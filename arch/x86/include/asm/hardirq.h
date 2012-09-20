@@ -12,9 +12,13 @@ typedef struct {
 	unsigned int apic_timer_irqs;	/* arch dependent */
 	unsigned int irq_spurious_count;
 #endif
-	unsigned int generic_irqs;	/* arch dependent */
+	unsigned int x86_platform_ipis;	/* arch dependent */
 	unsigned int apic_perf_irqs;
+#ifndef __GENKSYMS__
+	unsigned int apic_irq_work_irqs;
+#else
 	unsigned int apic_pending_irqs;
+#endif
 #ifdef CONFIG_SMP
 	unsigned int irq_resched_count;
 	unsigned int irq_call_count;
@@ -35,7 +39,7 @@ DECLARE_PER_CPU_SHARED_ALIGNED(irq_cpustat_t, irq_stat);
 
 #define __ARCH_IRQ_STAT
 
-#define inc_irq_stat(member)	percpu_add(irq_stat.member, 1)
+#define inc_irq_stat(member)	percpu_inc(irq_stat.member)
 
 #define local_softirq_pending()	percpu_read(irq_stat.__softirq_pending)
 

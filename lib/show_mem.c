@@ -8,15 +8,16 @@
 #include <linux/mm.h>
 #include <linux/nmi.h>
 #include <linux/quicklist.h>
+#include <linux/module.h>
 
-void show_mem(void)
+void show_mem(unsigned int filter)
 {
 	pg_data_t *pgdat;
 	unsigned long total = 0, reserved = 0, shared = 0,
 		nonshared = 0, highmem = 0;
 
 	printk(KERN_INFO "Mem-Info:\n");
-	show_free_areas();
+	__show_free_areas(filter);
 
 	for_each_online_pgdat(pgdat) {
 		unsigned long i, flags;
@@ -61,3 +62,4 @@ void show_mem(void)
 		quicklist_total_size());
 #endif
 }
+EXPORT_SYMBOL(show_mem);

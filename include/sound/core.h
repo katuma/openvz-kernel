@@ -29,6 +29,7 @@
 #include <linux/pm.h>			/* pm_message_t */
 #include <linux/device.h>
 #include <linux/stringify.h>
+#include <linux/sysfs.h>
 
 /* number of supported soundcards */
 #ifdef CONFIG_SND_DYNAMIC_MINORS
@@ -133,16 +134,17 @@ struct snd_card {
 	int free_on_last_close;		/* free in context of file_release */
 	wait_queue_head_t shutdown_sleep;
 	struct device *dev;		/* device assigned to this card */
-#ifndef CONFIG_SYSFS_DEPRECATED
 	struct device *card_dev;	/* cardX object for sysfs */
-#endif
 
 #ifdef CONFIG_PM
 	unsigned int power_state;	/* power state */
 	struct mutex power_lock;	/* power lock */
 	wait_queue_head_t power_sleep;
 #endif
+};
 
+struct snd_card_oss {
+	struct snd_card card;
 #if defined(CONFIG_SND_MIXER_OSS) || defined(CONFIG_SND_MIXER_OSS_MODULE)
 	struct snd_mixer_oss *mixer_oss;
 	int mixer_oss_change_count;
@@ -196,11 +198,10 @@ struct snd_minor {
 /* return a device pointer linked to each sound device as a parent */
 static inline struct device *snd_card_get_device_link(struct snd_card *card)
 {
-#ifdef CONFIG_SYSFS_DEPRECATED
-	return card ? card->dev : NULL;
-#else
-	return card ? card->card_dev : NULL;
-#endif
+	if (sysfs_deprecated)
+		return card ? card->dev : NULL;
+	else
+		return card ? card->card_dev : NULL;
 }
 
 /* sound.c */
@@ -458,5 +459,8 @@ struct snd_pci_quirk {
 const struct snd_pci_quirk *
 snd_pci_quirk_lookup(struct pci_dev *pci, const struct snd_pci_quirk *list);
 
+const struct snd_pci_quirk *
+snd_pci_quirk_lookup_id(u16 vendor, u16 device,
+			const struct snd_pci_quirk *list);
 
 #endif /* __SOUND_CORE_H */

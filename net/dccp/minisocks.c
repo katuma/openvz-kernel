@@ -19,6 +19,8 @@
 #include <net/xfrm.h>
 #include <net/inet_timewait_sock.h>
 
+#include <bc/sock_orphan.h>
+
 #include "ackvec.h"
 #include "ccid.h"
 #include "dccp.h"
@@ -46,7 +48,8 @@ void dccp_time_wait(struct sock *sk, int state, int timeo)
 {
 	struct inet_timewait_sock *tw = NULL;
 
-	if (dccp_death_row.tw_count < dccp_death_row.sysctl_max_tw_buckets)
+	if (dccp_death_row.tw_count < dccp_death_row.sysctl_max_tw_buckets &&
+			ub_timewait_check(sk, &dccp_death_row))
 		tw = inet_twsk_alloc(sk, state);
 
 	if (tw != NULL) {
@@ -254,7 +257,7 @@ int dccp_child_process(struct sock *parent, struct sock *child,
 		 * in main socket hash table and lock on listening
 		 * socket does not protect us more.
 		 */
-		sk_add_backlog(child, skb);
+		__sk_add_backlog(child, skb);
 	}
 
 	bh_unlock_sock(child);

@@ -13,6 +13,7 @@
 #include <linux/bootmem.h>
 #include <linux/module.h>
 #include <linux/kmemleak.h>
+#include <linux/pram.h>
 
 #include <asm/bug.h>
 #include <asm/io.h>
@@ -143,6 +144,30 @@ unsigned long __init init_bootmem(unsigned long start, unsigned long pages)
 	return init_bootmem_core(NODE_DATA(0)->bdata, start, 0, pages);
 }
 
+/*
+ * free_bootmem_late - free bootmem pages directly to page allocator
+ * @addr: starting address of the range
+ * @size: size of the range in bytes
+ *
+ * This is only useful when the bootmem allocator has already been torn
+ * down, but we are still initializing the system.  Pages are given directly
+ * to the page allocator, no bootmem metadata is updated because it is gone.
+ */
+void __init free_bootmem_late(unsigned long addr, unsigned long size)
+{
+	unsigned long cursor, end;
+
+	kmemleak_free_part(__va(addr), size);
+
+	cursor = PFN_UP(addr);
+	end = PFN_DOWN(addr + size);
+
+	for (; cursor < end; cursor++) {
+		__free_pages_bootmem(pfn_to_page(cursor), 0);
+		totalram_pages++;
+	}
+}
+
 static unsigned long __init free_all_bootmem_core(bootmem_data_t *bdata)
 {
 	int aligned;
@@ -239,7 +264,7 @@ static void __init __free(bootmem_data_t *bdata,
 		bdata->hint_idx = sidx;
 
 	for (idx = sidx; idx < eidx; idx++)
-		if (!test_and_clear_bit(idx, bdata->node_bootmem_map))
+		if (!bootmem_test_and_clear_bit(idx, bdata->node_bootmem_map))
 			BUG();
 }
 
@@ -256,7 +281,7 @@ static int __init __reserve(bootmem_data_t *bdata, unsigned long sidx,
 		flags);
 
 	for (idx = sidx; idx < eidx; idx++)
-		if (test_and_set_bit(idx, bdata->node_bootmem_map)) {
+		if (bootmem_test_and_set_bit(idx, bdata->node_bootmem_map)) {
 			if (exclusive) {
 				__free(bdata, sidx, idx);
 				return -EBUSY;
@@ -264,6 +289,8 @@ static int __init __reserve(bootmem_data_t *bdata, unsigned long sidx,
 			bdebug("silent double reserve of PFN %lx\n",
 				idx + bdata->node_min_pfn);
 		}
+	pram_ban_region(sidx + bdata->node_min_pfn,
+			eidx + bdata->node_min_pfn - 1);
 	return 0;
 }
 

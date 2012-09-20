@@ -64,9 +64,12 @@ struct backing_dev_info {
 	unsigned long state;	/* Always use atomic bitops on this */
 	unsigned int capabilities; /* Device capabilities */
 	congested_fn *congested_fn; /* Function pointer if device is md/dm */
+	congested_fn *congested_fn2; /* use per-bdi waitq */
 	void *congested_data;	/* Pointer to aux data for congested func */
 	void (*unplug_io_fn)(struct backing_dev_info *, struct page *);
 	void *unplug_io_data;
+	int (*bd_full_fn) (struct backing_dev_info *, long long, int);
+	int bd_full; /* backing dev is full */
 
 	char *name;
 
@@ -78,15 +81,18 @@ struct backing_dev_info {
 	unsigned int min_ratio;
 	unsigned int max_ratio, max_prop_frac;
 
+	unsigned int min_dirty_pages;
+	unsigned int max_dirty_pages;
+
 	struct bdi_writeback wb;  /* default writeback info for this bdi */
 	spinlock_t wb_lock;	  /* protects update side of wb_list */
 	struct list_head wb_list; /* the flusher threads hanging off this bdi */
-	unsigned long wb_mask;	  /* bitmask of registered tasks */
-	unsigned int wb_cnt;	  /* number of registered tasks */
 
 	struct list_head work_list;
 
 	struct device *dev;
+
+        wait_queue_head_t cong_waitq; /* to wait on congestion */
 
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debug_dir;
@@ -101,10 +107,12 @@ int bdi_register(struct backing_dev_info *bdi, struct device *parent,
 		const char *fmt, ...);
 int bdi_register_dev(struct backing_dev_info *bdi, dev_t dev);
 void bdi_unregister(struct backing_dev_info *bdi);
-void bdi_start_writeback(struct backing_dev_info *bdi, struct super_block *sb,
-				long nr_pages);
+void bdi_start_writeback(struct backing_dev_info *bdi, long nr_pages);
+void bdi_start_background_writeback(struct backing_dev_info *bdi,
+		struct user_beancounter *);
 int bdi_writeback_task(struct bdi_writeback *wb);
 int bdi_has_dirty_io(struct backing_dev_info *bdi);
+void bdi_arm_supers_timer(void);
 
 extern spinlock_t bdi_lock;
 extern struct list_head bdi_list;
@@ -195,6 +203,8 @@ static inline unsigned long bdi_stat_error(struct backing_dev_info *bdi)
 
 int bdi_set_min_ratio(struct backing_dev_info *bdi, unsigned int min_ratio);
 int bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned int max_ratio);
+int bdi_set_min_dirty(struct backing_dev_info *bdi, unsigned int min_dirty);
+int bdi_set_max_dirty(struct backing_dev_info *bdi, unsigned int max_dirty);
 
 /*
  * Flags in backing_dev_info::capability
@@ -273,6 +283,31 @@ static inline int bdi_rw_congested(struct backing_dev_info *bdi)
 				  (1 << BDI_async_congested));
 }
 
+/* congestion helpers for block-devices supporting per-bdi waitq */
+static inline int bdi_congested2(struct backing_dev_info *bdi, int bdi_bits)
+{
+	if (bdi->congested_fn2)
+		return bdi->congested_fn2(bdi->congested_data, bdi_bits);
+	return 0;
+}
+
+static inline int bdi_read_congested2(struct backing_dev_info *bdi)
+{
+	return bdi_congested2(bdi, 1 << BDI_sync_congested);
+}
+
+static inline int bdi_write_congested2(struct backing_dev_info *bdi)
+{
+	return bdi_congested2(bdi, 1 << BDI_async_congested);
+}
+
+static inline int bdi_rw_congested2(struct backing_dev_info *bdi)
+{
+	return bdi_congested2(bdi, (1 << BDI_sync_congested) |
+				  (1 << BDI_async_congested));
+}
+
+
 enum {
 	BLK_RW_ASYNC	= 0,
 	BLK_RW_SYNC	= 1,
@@ -281,7 +316,7 @@ enum {
 void clear_bdi_congested(struct backing_dev_info *bdi, int sync);
 void set_bdi_congested(struct backing_dev_info *bdi, int sync);
 long congestion_wait(int sync, long timeout);
-
+long wait_iff_congested(struct zone *zone, int sync, long timeout);
 
 static inline bool bdi_cap_writeback_dirty(struct backing_dev_info *bdi)
 {
@@ -318,6 +353,11 @@ static inline bool mapping_cap_writeback_dirty(struct address_space *mapping)
 static inline bool mapping_cap_account_dirty(struct address_space *mapping)
 {
 	return bdi_cap_account_dirty(mapping->backing_dev_info);
+}
+
+static inline bool mapping_cap_account_writeback(struct address_space *mapping)
+{
+	return bdi_cap_account_writeback(mapping->backing_dev_info);
 }
 
 static inline bool mapping_cap_swap_backed(struct address_space *mapping)

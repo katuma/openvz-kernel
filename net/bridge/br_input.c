@@ -20,18 +20,24 @@
 /* Bridge group multicast address 802.1d (pg 51). */
 const u8 br_group_address[ETH_ALEN] = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x00 };
 
-static void br_pass_frame_up(struct net_bridge *br, struct sk_buff *skb)
+static int br_pass_frame_up(struct net_bridge *br, struct sk_buff *skb)
 {
-	struct net_device *indev, *brdev = br->dev;
+	struct net_device *indev, *brdev = BR_INPUT_SKB_CB(skb)->brdev;
 
 	brdev->stats.rx_packets++;
 	brdev->stats.rx_bytes += skb->len;
 
 	indev = skb->dev;
-	skb->dev = brdev;
+	if (!br->via_phys_dev)
+		skb->dev = brdev;
+	else {
+		skb->brmark = BR_ALREADY_SEEN;
+		if (br->master_dev)
+			skb->dev = br->master_dev;
+	}
 
-	NF_HOOK(PF_BRIDGE, NF_BR_LOCAL_IN, skb, indev, NULL,
-		netif_receive_skb);
+	return NF_HOOK(PF_BRIDGE, NF_BR_LOCAL_IN, skb, indev, NULL,
+		       netif_receive_skb);
 }
 
 /* note: already called with rcu_read_lock (preempt_disabled) */
@@ -41,7 +47,9 @@ int br_handle_frame_finish(struct sk_buff *skb)
 	struct net_bridge_port *p = rcu_dereference(skb->dev->br_port);
 	struct net_bridge *br;
 	struct net_bridge_fdb_entry *dst;
+	struct net_bridge_mdb_entry *mdst;
 	struct sk_buff *skb2;
+	int err = 0;
 
 	if (!p || p->state == BR_STATE_DISABLED)
 		goto drop;
@@ -50,20 +58,39 @@ int br_handle_frame_finish(struct sk_buff *skb)
 	br = p->br;
 	br_fdb_update(br, p, eth_hdr(skb)->h_source);
 
+	if (!is_broadcast_ether_addr(dest) && is_multicast_ether_addr(dest) &&
+	    br_multicast_rcv(br, p, skb))
+		goto drop;
+
 	if (p->state == BR_STATE_LEARNING)
 		goto drop;
+
+	BR_INPUT_SKB_CB(skb)->brdev = br->dev;
 
 	/* The packet skb2 goes to the local host (NULL to skip). */
 	skb2 = NULL;
 
-	if (br->dev->flags & IFF_PROMISC)
+	if ((br->dev->flags & IFF_PROMISC) && !br->via_phys_dev)
 		skb2 = skb;
 
 	dst = NULL;
 
-	if (is_multicast_ether_addr(dest)) {
-		br->dev->stats.multicast++;
+	if (is_broadcast_ether_addr(dest))
 		skb2 = skb;
+	else if (is_multicast_ether_addr(dest)) {
+		mdst = br_mdb_get(br, skb);
+		if (mdst || BR_INPUT_SKB_CB(skb)->mrouters_only) {
+			if ((mdst && !hlist_unhashed(&mdst->mglist)) ||
+			    br_multicast_is_router(br))
+				skb2 = skb;
+			br_multicast_forward(mdst, skb, skb2);
+			skb = NULL;
+			if (!skb2)
+				goto out;
+		} else
+			skb2 = skb;
+
+		br->dev->stats.multicast++;
 	} else if ((dst = __br_fdb_get(br, dest)) && dst->is_local) {
 		skb2 = skb;
 		/* Do not forward the packet since it's local. */
@@ -74,15 +101,16 @@ int br_handle_frame_finish(struct sk_buff *skb)
 		skb2 = skb_clone(skb, GFP_ATOMIC);
 
 	if (skb2)
-		br_pass_frame_up(br, skb2);
+		err = br_pass_frame_up(br, skb2);
 
 	if (skb) {
 		if (dst)
-			br_forward(dst->dst, skb);
+			br_forward(dst->dst, skb, NULL);
 		else
-			br_flood_forward(br, skb);
+			br_flood_forward(br, skb, NULL);
 	}
 
+	return err;
 out:
 	return 0;
 drop:
@@ -147,6 +175,8 @@ struct sk_buff *br_handle_frame(struct net_bridge_port *p, struct sk_buff *skb)
 
 forward:
 	switch (p->state) {
+		struct net_device *out;
+
 	case BR_STATE_FORWARDING:
 		rhook = rcu_dereference(br_should_route_hook);
 		if (rhook != NULL) {
@@ -156,7 +186,12 @@ forward:
 		}
 		/* fall through */
 	case BR_STATE_LEARNING:
-		if (!compare_ether_addr(p->br->dev->dev_addr, dest))
+		if (skb->brmark == BR_ALREADY_SEEN)
+			return skb;
+
+		out = p->br->via_phys_dev ? p->br->master_dev : p->br->dev;
+
+		if (out && !compare_ether_addr(out->dev_addr, dest))
 			skb->pkt_type = PACKET_HOST;
 
 		NF_HOOK(PF_BRIDGE, NF_BR_PRE_ROUTING, skb, skb->dev, NULL,

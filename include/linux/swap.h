@@ -116,6 +116,7 @@ struct address_space;
 struct sysinfo;
 struct writeback_control;
 struct zone;
+struct user_beancounter;
 
 /*
  * A swap extent maps a range of a swapfile's PAGE_SIZE pages onto a range of
@@ -145,28 +146,44 @@ enum {
 	SWP_DISCARDABLE = (1 << 2),	/* blkdev supports discard */
 	SWP_DISCARDING	= (1 << 3),	/* now discarding a free cluster */
 	SWP_SOLIDSTATE	= (1 << 4),	/* blkdev seeks are cheap */
+	SWP_CONTINUED	= (1 << 5),	/* swap_map has count continuation */
+	SWP_BLKDEV	= (1 << 6),	/* its a block device */
 					/* add others here before... */
 	SWP_SCANNING	= (1 << 8),	/* refcount in scan_swap_map */
 };
 
 #define SWAP_CLUSTER_MAX 32
+#define COMPACT_CLUSTER_MAX SWAP_CLUSTER_MAX
 
-#define SWAP_MAP_MAX	0x7ffe
-#define SWAP_MAP_BAD	0x7fff
-#define SWAP_HAS_CACHE  0x8000		/* There is a swap cache of entry. */
-#define SWAP_COUNT_MASK (~SWAP_HAS_CACHE)
+/*
+ * Ratio between the present memory in the zone and the "gap" that
+ * we're allowing kswapd to shrink in addition to the per-zone high
+ * wmark, even for zones that already have the high wmark satisfied,
+ * in order to provide better per-zone lru behavior. We are ok to
+ * spend not more than 1% of the memory for this zone balancing "gap".
+ */
+#define KSWAPD_ZONE_BALANCE_GAP_RATIO 100
+
+#define SWAP_MAP_MAX	0x3e	/* Max duplication count, in first swap_map */
+#define SWAP_MAP_BAD	0x3f	/* Note pageblock is bad, in first swap_map */
+#define SWAP_HAS_CACHE	0x40	/* Flag page is cached, in first swap_map */
+#define SWAP_CONT_MAX	0x7f	/* Max count, in each swap_map continuation */
+#define COUNT_CONTINUED	0x80	/* See swap_map continuation for full count */
+#define SWAP_MAP_SHMEM	0xbf	/* Owned by shmem/tmpfs, in first swap_map */
+
 /*
  * The in-memory structure used to track swap areas.
  */
 struct swap_info_struct {
-	unsigned long flags;
-	int prio;			/* swap priority */
-	int next;			/* next entry on swap list */
+	unsigned long	flags;		/* SWP_USED etc: see above */
+	signed short	prio;		/* swap priority of this type */
+	signed char	type;		/* strange name for an index */
+	signed char	next;		/* next type on the swap list */
 	struct file *swap_file;
 	struct block_device *bdev;
-	struct list_head extent_list;
+	struct swap_extent first_swap_extent;
 	struct swap_extent *curr_swap_extent;
-	unsigned short *swap_map;
+	unsigned char *swap_map;
 	unsigned int lowest_bit;
 	unsigned int highest_bit;
 	unsigned int lowest_alloc;	/* while preparing discard cluster */
@@ -177,7 +194,24 @@ struct swap_info_struct {
 	unsigned int max;
 	unsigned int inuse_pages;
 	unsigned int old_block_size;
+#ifdef CONFIG_PSWAP
+	signed char pswap_type;
+	unsigned long *pswap_reserved;
+#endif
+#ifdef CONFIG_BC_SWAP_ACCOUNTING
+	struct user_beancounter **swap_ubs;
+#endif
+	unsigned char uuid[16];
 };
+
+#ifdef CONFIG_BC_SWAP_ACCOUNTING
+struct user_beancounter *get_swap_ub(swp_entry_t entry);
+#else
+static inline struct user_beancounter *get_swap_ub(swp_entry_t entry)
+{
+	return get_ub0();
+}
+#endif
 
 struct swap_list_t {
 	int head;	/* head of priority-ordered swapfile list */
@@ -190,6 +224,8 @@ struct swap_list_t {
 /* linux/mm/page_alloc.c */
 extern unsigned long totalram_pages;
 extern unsigned long totalreserve_pages;
+extern int min_free_kbytes;
+extern int extra_free_kbytes;
 extern unsigned int nr_free_buffer_pages(void);
 extern unsigned int nr_free_pagecache_pages(void);
 
@@ -200,7 +236,10 @@ extern unsigned int nr_free_pagecache_pages(void);
 /* linux/mm/swap.c */
 extern void __lru_cache_add(struct page *, enum lru_list lru);
 extern void lru_cache_add_lru(struct page *, enum lru_list lru);
+extern void lru_add_page_tail(struct gang* gang,
+			      struct page *page, struct page *page_tail);
 extern void activate_page(struct page *);
+extern void deactivate_page(struct page *);
 extern void mark_page_accessed(struct page *);
 extern void lru_add_drain(void);
 extern int lru_add_drain_all(void);
@@ -233,9 +272,16 @@ static inline void lru_cache_add_active_file(struct page *page)
 	__lru_cache_add(page, LRU_ACTIVE_FILE);
 }
 
+/* LRU Isolation modes. */
+#define ISOLATE_INACTIVE 0	/* Isolate inactive pages. */
+#define ISOLATE_ACTIVE 1	/* Isolate active pages. */
+#define ISOLATE_BOTH 2		/* Isolate both active and inactive pages. */
+
 /* linux/mm/vmscan.c */
 extern unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 					gfp_t gfp_mask, nodemask_t *mask);
+extern unsigned long try_to_free_gang_pages(struct gang_set *gs,
+					gfp_t gfp_mask);
 extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *mem,
 						  gfp_t gfp_mask, bool noswap,
 						  unsigned int swappiness);
@@ -244,11 +290,13 @@ extern unsigned long mem_cgroup_shrink_node_zone(struct mem_cgroup *mem,
 						unsigned int swappiness,
 						struct zone *zone,
 						int nid);
-extern int __isolate_lru_page(struct page *page, int mode, int file);
+extern int __isolate_lru_page(struct page *page, int mode, int file,
+		struct gang **locked_gang);
 extern unsigned long shrink_all_memory(unsigned long nr_pages);
 extern int vm_swappiness;
 extern int remove_mapping(struct address_space *mapping, struct page *page);
 extern long vm_total_pages;
+extern int vm_sync_reclaim;
 
 #ifdef CONFIG_NUMA
 extern int zone_reclaim_mode;
@@ -262,6 +310,13 @@ static inline int zone_reclaim(struct zone *z, gfp_t mask, unsigned int order)
 	return 0;
 }
 #endif
+
+/*
+ * must be called with vma's mmap_sem held for read or write, and page locked.
+ */
+extern void mlock_vma_page(struct vm_area_struct *vma, struct page *page);
+extern void munlock_vma_page(struct page *page);
+#define MM_HAS_MLOCK_VMA_PAGE
 
 extern int page_evictable(struct page *page, struct vm_area_struct *vma);
 extern void scan_mapping_unevictable_pages(struct address_space *);
@@ -279,7 +334,31 @@ extern int kswapd_run(int nid);
 extern int shmem_unuse(swp_entry_t entry, struct page *page);
 #endif /* CONFIG_MMU */
 
+#ifdef CONFIG_CGROUP_MEM_RES_CTLR
+extern void mem_cgroup_get_shmem_target(struct inode *inode, pgoff_t pgoff,
+					struct page **pagep, swp_entry_t *ent);
+#endif
+
 extern void swap_unplug_io_fn(struct backing_dev_info *, struct page *);
+
+#ifdef CONFIG_PSWAP
+extern int sysctl_prune_pswap;
+extern int prune_pswap_sysctl_handler(ctl_table *table, int write,
+		void __user *buffer, size_t *length, loff_t *ppos);
+extern swp_entry_t pswap_reserve(swp_entry_t);
+extern swp_entry_t pswap_restore(swp_entry_t, struct user_beancounter *);
+#else
+static inline swp_entry_t pswap_reserve(swp_entry_t swp)
+{
+	return (swp_entry_t) {0};
+}
+
+static inline swp_entry_t pswap_restore(swp_entry_t swp,
+					struct user_beancounter *ub)
+{
+	return (swp_entry_t) {0};
+}
+#endif
 
 #ifdef CONFIG_SWAP
 /* linux/mm/page_io.c */
@@ -291,7 +370,7 @@ extern void end_swap_bio_read(struct bio *bio, int err);
 extern struct address_space swapper_space;
 #define total_swapcache_pages  swapper_space.nrpages
 extern void show_swap_cache_info(void);
-extern int add_to_swap(struct page *);
+extern int add_to_swap(struct page *, struct user_beancounter *ub);
 extern int add_to_swap_cache(struct page *, swp_entry_t, gfp_t);
 extern void __delete_from_swap_cache(struct page *);
 extern void delete_from_swap_cache(struct page *);
@@ -307,22 +386,33 @@ extern struct page *swapin_readahead(swp_entry_t, gfp_t,
 extern long nr_swap_pages;
 extern long total_swap_pages;
 extern void si_swapinfo(struct sysinfo *);
-extern swp_entry_t get_swap_page(void);
+extern swp_entry_t get_swap_page(struct user_beancounter *);
 extern swp_entry_t get_swap_page_of_type(int);
-extern void swap_duplicate(swp_entry_t);
-extern int swapcache_prepare(swp_entry_t);
 extern int valid_swaphandles(swp_entry_t, unsigned long *);
+extern int add_swap_count_continuation(swp_entry_t, gfp_t);
+extern void swap_shmem_alloc(swp_entry_t);
+extern int swap_duplicate(swp_entry_t);
+extern int __swap_duplicate(swp_entry_t, unsigned char);
+extern int swap_convert_to_shmem(swp_entry_t entry);
+extern int swapcache_prepare(swp_entry_t);
 extern void swap_free(swp_entry_t);
 extern void swapcache_free(swp_entry_t, struct page *page);
 extern int free_swap_and_cache(swp_entry_t);
 extern int swap_type_of(dev_t, sector_t, struct block_device **);
 extern unsigned int count_swap_pages(int, int);
-extern sector_t map_swap_page(struct swap_info_struct *, pgoff_t);
+extern sector_t map_swap_page(swp_entry_t, struct block_device **);
 extern sector_t swapdev_block(int, pgoff_t);
-extern struct swap_info_struct *get_swap_info_struct(unsigned);
 extern int reuse_swap_page(struct page *);
 extern int try_to_free_swap(struct page *);
 struct backing_dev_info;
+
+#ifdef CONFIG_BC_SWAP_ACCOUNTING
+extern void ub_unuse_swap_page(struct page *);
+extern void ub_unuse_swap(struct user_beancounter *);
+#else
+static inline void ub_unuse_swap_page(struct page *pg) { }
+static inline void ub_unuse_swap(struct user_beancounter *ub)  { }
+#endif
 
 /* linux/mm/thrash.c */
 extern struct mm_struct *swap_token_mm;
@@ -348,6 +438,7 @@ static inline void disable_swap_token(void)
 #ifdef CONFIG_CGROUP_MEM_RES_CTLR
 extern void
 mem_cgroup_uncharge_swapcache(struct page *page, swp_entry_t ent, bool swapout);
+extern int mem_cgroup_count_swap_user(swp_entry_t ent, struct page **pagep);
 #else
 static inline void
 mem_cgroup_uncharge_swapcache(struct page *page, swp_entry_t ent, bool swapout)
@@ -384,8 +475,23 @@ static inline void show_swap_cache_info(void)
 #define free_swap_and_cache(swp)	is_migration_entry(swp)
 #define swapcache_prepare(swp)		is_migration_entry(swp)
 
-static inline void swap_duplicate(swp_entry_t swp)
+static inline int add_swap_count_continuation(swp_entry_t swp, gfp_t gfp_mask)
 {
+	return 0;
+}
+
+static inline void swap_shmem_alloc(swp_entry_t swp)
+{
+}
+
+static inline int swap_duplicate(swp_entry_t swp)
+{
+	return 0;
+}
+
+static inline int swap_convert_to_shmem(swp_entry_t entry)
+{
+	return 0;
 }
 
 static inline void swap_free(swp_entry_t swp)
@@ -412,7 +518,7 @@ static inline struct page *lookup_swap_cache(swp_entry_t swp)
 	return NULL;
 }
 
-static inline int add_to_swap(struct page *page)
+static inline int add_to_swap(struct page *page, struct user_beancounter *ub)
 {
 	return 0;
 }
@@ -438,7 +544,7 @@ static inline int try_to_free_swap(struct page *page)
 	return 0;
 }
 
-static inline swp_entry_t get_swap_page(void)
+static inline swp_entry_t get_swap_page(struct user_beancounter *ub)
 {
 	swp_entry_t entry;
 	entry.val = 0;
@@ -467,6 +573,14 @@ static inline void
 mem_cgroup_uncharge_swapcache(struct page *page, swp_entry_t ent)
 {
 }
+
+#ifdef CONFIG_CGROUP_MEM_RES_CTLR
+static inline int
+mem_cgroup_count_swap_user(swp_entry_t ent, struct page **pagep)
+{
+	return 0;
+}
+#endif
 
 #endif /* CONFIG_SWAP */
 #endif /* __KERNEL__*/

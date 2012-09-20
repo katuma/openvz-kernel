@@ -147,7 +147,7 @@ struct pneigh_entry
 /*
  *	neighbour table manipulation
  */
-
+#define NEIGH_NUM_HASH_RND	4
 
 struct neigh_table
 {
@@ -178,7 +178,7 @@ struct neigh_table
 	struct neigh_statistics	*stats;
 	struct neighbour	**hash_buckets;
 	unsigned int		hash_mask;
-	__u32			hash_rnd;
+	__u32			hash_rnd[NEIGH_NUM_HASH_RND];
 	struct pneigh_entry	**phash_buckets;
 };
 

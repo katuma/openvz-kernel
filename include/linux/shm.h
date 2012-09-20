@@ -83,6 +83,22 @@ struct shm_info {
 };
 
 #ifdef __KERNEL__
+
+#include <linux/ipc_namespace.h>
+
+#define IPC_SEM_IDS	0
+#define IPC_MSG_IDS	1
+#define IPC_SHM_IDS	2
+
+struct shm_file_data {
+	int id;
+	struct ipc_namespace *ns;
+	struct file *file;
+	const struct vm_operations_struct *vm_ops;
+};
+#define shm_file_data(file) (*((struct shm_file_data **)&(file)->private_data))
+#define shm_ids(ns)	((ns)->ids[IPC_SHM_IDS])
+
 struct shmid_kernel /* private to the kernel */
 {	
 	struct kern_ipc_perm	shm_perm;
@@ -97,6 +113,23 @@ struct shmid_kernel /* private to the kernel */
 	struct user_struct	*mlock_user;
 };
 
+/*
+ * shm_lock_(check_) routines are called in the paths where the rw_mutex
+ * is not held.
+ */
+static inline struct shmid_kernel *shm_lock(struct ipc_namespace *ns, int id)
+{
+	struct kern_ipc_perm *ipcp = ipc_lock(&shm_ids(ns), id);
+
+	if (IS_ERR(ipcp))
+		return (struct shmid_kernel *)ipcp;
+
+	return container_of(ipcp, struct shmid_kernel, shm_perm);
+}
+
+#define shm_unlock(shp)			\
+	ipc_unlock(&(shp)->shm_perm)
+
 /* shm_mode upper byte flags */
 #define	SHM_DEST	01000	/* segment will be destroyed on last detach */
 #define SHM_LOCKED      02000   /* segment will not be swapped */
@@ -106,6 +139,7 @@ struct shmid_kernel /* private to the kernel */
 #ifdef CONFIG_SYSVIPC
 long do_shmat(int shmid, char __user *shmaddr, int shmflg, unsigned long *addr);
 extern int is_file_shm_hugepages(struct file *file);
+extern void exit_shm(struct task_struct *task);
 #else
 static inline long do_shmat(int shmid, char __user *shmaddr,
 				int shmflg, unsigned long *addr)
@@ -116,8 +150,17 @@ static inline int is_file_shm_hugepages(struct file *file)
 {
 	return 0;
 }
+static inline void exit_shm(struct task_struct *task)
+{
+}
 #endif
 
+int sysvipc_walk_shm(int (*func)(struct shmid_kernel*, void *), void *arg);
+struct file * sysvipc_setup_shm(key_t key, int shmid, size_t size, int shmflg);
+extern const struct file_operations shmem_file_operations;
+extern const struct file_operations shm_file_operations;
+
+extern struct file_system_type tmpfs_fs_type;
 #endif /* __KERNEL__ */
 
 #endif /* _LINUX_SHM_H_ */

@@ -10,6 +10,7 @@
 #include <linux/mman.h>
 #include <linux/smp_lock.h>
 #include <linux/notifier.h>
+#include <linux/virtinfo.h>
 #include <linux/reboot.h>
 #include <linux/prctl.h>
 #include <linux/highuid.h>
@@ -41,6 +42,8 @@
 #include <linux/syscalls.h>
 #include <linux/kprobes.h>
 #include <linux/user_namespace.h>
+
+#include <linux/kmsg_dump.h>
 
 #include <asm/uaccess.h>
 #include <asm/io.h>
@@ -114,6 +117,125 @@ EXPORT_SYMBOL(cad_pid);
  */
 
 void (*pm_power_off_prepare)(void);
+
+DECLARE_MUTEX(virtinfo_sem);
+EXPORT_SYMBOL(virtinfo_sem);
+static struct vnotifier_block *virtinfo_chain[VIRT_TYPES];
+
+void __virtinfo_notifier_register(int type, struct vnotifier_block *nb)
+{
+	struct vnotifier_block **p;
+
+	for (p = &virtinfo_chain[type];
+	     *p != NULL && nb->priority < (*p)->priority;
+	     p = &(*p)->next);
+	nb->next = *p;
+	smp_wmb();
+	*p = nb;
+}
+
+EXPORT_SYMBOL(__virtinfo_notifier_register);
+
+void virtinfo_notifier_register(int type, struct vnotifier_block *nb)
+{
+	down(&virtinfo_sem);
+	__virtinfo_notifier_register(type, nb);
+	up(&virtinfo_sem);
+}
+
+EXPORT_SYMBOL(virtinfo_notifier_register);
+
+struct virtinfo_cnt_struct {
+	volatile unsigned long exit[NR_CPUS];
+	volatile unsigned long entry;
+};
+static DEFINE_PER_CPU(struct virtinfo_cnt_struct, virtcnt);
+
+void virtinfo_notifier_unregister(int type, struct vnotifier_block *nb)
+{
+	struct vnotifier_block **p;
+	int entry_cpu, exit_cpu;
+	unsigned long cnt, ent;
+	struct rcu_synchronize rcu;
+
+	down(&virtinfo_sem);
+	for (p = &virtinfo_chain[type]; *p != nb; p = &(*p)->next);
+	*p = nb->next;
+	smp_mb();
+
+	init_completion(&rcu.completion);
+	call_rcu_sched(&rcu.head, wakeme_after_rcu);
+
+	for_each_cpu_mask(entry_cpu, cpu_possible_map) {
+		while (1) {
+			cnt = 0;
+			for_each_cpu_mask(exit_cpu, cpu_possible_map)
+				cnt +=
+				    per_cpu(virtcnt, entry_cpu).exit[exit_cpu];
+			smp_rmb();
+			ent = per_cpu(virtcnt, entry_cpu).entry;
+			if (cnt == ent)
+				break;
+			__set_current_state(TASK_UNINTERRUPTIBLE);
+			schedule_timeout(HZ / 100);
+		}
+	}
+
+	wait_for_completion(&rcu.completion);
+
+	up(&virtinfo_sem);
+}
+
+EXPORT_SYMBOL(virtinfo_notifier_unregister);
+
+static int do_virtinfo_notifier_call(int type, unsigned long n, void *data)
+{
+	int ret;
+	struct vnotifier_block *nb;
+
+	nb = virtinfo_chain[type];
+	ret = NOTIFY_DONE;
+	while (nb)
+	{
+		ret = nb->notifier_call(nb, n, data, ret);
+		if(ret & NOTIFY_STOP_MASK) {
+			ret &= ~NOTIFY_STOP_MASK;
+			break;
+		}
+		nb = nb->next;
+	}
+
+	return ret;
+}
+
+int virtinfo_notifier_call(int type, unsigned long n, void *data)
+{
+	int ret;
+	int entry_cpu, exit_cpu;
+
+	entry_cpu = get_cpu();
+	per_cpu(virtcnt, entry_cpu).entry++;
+	smp_wmb();
+	put_cpu();
+
+	ret = do_virtinfo_notifier_call(type, n, data);
+
+	exit_cpu = get_cpu();
+	smp_wmb();
+	per_cpu(virtcnt, entry_cpu).exit[exit_cpu]++;
+	put_cpu();
+
+	return ret;
+}
+EXPORT_SYMBOL(virtinfo_notifier_call);
+
+int virtinfo_notifier_call_irq(int type, unsigned long n, void *data)
+{
+	if (!in_interrupt())
+		return virtinfo_notifier_call(type, n, data);
+	return do_virtinfo_notifier_call(type, n, data);
+}
+EXPORT_SYMBOL(virtinfo_notifier_call_irq);
 
 /*
  * set the priority of a task
@@ -190,10 +312,10 @@ SYSCALL_DEFINE3(setpriority, int, which, int, who, int, niceval)
 				 !(user = find_user(who)))
 				goto out_unlock;	/* No processes for this user */
 
-			do_each_thread(g, p)
+			do_each_thread_ve(g, p) {
 				if (__task_cred(p)->uid == who)
 					error = set_one_prio(p, niceval, error);
-			while_each_thread(g, p);
+			} while_each_thread_ve(g, p);
 			if (who != cred->uid)
 				free_uid(user);		/* For find_user() */
 			break;
@@ -253,13 +375,13 @@ SYSCALL_DEFINE2(getpriority, int, which, int, who)
 				 !(user = find_user(who)))
 				goto out_unlock;	/* No processes for this user */
 
-			do_each_thread(g, p)
+			do_each_thread_ve(g, p)
 				if (__task_cred(p)->uid == who) {
 					niceval = 20 - task_nice(p);
 					if (niceval > retval)
 						retval = niceval;
 				}
-			while_each_thread(g, p);
+			while_each_thread_ve(g, p);
 			if (who != cred->uid)
 				free_uid(user);		/* for find_user() */
 			break;
@@ -280,6 +402,7 @@ out_unlock:
  */
 void emergency_restart(void)
 {
+	kmsg_dump(KMSG_DUMP_EMERG);
 	machine_emergency_restart();
 }
 EXPORT_SYMBOL_GPL(emergency_restart);
@@ -307,6 +430,7 @@ void kernel_restart(char *cmd)
 		printk(KERN_EMERG "Restarting system.\n");
 	else
 		printk(KERN_EMERG "Restarting system with command '%s'.\n", cmd);
+	kmsg_dump(KMSG_DUMP_RESTART);
 	machine_restart(cmd);
 }
 EXPORT_SYMBOL_GPL(kernel_restart);
@@ -328,6 +452,7 @@ void kernel_halt(void)
 	kernel_shutdown_prepare(SYSTEM_HALT);
 	sysdev_shutdown();
 	printk(KERN_EMERG "System halted.\n");
+	kmsg_dump(KMSG_DUMP_HALT);
 	machine_halt();
 }
 
@@ -346,6 +471,7 @@ void kernel_power_off(void)
 	disable_nonboot_cpus();
 	sysdev_shutdown();
 	printk(KERN_EMERG "Power down.\n");
+	kmsg_dump(KMSG_DUMP_POWEROFF);
 	machine_power_off();
 }
 EXPORT_SYMBOL_GPL(kernel_power_off);
@@ -374,6 +500,26 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 			magic2 != LINUX_REBOOT_MAGIC2B &&
 	                magic2 != LINUX_REBOOT_MAGIC2C))
 		return -EINVAL;
+
+#ifdef CONFIG_VE
+	if (!ve_is_super(get_exec_env()))
+		switch (cmd) {
+		case LINUX_REBOOT_CMD_RESTART:
+		case LINUX_REBOOT_CMD_RESTART2:
+			set_bit(VE_REBOOT, &get_exec_env()->flags);
+
+		case LINUX_REBOOT_CMD_HALT:
+		case LINUX_REBOOT_CMD_POWER_OFF:
+			force_sig(SIGKILL, get_exec_env_init());
+
+		case LINUX_REBOOT_CMD_CAD_ON:
+		case LINUX_REBOOT_CMD_CAD_OFF:
+			return 0;
+
+		default:
+			return -EINVAL;
+		}
+#endif
 
 	/* Instead of trying to make the power_off code look like
 	 * halt when pm_power_off is not set do it the easy way.
@@ -911,22 +1057,40 @@ change_okay:
 
 void do_sys_times(struct tms *tms)
 {
-	struct task_cputime cputime;
-	cputime_t cutime, cstime;
+	cputime_t tgutime, tgstime, cutime, cstime;
 
-	thread_group_cputime(current, &cputime);
 	spin_lock_irq(&current->sighand->siglock);
+	thread_group_times(current, &tgutime, &tgstime);
 	cutime = current->signal->cutime;
 	cstime = current->signal->cstime;
 	spin_unlock_irq(&current->sighand->siglock);
-	tms->tms_utime = cputime_to_clock_t(cputime.utime);
-	tms->tms_stime = cputime_to_clock_t(cputime.stime);
+	tms->tms_utime = cputime_to_clock_t(tgutime);
+	tms->tms_stime = cputime_to_clock_t(tgstime);
 	tms->tms_cutime = cputime_to_clock_t(cutime);
 	tms->tms_cstime = cputime_to_clock_t(cstime);
 }
 
+#ifdef CONFIG_VE
+unsigned long long ve_relative_clock(struct timespec * ts)
+{
+	unsigned long long offset = 0;
+
+	if (ts->tv_sec > get_exec_env()->start_timespec.tv_sec ||
+	    (ts->tv_sec == get_exec_env()->start_timespec.tv_sec &&
+	     ts->tv_nsec >= get_exec_env()->start_timespec.tv_nsec))
+		offset = (unsigned long long)(ts->tv_sec -
+			get_exec_env()->start_timespec.tv_sec) * NSEC_PER_SEC
+			+ ts->tv_nsec -	get_exec_env()->start_timespec.tv_nsec;
+	return nsec_to_clock_t(offset);
+}
+#endif
+
 SYSCALL_DEFINE1(times, struct tms __user *, tbuf)
 {
+#ifdef CONFIG_VE
+	struct timespec now;
+#endif
+
 	if (tbuf) {
 		struct tms tmp;
 
@@ -934,8 +1098,15 @@ SYSCALL_DEFINE1(times, struct tms __user *, tbuf)
 		if (copy_to_user(tbuf, &tmp, sizeof(struct tms)))
 			return -EFAULT;
 	}
+#ifndef CONFIG_VE
 	force_successful_syscall_return();
 	return (long) jiffies_64_to_clock_t(get_jiffies_64());
+#else
+	/* Compare to calculation in fs/proc/array.c */
+	do_posix_clock_monotonic_gettime(&now);
+	force_successful_syscall_return();
+	return ve_relative_clock(&now);
+#endif
 }
 
 /*
@@ -1110,12 +1281,15 @@ SYSCALL_DEFINE0(setsid)
 	err = session;
 out:
 	write_unlock_irq(&tasklist_lock);
-	if (err > 0)
+	if (err > 0) {
 		proc_sid_connector(group_leader);
+		sched_autogroup_create_attach(group_leader);
+	}
 	return err;
 }
 
 DECLARE_RWSEM(uts_sem);
+EXPORT_SYMBOL_GPL(uts_sem);
 
 SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 {
@@ -1133,7 +1307,7 @@ SYSCALL_DEFINE2(sethostname, char __user *, name, int, len)
 	int errno;
 	char tmp[__NEW_UTS_LEN];
 
-	if (!capable(CAP_SYS_ADMIN))
+	if (!capable(CAP_VE_SYS_ADMIN))
 		return -EPERM;
 	if (len < 0 || len > __NEW_UTS_LEN)
 		return -EINVAL;
@@ -1182,7 +1356,7 @@ SYSCALL_DEFINE2(setdomainname, char __user *, name, int, len)
 	int errno;
 	char tmp[__NEW_UTS_LEN];
 
-	if (!capable(CAP_SYS_ADMIN))
+	if (!capable(CAP_VE_SYS_ADMIN))
 		return -EPERM;
 	if (len < 0 || len > __NEW_UTS_LEN)
 		return -EINVAL;
@@ -1238,43 +1412,52 @@ SYSCALL_DEFINE2(old_getrlimit, unsigned int, resource,
 
 #endif
 
-SYSCALL_DEFINE2(setrlimit, unsigned int, resource, struct rlimit __user *, rlim)
+/* make sure you are allowed to change @tsk limits before calling this */
+int setrlimit(struct task_struct *tsk, unsigned int resource,
+		struct rlimit *new_rlim)
 {
-	struct rlimit new_rlim, *old_rlim;
+	struct rlimit *old_rlim;
 	int retval;
 
-	if (resource >= RLIM_NLIMITS)
+	if (new_rlim->rlim_cur > new_rlim->rlim_max)
 		return -EINVAL;
-	if (copy_from_user(&new_rlim, rlim, sizeof(*rlim)))
-		return -EFAULT;
-	if (new_rlim.rlim_cur > new_rlim.rlim_max)
-		return -EINVAL;
-	old_rlim = current->signal->rlim + resource;
-	if ((new_rlim.rlim_max > old_rlim->rlim_max) &&
-	    !capable(CAP_SYS_RESOURCE))
-		return -EPERM;
-	if (resource == RLIMIT_NOFILE && new_rlim.rlim_max > sysctl_nr_open)
+	if (resource == RLIMIT_NOFILE && new_rlim->rlim_max > sysctl_nr_open)
 		return -EPERM;
 
-	retval = security_task_setrlimit(resource, &new_rlim);
+	/* optimization: 'current' doesn't need locking, e.g. setrlimit */
+	if (tsk != current) {
+		/* protect tsk->signal and tsk->sighand from disappearing */
+		read_lock(&tasklist_lock);
+		if (!tsk->sighand) {
+			retval = -ESRCH;
+			goto out;
+		}
+	}
+
+	retval = security_task_setrlimit(tsk, resource, new_rlim);
 	if (retval)
-		return retval;
+		goto out;
 
-	if (resource == RLIMIT_CPU && new_rlim.rlim_cur == 0) {
+	if (resource == RLIMIT_CPU && new_rlim->rlim_cur == 0) {
 		/*
 		 * The caller is asking for an immediate RLIMIT_CPU
 		 * expiry.  But we use the zero value to mean "it was
 		 * never set".  So let's cheat and make it one second
 		 * instead
 		 */
-		new_rlim.rlim_cur = 1;
+		new_rlim->rlim_cur = 1;
 	}
 
-	task_lock(current->group_leader);
-	*old_rlim = new_rlim;
-	task_unlock(current->group_leader);
+	old_rlim = tsk->signal->rlim + resource;
+	task_lock(tsk->group_leader);
+	if ((new_rlim->rlim_max <= old_rlim->rlim_max) ||
+				capable(CAP_SYS_RESOURCE))
+		*old_rlim = *new_rlim;
+	else
+		retval = -EPERM;
+	task_unlock(tsk->group_leader);
 
-	if (resource != RLIMIT_CPU)
+	if (retval || resource != RLIMIT_CPU)
 		goto out;
 
 	/*
@@ -1283,12 +1466,25 @@ SYSCALL_DEFINE2(setrlimit, unsigned int, resource, struct rlimit __user *, rlim)
 	 * very long-standing error, and fixing it now risks breakage of
 	 * applications, so we live with it
 	 */
-	if (new_rlim.rlim_cur == RLIM_INFINITY)
+	if (new_rlim->rlim_cur == RLIM_INFINITY)
 		goto out;
 
-	update_rlimit_cpu(new_rlim.rlim_cur);
+	update_rlimit_cpu(tsk, new_rlim->rlim_cur);
 out:
-	return 0;
+	if (tsk != current)
+		read_unlock(&tasklist_lock);
+	return retval;
+}
+
+SYSCALL_DEFINE2(setrlimit, unsigned int, resource, struct rlimit __user *, rlim)
+{
+	struct rlimit new_rlim;
+
+	if (resource >= RLIM_NLIMITS)
+		return -EINVAL;
+	if (copy_from_user(&new_rlim, rlim, sizeof(*rlim)))
+		return -EFAULT;
+	return setrlimit(current, resource, &new_rlim);
 }
 
 /*
@@ -1338,16 +1534,14 @@ static void k_getrusage(struct task_struct *p, int who, struct rusage *r)
 {
 	struct task_struct *t;
 	unsigned long flags;
-	cputime_t utime, stime;
-	struct task_cputime cputime;
+	cputime_t tgutime, tgstime, utime, stime;
 	unsigned long maxrss = 0;
 
 	memset((char *) r, 0, sizeof *r);
 	utime = stime = cputime_zero;
 
 	if (who == RUSAGE_THREAD) {
-		utime = task_utime(current);
-		stime = task_stime(current);
+		task_times(current, &utime, &stime);
 		accumulate_thread_rusage(p, r);
 		maxrss = p->signal->maxrss;
 		goto out;
@@ -1373,9 +1567,9 @@ static void k_getrusage(struct task_struct *p, int who, struct rusage *r)
 				break;
 
 		case RUSAGE_SELF:
-			thread_group_cputime(p, &cputime);
-			utime = cputime_add(utime, cputime.utime);
-			stime = cputime_add(stime, cputime.stime);
+			thread_group_times(p, &tgutime, &tgstime);
+			utime = cputime_add(utime, tgutime);
+			stime = cputime_add(stime, tgstime);
 			r->ru_nvcsw += p->signal->nvcsw;
 			r->ru_nivcsw += p->signal->nivcsw;
 			r->ru_minflt += p->signal->min_flt;
@@ -1579,6 +1773,17 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			else
 				error = PR_MCE_KILL_DEFAULT;
 			break;
+		case PR_SET_DATA_CSUM:
+			switch (arg2) {
+			case PR_DATA_CSUM_OFF:
+			case PR_DATA_CSUM_ON:
+				current->data_csum_enabled = arg2;
+				break;
+			default:
+				error = -EINVAL;
+				break;
+			}
+			break;
 		default:
 			error = -EINVAL;
 			break;
@@ -1600,9 +1805,9 @@ SYSCALL_DEFINE3(getcpu, unsigned __user *, cpup, unsigned __user *, nodep,
 
 char poweroff_cmd[POWEROFF_CMD_PATH_LEN] = "/sbin/poweroff";
 
-static void argv_cleanup(char **argv, char **envp)
+static void argv_cleanup(struct subprocess_info *info)
 {
-	argv_free(argv);
+	argv_free(info->argv);
 }
 
 /**
@@ -1636,7 +1841,7 @@ int orderly_poweroff(bool force)
 		goto out;
 	}
 
-	call_usermodehelper_setcleanup(info, argv_cleanup);
+	call_usermodehelper_setfns(info, NULL, argv_cleanup, NULL);
 
 	ret = call_usermodehelper_exec(info, UMH_NO_WAIT);
 

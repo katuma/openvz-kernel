@@ -19,8 +19,8 @@
  * along with this program; if not, write to the Free Software Foundation,
  * Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
-/* Up to 16 microframes to halt an HC - one microframe is 125 microsectonds */
-#define XHCI_MAX_HALT_USEC	(16*125)
+/* Up to 16 ms to halt an HC */
+#define XHCI_MAX_HALT_USEC	(16*1000)
 /* HC not running - set to 1 when run/stop bit is cleared. */
 #define XHCI_STS_HALT		(1<<0)
 
@@ -65,6 +65,12 @@
 /* bits 1:2, 5:12, and 17:19 need to be preserved; bits 21:28 should be zero */
 #define	XHCI_LEGACY_DISABLE_SMI		((0x3 << 1) + (0xff << 5) + (0x7 << 17))
 
+/* USB 2.0 xHCI 0.96 L1C capability - section 7.2.2.1.3.2 */
+#define XHCI_L1C               (1 << 16)
+
+/* USB 2.0 xHCI 1.0 hardware LMP capability - section 7.2.2.1.3.2 */
+#define XHCI_HLC               (1 << 19)
+
 /* command register values to disable interrupts and halt the HC */
 /* start/stop HC execution - do not write unless HC is halted*/
 #define XHCI_CMD_RUN		(1 << 0)
@@ -101,12 +107,15 @@ static inline int xhci_find_next_cap_offset(void __iomem *base, int ext_offset)
 
 	next = readl(base + ext_offset);
 
-	if (ext_offset == XHCI_HCC_PARAMS_OFFSET)
+	if (ext_offset == XHCI_HCC_PARAMS_OFFSET) {
 		/* Find the first extended capability */
 		next = XHCI_HCC_EXT_CAPS(next);
-	else
+		ext_offset = 0;
+	} else {
 		/* Find the next extended capability */
 		next = XHCI_EXT_CAPS_NEXT(next);
+	}
+
 	if (!next)
 		return 0;
 	/*

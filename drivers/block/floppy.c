@@ -3341,7 +3341,7 @@ static inline int set_geometry(unsigned int cmd, struct floppy_struct *g,
 			struct block_device *bdev = opened_bdev[cnt];
 			if (!bdev || ITYPE(drive_state[cnt].fd_device) != type)
 				continue;
-			__invalidate_device(bdev);
+			__invalidate_device(bdev, true);
 		}
 		mutex_unlock(&open_lock);
 	} else {
@@ -4231,7 +4231,7 @@ static int __init floppy_init(void)
 		err = -ENOMEM;
 		goto out_unreg_driver;
 	}
-	blk_queue_max_sectors(floppy_queue, 64);
+	blk_queue_max_hw_sectors(floppy_queue, 64);
 
 	blk_register_region(MKDEV(FLOPPY_MAJOR, 0), 256, THIS_MODULE,
 			    floppy_find, NULL, NULL);
@@ -4383,6 +4383,12 @@ out_unreg_blkdev:
 out_put_disk:
 	while (dr--) {
 		del_timer(&motor_off_timer[dr]);
+		if (disks[dr]->queue)
+			/*
+			 * put_disk() is not paired with add_disk() and
+			 * will put queue reference one extra time. fix it.
+			 */
+			disks[dr]->queue = NULL;
 		put_disk(disks[dr]);
 	}
 	return err;
@@ -4609,6 +4615,15 @@ static void __exit floppy_module_exit(void)
 			device_remove_file(&floppy_device[drive].dev, &dev_attr_cmos);
 			platform_device_unregister(&floppy_device[drive]);
 		}
+
+		/*
+		 * These disks have not called add_disk().  Don't put down
+		 * queue reference in put_disk().
+		 */
+		if (!(allowed_drive_mask & (1 << drive)) ||
+		    fdc_state[FDC(drive)].version == FDC_NONE)
+			disks[drive]->queue = NULL;
+
 		put_disk(disks[drive]);
 	}
 
@@ -4636,7 +4651,7 @@ static const struct pnp_device_id floppy_pnpids[] = {
 	{ "PNP0700", 0 },
 	{ }
 };
-MODULE_DEVICE_TABLE(pnp, floppy_pnpids);
+/* MODULE_DEVICE_TABLE(pnp, floppy_pnpids); */
 
 #else
 

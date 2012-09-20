@@ -46,10 +46,14 @@ cond_syscall(sys_getsockopt);
 cond_syscall(compat_sys_getsockopt);
 cond_syscall(sys_shutdown);
 cond_syscall(sys_sendmsg);
+cond_syscall(sys_sendmmsg);
 cond_syscall(compat_sys_sendmsg);
+cond_syscall(compat_sys_sendmmsg);
 cond_syscall(sys_recvmsg);
+cond_syscall(sys_recvmmsg);
 cond_syscall(compat_sys_recvmsg);
 cond_syscall(compat_sys_recvfrom);
+cond_syscall(compat_sys_recvmmsg);
 cond_syscall(sys_socketcall);
 cond_syscall(sys_futex);
 cond_syscall(compat_sys_futex);
@@ -133,6 +137,10 @@ cond_syscall(sys_io_submit);
 cond_syscall(sys_io_cancel);
 cond_syscall(sys_io_getevents);
 cond_syscall(sys_syslog);
+cond_syscall(sys_process_vm_readv);
+cond_syscall(sys_process_vm_writev);
+cond_syscall(compat_sys_process_vm_readv);
+cond_syscall(compat_sys_process_vm_writev);
 
 /* arch-specific weak syscall entries */
 cond_syscall(sys_pciconfig_read);
@@ -177,5 +185,27 @@ cond_syscall(compat_sys_timerfd_gettime);
 cond_syscall(sys_eventfd);
 cond_syscall(sys_eventfd2);
 
+/* open by handle */
+cond_syscall(sys_name_to_handle_at);
+cond_syscall(sys_open_by_handle_at);
+cond_syscall(compat_sys_open_by_handle_at);
+
 /* performance counters: */
 cond_syscall(sys_perf_event_open);
+cond_syscall(sys_getluid);
+cond_syscall(sys_setluid);
+cond_syscall(sys_setublimit);
+cond_syscall(compat_sys_setublimit);
+cond_syscall(sys_ubstat);
+
+/* fairsched compat */
+cond_syscall(sys_fairsched_mknod);
+cond_syscall(sys_fairsched_rmnod);
+cond_syscall(sys_fairsched_mvpr);
+cond_syscall(sys_fairsched_vcpus);
+cond_syscall(sys_fairsched_chwt);
+cond_syscall(sys_fairsched_rate);
+cond_syscall(sys_fairsched_cpumask);
+cond_syscall(sys_fairsched_nodemask);
+
+cond_syscall(compat_sys_lutime);

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2005 - 2009 ServerEngines
+ * Copyright (C) 2005 - 2011 Emulex
  * All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
@@ -8,11 +8,11 @@
  * Public License is included in this distribution in the file called COPYING.
  *
  * Contact Information:
- * linux-drivers@serverengines.com
+ * linux-drivers@emulex.com
  *
- * ServerEngines
- * 209 N. Fair Oaks Ave
- * Sunnyvale, CA 94085
+ * Emulex
+ * 3333 Susan Street
+ * Costa Mesa, CA 92626
  */
 
 #ifndef BE_H
@@ -29,30 +29,51 @@
 #include <linux/workqueue.h>
 #include <linux/interrupt.h>
 #include <linux/firmware.h>
+#include <linux/slab.h>
 
 #include "be_hw.h"
 
-#define DRV_VER			"2.101.205"
+#define DRV_VER			"4.1.307r"
 #define DRV_NAME		"be2net"
 #define BE_NAME			"ServerEngines BladeEngine2 10Gbps NIC"
+#define BE3_NAME		"ServerEngines BladeEngine3 10Gbps NIC"
 #define OC_NAME			"Emulex OneConnect 10Gbps NIC"
-#define DRV_DESC		BE_NAME "Driver"
+#define OC_NAME_BE		OC_NAME	"(be3)"
+#define OC_NAME_LANCER		OC_NAME "(Lancer)"
+#define OC_NAME_SH		OC_NAME "(Skyhawk)"
+#define DRV_DESC		"ServerEngines BladeEngine 10Gbps NIC Driver"
 
 #define BE_VENDOR_ID 		0x19a2
+#define EMULEX_VENDOR_ID	0x10df
 #define BE_DEVICE_ID1		0x211
-#define OC_DEVICE_ID1		0x700
-#define OC_DEVICE_ID2		0x701
+#define BE_DEVICE_ID2		0x221
+#define OC_DEVICE_ID1		0x700	/* Device Id for BE2 cards */
+#define OC_DEVICE_ID2		0x710	/* Device Id for BE3 cards */
+#define OC_DEVICE_ID3		0xe220	/* Device id for Lancer cards */
+#define OC_DEVICE_ID4           0xe228   /* Device id for VF in Lancer */
+#define OC_DEVICE_ID5		0x720	/* Device Id for Skyhawk cards */
 
 static inline char *nic_name(struct pci_dev *pdev)
 {
-	if (pdev->device == OC_DEVICE_ID1 || pdev->device == OC_DEVICE_ID2)
+	switch (pdev->device) {
+	case OC_DEVICE_ID1:
 		return OC_NAME;
-	else
+	case OC_DEVICE_ID2:
+		return OC_NAME_BE;
+	case OC_DEVICE_ID3:
+	case OC_DEVICE_ID4:
+		return OC_NAME_LANCER;
+	case BE_DEVICE_ID2:
+		return BE3_NAME;
+	case OC_DEVICE_ID5:
+		return OC_NAME_SH;
+	default:
 		return BE_NAME;
+	}
 }
 
 /* Number of bytes of an RX frame that are copied to skb->data */
-#define BE_HDR_LEN 		64
+#define BE_HDR_LEN		((u16) 64)
 #define BE_MAX_JUMBO_FRAME_SIZE	9018
 #define BE_MIN_MTU		256
 
@@ -68,6 +89,10 @@ static inline char *nic_name(struct pci_dev *pdev)
 #define MCC_Q_LEN		128	/* total size not to exceed 8 pages */
 #define MCC_CQ_LEN		256
 
+#define MAX_RSS_QS		4	/* BE limit is 4 queues/port */
+#define MAX_RX_QS		(MAX_RSS_QS + 1) /* RSS qs + 1 def Rx */
+#define MAX_TX_QS		8
+#define BE_MAX_MSIX_VECTORS	(MAX_RX_QS + 1)/* RX + TX */
 #define BE_NAPI_WEIGHT		64
 #define MAX_RX_POST 		BE_NAPI_WEIGHT /* Frags posted at a time */
 #define RX_FRAGS_REFILL_WM	(RX_Q_LEN - MAX_RX_POST)
@@ -116,9 +141,19 @@ static inline void *queue_tail_node(struct be_queue_info *q)
 	return q->dma_mem.va + q->tail * q->entry_size;
 }
 
+static inline void *queue_index_node(struct be_queue_info *q, u16 index)
+{
+	return q->dma_mem.va + index * q->entry_size;
+}
+
 static inline void queue_head_inc(struct be_queue_info *q)
 {
 	index_inc(&q->head, q->len);
+}
+
+static inline void index_dec(u16 *index, u16 limit)
+{
+	*index = MODULO((*index - 1), limit);
 }
 
 static inline void queue_tail_inc(struct be_queue_info *q)
@@ -135,6 +170,7 @@ struct be_eq_obj {
 	u16 min_eqd;		/* in usecs */
 	u16 max_eqd;		/* in usecs */
 	u16 cur_eqd;		/* in usecs */
+	u8  eq_idx;
 
 	struct napi_struct napi;
 };
@@ -142,47 +178,17 @@ struct be_eq_obj {
 struct be_mcc_obj {
 	struct be_queue_info q;
 	struct be_queue_info cq;
+	bool rearm_cq;
 };
 
-struct be_drvr_stats {
-	u32 be_tx_reqs;		/* number of TX requests initiated */
-	u32 be_tx_stops;	/* number of times TX Q was stopped */
-	u32 be_fwd_reqs;	/* number of send reqs through forwarding i/f */
-	u32 be_tx_wrbs;		/* number of tx WRBs used */
-	u32 be_tx_events;	/* number of tx completion events  */
-	u32 be_tx_compl;	/* number of tx completion entries processed */
-	ulong be_tx_jiffies;
-	u64 be_tx_bytes;
-	u64 be_tx_bytes_prev;
-	u32 be_tx_rate;
-
-	u32 cache_barrier[16];
-
-	u32 be_ethrx_post_fail;/* number of ethrx buffer alloc failures */
-	u32 be_polls;		/* number of times NAPI called poll function */
-	u32 be_rx_events;	/* number of ucast rx completion events  */
-	u32 be_rx_compl;	/* number of rx completion entries processed */
-	ulong be_rx_jiffies;
-	u64 be_rx_bytes;
-	u64 be_rx_bytes_prev;
-	u32 be_rx_rate;
-	/* number of non ether type II frames dropped where
-	 * frame len > length field of Mac Hdr */
-	u32 be_802_3_dropped_frames;
-	/* number of non ether type II frames malformed where
-	 * in frame len < length field of Mac Hdr */
-	u32 be_802_3_malformed_frames;
-	u32 be_rxcp_err;	/* Num rx completion entries w/ err set. */
-	ulong rx_fps_jiffies;	/* jiffies at last FPS calc */
-	u32 be_rx_frags;
-	u32 be_prev_rx_frags;
-	u32 be_rx_fps;		/* Rx frags per second */
-};
-
-struct be_stats_obj {
-	struct be_drvr_stats drvr_stats;
-	struct net_device_stats net_stats;
-	struct be_dma_mem cmd;
+struct be_tx_stats {
+	u64 tx_bytes;
+	u64 tx_pkts;
+	u64 tx_reqs;
+	u64 tx_wrbs;
+	u64 tx_compl;
+	ulong tx_jiffies;
+	u32 tx_stops;
 };
 
 struct be_tx_obj {
@@ -190,6 +196,7 @@ struct be_tx_obj {
 	struct be_queue_info cq;
 	/* Remember the skbs that were transmitted */
 	struct sk_buff *sent_skb_list[TX_Q_LEN];
+	struct be_tx_stats stats;
 };
 
 /* Struct to remember the pages posted for rx frags */
@@ -200,22 +207,111 @@ struct be_rx_page_info {
 	bool last_page_user;
 };
 
-struct be_rx_obj {
-	struct be_queue_info q;
-	struct be_queue_info cq;
-	struct be_rx_page_info page_info_tbl[RX_Q_LEN];
+struct be_rx_stats {
+	u64 rx_bytes;
+	u64 rx_pkts;
+	u64 rx_pkts_prev;
+	ulong rx_jiffies;
+	u32 rx_drops_no_skbs;	/* skb allocation errors */
+	u32 rx_drops_no_frags;	/* HW has no fetched frags */
+	u32 rx_post_fail;	/* page post alloc failures */
+	u32 rx_polls;		/* NAPI calls */
+	u32 rx_events;
+	u32 rx_compl;
+	u32 rx_mcast_pkts;
+	u32 rx_compl_err;	/* completions with err set */
+	u32 rx_pps;		/* pkts per second */
 };
 
-#define BE_NUM_MSIX_VECTORS		2	/* 1 each for Tx and Rx */
+struct be_rx_compl_info {
+	u32 rss_hash;
+	u16 vlan_tag;
+	u16 pkt_size;
+	u16 rxq_idx;
+	u16 port;
+	u8 vlanf;
+	u8 num_rcvd;
+	u8 err;
+	u8 ipf;
+	u8 tcpf;
+	u8 udpf;
+	u8 ip_csum;
+	u8 l4_csum;
+	u8 ipv6;
+	u8 vtm;
+	u8 pkt_type;
+};
+
+struct be_rx_obj {
+	struct be_adapter *adapter;
+	struct be_queue_info q;
+	struct be_queue_info cq;
+	struct be_rx_compl_info rxcp;
+	struct be_rx_page_info page_info_tbl[RX_Q_LEN];
+	struct be_eq_obj rx_eq;
+	struct be_rx_stats stats;
+	u8 rss_id;
+	bool rx_post_starved;	/* Zero rx frags have been posted to BE */
+	u32 cache_line_barrier[16];
+};
+
+struct be_drv_stats {
+	u32 be_on_die_temperature;
+	u32 tx_events;
+	u32 eth_red_drops;
+	u32 rx_drops_no_pbuf;
+	u32 rx_drops_no_txpb;
+	u32 rx_drops_no_erx_descr;
+	u32 rx_drops_no_tpre_descr;
+	u32 rx_drops_too_many_frags;
+	u32 forwarded_packets;
+	u32 rx_drops_mtu;
+	u32 rx_crc_errors;
+	u32 rx_alignment_symbol_errors;
+	u32 rx_pause_frames;
+	u32 rx_priority_pause_frames;
+	u32 rx_control_frames;
+	u32 rx_in_range_errors;
+	u32 rx_out_range_errors;
+	u32 rx_frame_too_long;
+	u32 rx_address_mismatch_drops;
+	u32 rx_dropped_too_small;
+	u32 rx_dropped_too_short;
+	u32 rx_dropped_header_too_small;
+	u32 rx_dropped_tcp_length;
+	u32 rx_dropped_runt;
+	u32 rx_ip_checksum_errs;
+	u32 rx_tcp_checksum_errs;
+	u32 rx_udp_checksum_errs;
+	u32 tx_pauseframes;
+	u32 tx_priority_pauseframes;
+	u32 tx_controlframes;
+	u32 rxpp_fifo_overflow_drop;
+	u32 rx_input_fifo_overflow_drop;
+	u32 pmem_fifo_overflow_drop;
+	u32 jabber_events;
+};
+
+struct be_vf_cfg {
+	unsigned char mac_addr[ETH_ALEN];
+	int if_handle;
+	int pmac_id;
+	u16 def_vid;
+	u16 vlan_tag;
+	u32 tx_rate;
+};
+
+#define BE_FLAGS_LINK_STATUS_INIT		1
+#define BE_FLAGS_WORKER_SCHEDULED		(1 << 3)
+
 struct be_adapter {
 	struct pci_dev *pdev;
 	struct net_device *netdev;
 
 	u8 __iomem *csr;
 	u8 __iomem *db;		/* Door Bell */
-	u8 __iomem *pcicfg;	/* PCI config space */
 
-	spinlock_t mbox_lock;	/* For serializing mbox cmds to BE card */
+	struct mutex mbox_lock; /* For serializing mbox cmds to BE card */
 	struct be_dma_mem mbox_mem;
 	/* Mbox mem is adjusted to align to 16 bytes. The allocated addr
 	 * is stored for freeing purpose */
@@ -225,54 +321,108 @@ struct be_adapter {
 	spinlock_t mcc_lock;	/* For serializing mcc cmds to BE card */
 	spinlock_t mcc_cq_lock;
 
-	struct msix_entry msix_entries[BE_NUM_MSIX_VECTORS];
-	bool msix_enabled;
+	struct msix_entry msix_entries[BE_MAX_MSIX_VECTORS];
+	u32 num_msix_vec;
 	bool isr_registered;
 
 	/* TX Rings */
 	struct be_eq_obj tx_eq;
-	struct be_tx_obj tx_obj;
+	struct be_tx_obj tx_obj[MAX_TX_QS];
+	u8 num_tx_qs;
 
 	u32 cache_line_break[8];
 
 	/* Rx rings */
-	struct be_eq_obj rx_eq;
-	struct be_rx_obj rx_obj;
+	struct be_rx_obj rx_obj[MAX_RX_QS];
+	u32 num_rx_qs;
 	u32 big_page_size;	/* Compounded page size shared by rx wrbs */
-	bool rx_post_starved;	/* Zero rx frags have been posted to BE */
+
+	u8 eq_next_idx;
+	struct be_drv_stats drv_stats;
 
 	struct vlan_group *vlan_grp;
-	u16 num_vlans;
+	u16 vlans_added;
+	u16 max_vlans;	/* Number of vlans supported */
 	u8 vlan_tag[VLAN_GROUP_ARRAY_LEN];
+	u8 vlan_prio_bmap;	/* Available Priority BitMap */
+	u16 recommended_prio;	/* Recommended Priority */
+	struct be_dma_mem rx_filter; /* Cmd DMA mem for rx-filter */
 
-	struct be_stats_obj stats;
+	struct be_dma_mem stats_cmd;
 	/* Work queue used to perform periodic tasks like getting statistics */
 	struct delayed_work work;
+	u16 work_counter;
 
+	u32 flags;
 	/* Ethtool knobs and info */
 	bool rx_csum; 		/* BE card must perform rx-checksumming */
 	char fw_ver[FW_VER_LEN];
-	u32 if_handle;		/* Used to configure filtering */
+	int if_handle;		/* Used to configure filtering */
 	u32 pmac_id;		/* MAC addr handle used by BE card */
 
-	bool link_up;
+	bool eeh_err;
+	bool ue_detected;
+	bool fw_timeout;
 	u32 port_num;
 	bool promiscuous;
-	u32 cap;
+	bool wol;
+	u32 function_mode;
+	u32 function_caps;
 	u32 rx_fc;		/* Rx flow control */
 	u32 tx_fc;		/* Tx flow control */
+	bool stats_cmd_sent;
+	int link_speed;
+	u8 port_type;
+	u8 transceiver;
+	u8 autoneg;
+	u8 generation;		/* BladeEngine ASIC generation */
+	u32 flash_status;
+	struct completion flash_compl;
+
+	u32 num_vfs;
+	u8 is_virtfn;
+	struct be_vf_cfg *vf_cfg;
+	bool be3_native;
+	u32 sli_family;
+	u8 hba_port_num;
+	u16 pvid;
 };
+
+#define be_physfn(adapter) (!adapter->is_virtfn)
+#define	sriov_enabled(adapter)		(adapter->num_vfs > 0)
+#define for_all_vfs(adapter, vf_cfg, i)					\
+	for (i = 0, vf_cfg = &adapter->vf_cfg[i]; i < adapter->num_vfs;	\
+		i++, vf_cfg++)
+
+/* BladeEngine Generation numbers */
+#define BE_GEN2 2
+#define BE_GEN3 3
+
+#define ON				1
+#define OFF				0
+#define lancer_chip(adapter)	((adapter->pdev->device == OC_DEVICE_ID3) || \
+				 (adapter->pdev->device == OC_DEVICE_ID4))
 
 extern const struct ethtool_ops be_ethtool_ops;
 
-#define drvr_stats(adapter)		(&adapter->stats.drvr_stats)
-
-static inline unsigned int be_pci_func(struct be_adapter *adapter)
-{
-	return PCI_FUNC(adapter->pdev->devfn);
-}
+#define msix_enabled(adapter)		(adapter->num_msix_vec > 0)
+#define tx_stats(txo)			(&txo->stats)
+#define rx_stats(rxo)			(&rxo->stats)
 
 #define BE_SET_NETDEV_OPS(netdev, ops)	(netdev->netdev_ops = ops)
+
+#define for_all_rx_queues(adapter, rxo, i)				\
+	for (i = 0, rxo = &adapter->rx_obj[i]; i < adapter->num_rx_qs;	\
+		i++, rxo++)
+
+/* Just skip the first default non-rss queue */
+#define for_all_rss_queues(adapter, rxo, i)				\
+	for (i = 0, rxo = &adapter->rx_obj[i+1]; i < (adapter->num_rx_qs - 1);\
+		i++, rxo++)
+
+#define for_all_tx_queues(adapter, txo, i)				\
+	for (i = 0, txo = &adapter->tx_obj[i]; i < adapter->num_tx_qs;	\
+		i++, txo++)
 
 #define PAGE_SHIFT_4K		12
 #define PAGE_SIZE_4K		(1 << PAGE_SHIFT_4K)
@@ -362,9 +512,40 @@ static inline u8 is_udp_pkt(struct sk_buff *skb)
 	return val;
 }
 
+static inline void be_check_sriov_fn_type(struct be_adapter *adapter)
+{
+	u32 sli_intf;
+
+	pci_read_config_dword(adapter->pdev, SLI_INTF_REG_OFFSET, &sli_intf);
+	adapter->is_virtfn = (sli_intf & SLI_INTF_FT_MASK) ? 1 : 0;
+}
+
+static inline void be_vf_eth_addr_generate(struct be_adapter *adapter, u8 *mac)
+{
+	u32 addr;
+
+	addr = jhash(adapter->netdev->dev_addr, ETH_ALEN, 0);
+
+	mac[5] = (u8)(addr & 0xFF);
+	mac[4] = (u8)((addr >> 8) & 0xFF);
+	mac[3] = (u8)((addr >> 16) & 0xFF);
+	/* Use the OUI from the current MAC address */
+	memcpy(mac, adapter->netdev->dev_addr, 3);
+}
+
+static inline bool be_multi_rxq(const struct be_adapter *adapter)
+{
+	return adapter->num_rx_qs > 1;
+}
+
+static inline bool be_error(struct be_adapter *adapter)
+{
+	return adapter->eeh_err || adapter->ue_detected || adapter->fw_timeout;
+}
+
 extern void be_cq_notify(struct be_adapter *adapter, u16 qid, bool arm,
 		u16 num_popped);
-extern void be_link_status_update(struct be_adapter *adapter, bool link_up);
-extern void netdev_stats_update(struct be_adapter *adapter);
+extern void be_link_status_update(struct be_adapter *adapter, u8 link_status);
+extern void be_parse_stats(struct be_adapter *adapter);
 extern int be_load_fw(struct be_adapter *adapter, u8 *func);
 #endif				/* BE_H */

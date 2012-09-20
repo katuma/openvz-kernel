@@ -1,6 +1,7 @@
 #ifndef LINUX_MSI_H
 #define LINUX_MSI_H
 
+#include <linux/kobject.h>
 #include <linux/list.h>
 
 struct msi_msg {
@@ -14,8 +15,10 @@ struct irq_desc;
 extern void mask_msi_irq(unsigned int irq);
 extern void unmask_msi_irq(unsigned int irq);
 extern void read_msi_msg_desc(struct irq_desc *desc, struct msi_msg *msg);
+extern void get_cached_msi_msg_desc(struct irq_desc *desc, struct msi_msg *msg);
 extern void write_msi_msg_desc(struct irq_desc *desc, struct msi_msg *msg);
 extern void read_msi_msg(unsigned int irq, struct msi_msg *msg);
+extern void get_cached_msi_msg(unsigned int irq, struct msi_msg *msg);
 extern void write_msi_msg(unsigned int irq, struct msi_msg *msg);
 
 struct msi_desc {
@@ -41,6 +44,8 @@ struct msi_desc {
 
 	/* Last set MSI message */
 	struct msi_msg msg;
+
+	struct kobject kobj;
 };
 
 /*

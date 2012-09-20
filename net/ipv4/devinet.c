@@ -81,6 +81,14 @@ static struct ipv4_devconf ipv4_devconf_dflt = {
 	},
 };
 
+struct ipv4_devconf_extensions ipv4_devconf_ext = {
+	.accept_local = 0,
+};
+
+static struct ipv4_devconf_extensions ipv4_devconf_dflt_ext = {
+	.accept_local = 0,
+};
+
 #define IPV4_DEVCONF_DFLT(net, attr) \
 	IPV4_DEVCONF((*net->ipv4.devconf_dflt), attr)
 
@@ -110,10 +118,11 @@ static inline void devinet_sysctl_unregister(struct in_device *idev)
 
 /* Locks all the inet devices. */
 
-static struct in_ifaddr *inet_alloc_ifa(void)
+struct in_ifaddr *inet_alloc_ifa(void)
 {
-	return kzalloc(sizeof(struct in_ifaddr), GFP_KERNEL);
+	return kzalloc(sizeof(struct in_ifaddr), GFP_KERNEL_UBC);
 }
+EXPORT_SYMBOL(inet_alloc_ifa);
 
 static void inet_rcu_free_ifa(struct rcu_head *head)
 {
@@ -146,9 +155,11 @@ void in_dev_finish_destroy(struct in_device *idev)
 	}
 }
 
-static struct in_device *inetdev_init(struct net_device *dev)
+struct in_device *inetdev_init(struct net_device *dev)
 {
 	struct in_device *in_dev;
+	struct ipv4_devconf_extensions *ext = dev ?
+				netdev_ipv4_devconf_extended(dev) : NULL;
 
 	ASSERT_RTNL();
 
@@ -157,6 +168,9 @@ static struct in_device *inetdev_init(struct net_device *dev)
 		goto out;
 	memcpy(&in_dev->cnf, dev_net(dev)->ipv4.devconf_dflt,
 			sizeof(in_dev->cnf));
+	if (ext)
+		memcpy(ext, &ipv4_devconf_dflt_ext, sizeof(ipv4_devconf_dflt_ext));
+
 	in_dev->cnf.sysctl = NULL;
 	in_dev->dev = dev;
 	if ((in_dev->arp_parms = neigh_parms_alloc(dev, &arp_tbl)) == NULL)
@@ -182,6 +196,7 @@ out_kfree:
 	in_dev = NULL;
 	goto out;
 }
+EXPORT_SYMBOL(inetdev_init);
 
 static void in_dev_rcu_put(struct rcu_head *head)
 {
@@ -375,10 +390,11 @@ static int __inet_insert_ifa(struct in_ifaddr *ifa, struct nlmsghdr *nlh,
 	return 0;
 }
 
-static int inet_insert_ifa(struct in_ifaddr *ifa)
+int inet_insert_ifa(struct in_ifaddr *ifa)
 {
 	return __inet_insert_ifa(ifa, NULL, 0);
 }
+EXPORT_SYMBOL(inet_insert_ifa);
 
 static int inet_set_ifa(struct net_device *dev, struct in_ifaddr *ifa)
 {
@@ -624,7 +640,7 @@ int devinet_ioctl(struct net *net, unsigned int cmd, void __user *arg)
 
 	case SIOCSIFFLAGS:
 		ret = -EACCES;
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 			goto out;
 		break;
 	case SIOCSIFADDR:	/* Set interface address (and family) */
@@ -632,7 +648,7 @@ int devinet_ioctl(struct net *net, unsigned int cmd, void __user *arg)
 	case SIOCSIFDSTADDR:	/* Set the destination address */
 	case SIOCSIFNETMASK: 	/* Set the netmask for the interface */
 		ret = -EACCES;
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 			goto out;
 		ret = -EINVAL;
 		if (sin->sin_family != AF_INET)
@@ -1076,6 +1092,7 @@ static int inetdev_event(struct notifier_block *this, unsigned long event,
 		}
 		ip_mc_up(in_dev);
 		/* fall through */
+	case NETDEV_NOTIFY_PEERS:
 	case NETDEV_CHANGEADDR:
 		/* Send gratuitous ARP to notify of link change */
 		if (IN_DEV_ARP_NOTIFY(in_dev)) {
@@ -1351,14 +1368,19 @@ static int devinet_sysctl_forward(ctl_table *ctl, int write,
 {
 	int *valp = ctl->data;
 	int val = *valp;
+	loff_t pos = *ppos;
 	int ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
 
 	if (write && *valp != val) {
 		struct net *net = ctl->extra2;
 
 		if (valp != &IPV4_DEVCONF_DFLT(net, FORWARDING)) {
-			if (!rtnl_trylock())
+			if (!rtnl_trylock()) {
+				/* Restore the original values before restarting */
+				*valp = val;
+				*ppos = pos;
 				return restart_syscall();
+			}
 			if (valp == &IPV4_DEVCONF_ALL(net, FORWARDING)) {
 				inet_forward_change(net);
 			} else if (*valp) {
@@ -1450,6 +1472,7 @@ static struct devinet_sysctl_table {
 		DEVINET_SYSCTL_RW_ENTRY(SEND_REDIRECTS, "send_redirects"),
 		DEVINET_SYSCTL_RW_ENTRY(ACCEPT_SOURCE_ROUTE,
 					"accept_source_route"),
+		DEVINET_SYSCTL_RW_ENTRY(SRC_VMARK, "src_valid_mark"),
 		DEVINET_SYSCTL_RW_ENTRY(PROXY_ARP, "proxy_arp"),
 		DEVINET_SYSCTL_RW_ENTRY(MEDIUM_ID, "medium_id"),
 		DEVINET_SYSCTL_RW_ENTRY(BOOTP_RELAY, "bootp_relay"),
@@ -1460,6 +1483,7 @@ static struct devinet_sysctl_table {
 		DEVINET_SYSCTL_RW_ENTRY(ARP_IGNORE, "arp_ignore"),
 		DEVINET_SYSCTL_RW_ENTRY(ARP_ACCEPT, "arp_accept"),
 		DEVINET_SYSCTL_RW_ENTRY(ARP_NOTIFY, "arp_notify"),
+		DEVINET_SYSCTL_RW_ENTRY(PROXY_ARP_PVLAN, "proxy_arp_pvlan"),
 
 		DEVINET_SYSCTL_FLUSHING_ENTRY(NOXFRM, "disable_xfrm"),
 		DEVINET_SYSCTL_FLUSHING_ENTRY(NOPOLICY, "disable_policy"),
@@ -1467,14 +1491,48 @@ static struct devinet_sysctl_table {
 					      "force_igmp_version"),
 		DEVINET_SYSCTL_FLUSHING_ENTRY(PROMOTE_SECONDARIES,
 					      "promote_secondaries"),
+		{
+			.ctl_name	= NET_IPV4_CONF_ACCEPT_LOCAL,
+			.procname	= "accept_local",
+			.data		= &ipv4_devconf_ext.accept_local,
+			.maxlen		= sizeof(int),
+			.mode		= 0644,
+			.proc_handler	= &devinet_conf_proc,
+			.strategy	= &devinet_conf_sysctl,
+			.extra1		= &ipv4_devconf,
+		},
+
 	},
 };
+
+/*
+ * Check for conf attribute inside the ipv4_devconf_extensions struct,
+ * and prepares their the value storage.
+ *
+ * Returns 1 if the attribute was extented, 0 otherwise.
+ */
+static int check_ipv4_ext_conf(ctl_table *t, struct net_device *dev, int dflt)
+{
+	struct ipv4_devconf_extensions *ipv4_ext = dev ?
+				netdev_ipv4_devconf_extended(dev) : NULL;
+
+	if (t->ctl_name != NET_IPV4_CONF_ACCEPT_LOCAL)
+		return 0;
+
+	if (ipv4_ext)
+		t->data += (char *)ipv4_ext - (char*) &ipv4_devconf_ext;
+	else if (dflt)
+		t->data = &ipv4_devconf_dflt_ext.accept_local;
+
+	return 1;
+}
 
 static int __devinet_sysctl_register(struct net *net, char *dev_name,
 		int ctl_name, struct ipv4_devconf *p)
 {
 	int i;
 	struct devinet_sysctl_table *t;
+	struct net_device *dev = NULL;
 
 #define DEVINET_CTL_PATH_DEV	3
 
@@ -1490,8 +1548,14 @@ static int __devinet_sysctl_register(struct net *net, char *dev_name,
 	if (!t)
 		goto out;
 
+	dev = __dev_get_by_name(net, dev_name);
 	for (i = 0; i < ARRAY_SIZE(t->devinet_vars) - 1; i++) {
-		t->devinet_vars[i].data += (char *)p - (char *)&ipv4_devconf;
+		if (!check_ipv4_ext_conf(&t->devinet_vars[i], dev,
+				   p == &ipv4_devconf_dflt)) {
+			t->devinet_vars[i].data +=
+					(char *)p - (char *)&ipv4_devconf;
+		}
+
 		t->devinet_vars[i].extra1 = p;
 		t->devinet_vars[i].extra2 = net;
 	}
@@ -1685,3 +1749,4 @@ EXPORT_SYMBOL(inet_select_addr);
 EXPORT_SYMBOL(inetdev_by_index);
 EXPORT_SYMBOL(register_inetaddr_notifier);
 EXPORT_SYMBOL(unregister_inetaddr_notifier);
+EXPORT_SYMBOL(inet_confirm_addr);

@@ -32,6 +32,8 @@
 #include <linux/netdevice.h>
 #include <linux/jhash.h>
 #include <linux/random.h>
+#include <net/route.h>
+#include <net/dst.h>
 #include <net/sock.h>
 #include <net/ip.h>
 #include <net/icmp.h>
@@ -186,10 +188,13 @@ static void ip_evictor(struct net *net)
  */
 static void ip_expire(unsigned long arg)
 {
+	struct inet_frag_queue *q = (struct inet_frag_queue *)arg;
 	struct ipq *qp;
 	struct net *net;
+	struct ve_struct *old_ve;
 
-	qp = container_of((struct inet_frag_queue *) arg, struct ipq, q);
+	qp = container_of(q, struct ipq, q);
+	old_ve = set_exec_env(q->owner_ve);
 	net = container_of(qp->q.net, struct net, ipv4.frags);
 
 	spin_lock(&qp->q.lock);
@@ -205,15 +210,40 @@ static void ip_expire(unsigned long arg)
 	if ((qp->q.last_in & INET_FRAG_FIRST_IN) && qp->q.fragments != NULL) {
 		struct sk_buff *head = qp->q.fragments;
 
-		/* Send an ICMP "Fragment Reassembly Timeout" message. */
-		if ((head->dev = dev_get_by_index(net, qp->iif)) != NULL) {
-			icmp_send(head, ICMP_TIME_EXCEEDED, ICMP_EXC_FRAGTIME, 0);
-			dev_put(head->dev);
+		head->dev = dev_get_by_index(net, qp->iif);
+		if (!head->dev)
+			goto out;
+
+		/*
+		 * Only search router table for the head fragment,
+		 * when defraging timeout at PRE_ROUTING HOOK.
+		 */
+		if (qp->user == IP_DEFRAG_CONNTRACK_IN && !skb_dst(head)) {
+			const struct iphdr *iph = ip_hdr(head);
+			int err = ip_route_input(head, iph->daddr, iph->saddr,
+						 iph->tos, head->dev);
+			if (unlikely(err))
+				goto out_put;
+ 
+			/*
+			 * Only an end host needs to send an ICMP
+			 * "Fragment Reassembly Timeout" message, per RFC792.
+			 */
+			if (skb_rtable(head)->rt_type != RTN_LOCAL)
+				goto out_put;
+ 
 		}
+ 
+		/* Send an ICMP "Fragment Reassembly Timeout" message. */
+		icmp_send(head, ICMP_TIME_EXCEEDED, ICMP_EXC_FRAGTIME, 0);	
+out_put:
+		dev_put(head->dev);
 	}
 out:
 	spin_unlock(&qp->q.lock);
 	ipq_put(qp);
+
+	(void)set_exec_env(old_ve);
 }
 
 /* Find the correct entry in the "incomplete datagrams" queue for
@@ -525,6 +555,7 @@ static int ip_frag_reasm(struct ipq *qp, struct sk_buff *prev,
 		clone->csum = 0;
 		clone->ip_summed = head->ip_summed;
 		atomic_add(clone->truesize, &qp->q.net->mem);
+		clone->owner_env = head->owner_env;
 	}
 
 	skb_shinfo(head)->frag_list = head->next;

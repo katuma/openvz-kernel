@@ -72,6 +72,7 @@ struct frag_queue
 	struct inet_frag_queue	q;
 
 	__be32			id;		/* fragment id		*/
+	u32			user;
 	struct in6_addr		saddr;
 	struct in6_addr		daddr;
 
@@ -102,26 +103,22 @@ static int ip6_frag_reasm(struct frag_queue *fq, struct sk_buff *prev,
 unsigned int inet6_hash_frag(__be32 id, const struct in6_addr *saddr,
 			     const struct in6_addr *daddr, u32 rnd)
 {
-	u32 a, b, c;
+	u32 c;
 
-	a = (__force u32)saddr->s6_addr32[0];
-	b = (__force u32)saddr->s6_addr32[1];
-	c = (__force u32)saddr->s6_addr32[2];
+	c = jhash_3words((__force u32)saddr->s6_addr32[0],
+			 (__force u32)saddr->s6_addr32[1],
+			 (__force u32)saddr->s6_addr32[2],
+			 rnd);
 
-	a += JHASH_GOLDEN_RATIO;
-	b += JHASH_GOLDEN_RATIO;
-	c += rnd;
-	__jhash_mix(a, b, c);
+	c = jhash_3words((__force u32)saddr->s6_addr32[3],
+			 (__force u32)daddr->s6_addr32[0],
+			 (__force u32)daddr->s6_addr32[1],
+			 c);
 
-	a += (__force u32)saddr->s6_addr32[3];
-	b += (__force u32)daddr->s6_addr32[0];
-	c += (__force u32)daddr->s6_addr32[1];
-	__jhash_mix(a, b, c);
-
-	a += (__force u32)daddr->s6_addr32[2];
-	b += (__force u32)daddr->s6_addr32[3];
-	c += (__force u32)id;
-	__jhash_mix(a, b, c);
+	c =  jhash_3words((__force u32)daddr->s6_addr32[2],
+			  (__force u32)daddr->s6_addr32[3],
+			  (__force u32)id,
+			  c);
 
 	return c & (INETFRAGS_HASHSZ - 1);
 }
@@ -141,7 +138,7 @@ int ip6_frag_match(struct inet_frag_queue *q, void *a)
 	struct ip6_create_arg *arg = a;
 
 	fq = container_of(q, struct frag_queue, q);
-	return (fq->id == arg->id &&
+	return (fq->id == arg->id && fq->user == arg->user &&
 			ipv6_addr_equal(&fq->saddr, arg->src) &&
 			ipv6_addr_equal(&fq->daddr, arg->dst));
 }
@@ -163,6 +160,7 @@ void ip6_frag_init(struct inet_frag_queue *q, void *a)
 	struct ip6_create_arg *arg = a;
 
 	fq->id = arg->id;
+	fq->user = arg->user;
 	ipv6_addr_copy(&fq->saddr, arg->src);
 	ipv6_addr_copy(&fq->daddr, arg->dst);
 }
@@ -197,8 +195,10 @@ static void ip6_frag_expire(unsigned long data)
 	struct frag_queue *fq;
 	struct net_device *dev = NULL;
 	struct net *net;
+	struct ve_struct *old_ve;
 
 	fq = container_of((struct inet_frag_queue *)data, struct frag_queue, q);
+	old_ve = set_exec_env(fq->q.owner_ve);
 
 	spin_lock(&fq->q.lock);
 
@@ -233,6 +233,8 @@ out:
 		dev_put(dev);
 	spin_unlock(&fq->q.lock);
 	fq_put(fq);
+
+	(void)set_exec_env(old_ve);
 }
 
 static __inline__ struct frag_queue *
@@ -244,6 +246,7 @@ fq_find(struct net *net, __be32 id, struct in6_addr *src, struct in6_addr *dst,
 	unsigned int hash;
 
 	arg.id = id;
+	arg.user = IP6_DEFRAG_LOCAL_DELIVER;
 	arg.src = src;
 	arg.dst = dst;
 
@@ -512,6 +515,7 @@ static int ip6_frag_reasm(struct frag_queue *fq, struct sk_buff *prev,
 		clone->csum = 0;
 		clone->ip_summed = head->ip_summed;
 		atomic_add(clone->truesize, &fq->q.net->mem);
+		clone->owner_env = head->owner_env;
 	}
 
 	/* We have to remove fragment header from datagram and to relocate

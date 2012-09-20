@@ -30,6 +30,11 @@ void refrigerator(void)
 	long save;
 
 	task_lock(current);
+	if (current->exit_state == EXIT_DEAD) {
+		printk(KERN_ERR "%s: freezing(current): %d\n", __func__,
+				freezing(current));
+		BUG();
+	}
 	if (freezing(current)) {
 		frozen_process();
 		task_unlock(current);

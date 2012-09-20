@@ -33,6 +33,8 @@
 #include <linux/bootmem.h>
 #include <linux/syscalls.h>
 #include <linux/kexec.h>
+#include <linux/kmsg_dump.h>
+#include <linux/veprintk.h>
 
 #include <asm/uaccess.h>
 
@@ -136,6 +138,7 @@ EXPORT_SYMBOL(console_set_on_cmdline);
 
 /* Flag: console code may call schedule() */
 static int console_may_schedule;
+int console_silence_loglevel;
 
 #ifdef CONFIG_PRINTK
 
@@ -162,46 +165,90 @@ void log_buf_kexec_setup(void)
 }
 #endif
 
-static int __init log_buf_len_setup(char *str)
+static int __init setup_console_silencelevel(char *str)
 {
-	unsigned size = memparse(str, &str);
-	unsigned long flags;
+	int level;
 
-	if (size)
-		size = roundup_pow_of_two(size);
-	if (size > log_buf_len) {
-		unsigned start, dest_idx, offset;
-		char *new_log_buf;
+	if (get_option(&str, &level) != 1)
+		return 0;
 
-		new_log_buf = alloc_bootmem(size);
-		if (!new_log_buf) {
-			printk(KERN_WARNING "log_buf_len: allocation failed\n");
-			goto out;
-		}
-
-		spin_lock_irqsave(&logbuf_lock, flags);
-		log_buf_len = size;
-		log_buf = new_log_buf;
-
-		offset = start = min(con_start, log_start);
-		dest_idx = 0;
-		while (start != log_end) {
-			log_buf[dest_idx] = __log_buf[start & (__LOG_BUF_LEN - 1)];
-			start++;
-			dest_idx++;
-		}
-		log_start -= offset;
-		con_start -= offset;
-		log_end -= offset;
-		spin_unlock_irqrestore(&logbuf_lock, flags);
-
-		printk(KERN_NOTICE "log_buf_len: %d\n", log_buf_len);
-	}
-out:
+	console_silence_loglevel = level;
 	return 1;
 }
 
-__setup("log_buf_len=", log_buf_len_setup);
+__setup("silencelevel=", setup_console_silencelevel);
+
+/* requested log_buf_len from kernel cmdline */
+static unsigned long __initdata new_log_buf_len;
+
+/* save requested log_buf_len since it's too early to process it */
+static int __init log_buf_len_setup(char *str)
+{
+	unsigned size = memparse(str, &str);
+
+	if (size)
+		size = roundup_pow_of_two(size);
+	if (size > log_buf_len)
+		new_log_buf_len = size;
+
+	return 0;
+}
+early_param("log_buf_len", log_buf_len_setup);
+
+void __init setup_log_buf(unsigned long (*alloc_fn)(unsigned long len))
+{
+	unsigned long flags;
+	unsigned start, dest_idx, offset;
+	char *new_log_buf;
+	int free;
+
+	if (!new_log_buf_len)
+		return;
+
+	if (alloc_fn) {
+		unsigned long mem;
+
+		mem = alloc_fn(new_log_buf_len);
+		if (!mem)
+			return;
+		new_log_buf = __va(mem);
+	}
+	else
+		new_log_buf = alloc_bootmem_nopanic(new_log_buf_len);
+
+	if (!new_log_buf) {
+		pr_err("log_buf_len: %ld bytes not available\n",
+			new_log_buf_len);
+		return;
+	}
+
+	spin_lock_irqsave(&logbuf_lock, flags);
+	log_buf_len = new_log_buf_len;
+	log_buf = new_log_buf;
+#ifdef CONFIG_VE
+	ve0.log_buf = log_buf;
+#endif
+	new_log_buf_len = 0;
+	free = __LOG_BUF_LEN - log_end;
+
+	offset = start = min(con_start, log_start);
+	dest_idx = 0;
+	while (start != log_end) {
+		unsigned log_idx_mask = start & (__LOG_BUF_LEN - 1);
+
+		log_buf[dest_idx] = __log_buf[log_idx_mask];
+		start++;
+		dest_idx++;
+	}
+	log_start -= offset;
+	con_start -= offset;
+	log_end -= offset;
+	spin_unlock_irqrestore(&logbuf_lock, flags);
+
+	pr_info("log_buf_len: %d\n", log_buf_len);
+	pr_info("early log buf free: %d(%d%%)\n",
+		free, (free * 100) / __LOG_BUF_LEN);
+}
 
 #ifdef CONFIG_BOOT_PRINTK_DELAY
 
@@ -256,6 +303,12 @@ static inline void boot_delay_msec(void)
 }
 #endif
 
+#ifdef CONFIG_SECURITY_DMESG_RESTRICT
+int dmesg_restrict = 1;
+#else
+int dmesg_restrict;
+#endif
+
 /*
  * Commands to do_syslog:
  *
@@ -278,6 +331,9 @@ int do_syslog(int type, char __user *buf, int len)
 	char c;
 	int error = 0;
 
+	if (!ve_is_super(get_exec_env()) && (type == 6 || type == 7))
+		goto out;
+
 	error = security_syslog(type);
 	if (error)
 		return error;
@@ -298,15 +354,15 @@ int do_syslog(int type, char __user *buf, int len)
 			error = -EFAULT;
 			goto out;
 		}
-		error = wait_event_interruptible(log_wait,
-							(log_start - log_end));
+		error = wait_event_interruptible(ve_log_wait,
+						(ve_log_start - ve_log_end));
 		if (error)
 			goto out;
 		i = 0;
 		spin_lock_irq(&logbuf_lock);
-		while (!error && (log_start != log_end) && i < len) {
-			c = LOG_BUF(log_start);
-			log_start++;
+		while (!error && (ve_log_start != ve_log_end) && i < len) {
+			c = VE_LOG_BUF(ve_log_start);
+			ve_log_start++;
 			spin_unlock_irq(&logbuf_lock);
 			error = __put_user(c,buf);
 			buf++;
@@ -332,15 +388,17 @@ int do_syslog(int type, char __user *buf, int len)
 			error = -EFAULT;
 			goto out;
 		}
+		if (ve_log_buf == NULL)
+			goto out;
 		count = len;
-		if (count > log_buf_len)
-			count = log_buf_len;
 		spin_lock_irq(&logbuf_lock);
-		if (count > logged_chars)
-			count = logged_chars;
+		if (count > ve_log_buf_len)
+			count = ve_log_buf_len;
+		if (count > ve_logged_chars)
+			count = ve_logged_chars;
 		if (do_clear)
-			logged_chars = 0;
-		limit = log_end;
+			ve_logged_chars = 0;
+		limit = ve_log_end;
 		/*
 		 * __put_user() could sleep, and while we sleep
 		 * printk() could overwrite the messages
@@ -349,9 +407,9 @@ int do_syslog(int type, char __user *buf, int len)
 		 */
 		for (i = 0; i < count && !error; i++) {
 			j = limit-1-i;
-			if (j + log_buf_len < log_end)
+			if (j + ve_log_buf_len < ve_log_end)
 				break;
-			c = LOG_BUF(j);
+			c = VE_LOG_BUF(j);
 			spin_unlock_irq(&logbuf_lock);
 			error = __put_user(c,&buf[count-1-i]);
 			cond_resched();
@@ -375,7 +433,7 @@ int do_syslog(int type, char __user *buf, int len)
 		}
 		break;
 	case 5:		/* Clear ring buffer */
-		logged_chars = 0;
+		ve_logged_chars = 0;
 		break;
 	case 6:		/* Disable logging to console */
 		if (saved_console_loglevel == -1)
@@ -392,18 +450,21 @@ int do_syslog(int type, char __user *buf, int len)
 		error = -EINVAL;
 		if (len < 1 || len > 8)
 			goto out;
+		error = 0;
+		/* VE has no console, so return success */
+		if (!ve_is_super(get_exec_env()))
+			goto out;
 		if (len < minimum_console_loglevel)
 			len = minimum_console_loglevel;
 		console_loglevel = len;
 		/* Implicitly re-enable logging to console */
 		saved_console_loglevel = -1;
-		error = 0;
 		break;
 	case 9:		/* Number of chars in the log buffer */
-		error = log_end - log_start;
+		error = ve_log_end - ve_log_start;
 		break;
 	case 10:	/* Size of the log buffer */
-		error = log_buf_len;
+		error = ve_log_buf_len;
 		break;
 	default:
 		error = -EINVAL;
@@ -514,14 +575,14 @@ static void call_console_drivers(unsigned start, unsigned end)
 
 static void emit_log_char(char c)
 {
-	LOG_BUF(log_end) = c;
-	log_end++;
-	if (log_end - log_start > log_buf_len)
-		log_start = log_end - log_buf_len;
-	if (log_end - con_start > log_buf_len)
-		con_start = log_end - log_buf_len;
-	if (logged_chars < log_buf_len)
-		logged_chars++;
+	VE_LOG_BUF(ve_log_end) = c;
+	ve_log_end++;
+	if (ve_log_end - ve_log_start > ve_log_buf_len)
+		ve_log_start = ve_log_end - ve_log_buf_len;
+	if (ve_is_super(get_exec_env()) && ve_log_end - con_start > ve_log_buf_len)
+		con_start = ve_log_end - ve_log_buf_len;
+	if (ve_logged_chars < ve_log_buf_len)
+		ve_logged_chars++;
 }
 
 /*
@@ -551,6 +612,9 @@ static int printk_time = 1;
 static int printk_time = 0;
 #endif
 module_param_named(time, printk_time, bool, S_IRUGO | S_IWUSR);
+
+static bool always_kmsg_dump;
+module_param_named(always_kmsg_dump, always_kmsg_dump, bool, S_IRUGO | S_IWUSR);
 
 /* Check if we have any console registered that can be called early in boot. */
 static int have_callable_console(void)
@@ -585,6 +649,30 @@ static int have_callable_console(void)
  *
  * See the vsnprintf() documentation for format string extensions over C99.
  */
+
+static inline int ve_log_init(void)
+{
+#ifdef CONFIG_VE
+	if (ve_log_buf != NULL)
+		return 0;
+
+	if (ve_is_super(get_exec_env())) {
+		ve0._log_wait = &log_wait;
+		ve0._log_start = &log_start;
+		ve0._log_end = &log_end;
+		ve0._logged_chars = &logged_chars;
+		ve0.log_buf = log_buf;
+		return 0;
+	}
+
+	ve_log_buf = kmalloc(ve_log_buf_len, GFP_ATOMIC);
+	if (!ve_log_buf)
+		return -ENOMEM;
+
+	memset(ve_log_buf, 0, ve_log_buf_len);
+#endif
+	return 0;
+}
 
 asmlinkage int printk(const char *fmt, ...)
 {
@@ -667,13 +755,14 @@ static inline void printk_delay(void)
 	}
 }
 
-asmlinkage int vprintk(const char *fmt, va_list args)
+asmlinkage int __vprintk(const char *fmt, va_list args)
 {
 	int printed_len = 0;
 	int current_log_level = default_message_loglevel;
 	unsigned long flags;
 	int this_cpu;
 	char *p;
+	int err, need_wake;
 
 	boot_delay_msec();
 	printk_delay();
@@ -704,6 +793,13 @@ asmlinkage int vprintk(const char *fmt, va_list args)
 	lockdep_off();
 	spin_lock(&logbuf_lock);
 	printk_cpu = this_cpu;
+
+	err = ve_log_init();
+	if (err) {
+		spin_unlock(&logbuf_lock);
+		printed_len = err;
+		goto out_lockdep;
+	}
 
 	if (recursion_bug) {
 		recursion_bug = 0;
@@ -768,6 +864,13 @@ asmlinkage int vprintk(const char *fmt, va_list args)
 					emit_log_char(*tp);
 				printed_len += tlen;
 			}
+			if (test_taint(TAINT_BIT_BY_ZOMBIE)) {
+				/* len is 21 */
+				char tbuf[] = "[BRRAAIIIINNNSSSSS!] ";
+				char *tp;
+				for (tp = tbuf; tp < tbuf + 21; tp++)
+					emit_log_char(*tp);
+			}
 
 			if (!*p)
 				break;
@@ -788,18 +891,66 @@ asmlinkage int vprintk(const char *fmt, va_list args)
 	 * will release 'logbuf_lock' regardless of whether it
 	 * actually gets the semaphore or not.
 	 */
-	if (acquire_console_semaphore_for_printk(this_cpu))
+	if (!ve_is_super(get_exec_env())) {
+		need_wake = (ve_log_start != ve_log_end);
+		printk_cpu = UINT_MAX;
+		spin_unlock(&logbuf_lock);
+		lockdep_on();
+		raw_local_irq_restore(flags);
+		if (!oops_in_progress && need_wake)
+			wake_up_interruptible(&ve_log_wait);
+		goto out_preempt;
+	} else if (acquire_console_semaphore_for_printk(this_cpu))
 		release_console_sem();
 
+out_lockdep:
 	lockdep_on();
 out_restore_irqs:
 	raw_local_irq_restore(flags);
 
+out_preempt:
 	preempt_enable();
 	return printed_len;
 }
 EXPORT_SYMBOL(printk);
 EXPORT_SYMBOL(vprintk);
+
+asmlinkage int vprintk(const char *fmt, va_list args)
+{
+	int i;
+	struct ve_struct *env;
+
+	env = set_exec_env(get_ve0());
+	i = __vprintk(fmt, args);
+	(void)set_exec_env(env);
+	return i;
+}
+
+asmlinkage int ve_vprintk(int dst, const char *fmt, va_list args)
+{
+	int printed_len;
+	va_list args2;
+
+	printed_len = 0;
+	va_copy(args2, args);
+	if (ve_is_super(get_exec_env()) || (dst & VE0_LOG))
+		printed_len = vprintk(fmt, args);
+	if (!ve_is_super(get_exec_env()) && (dst & VE_LOG))
+		printed_len = __vprintk(fmt, args2);
+	return printed_len;
+}
+
+asmlinkage int ve_printk(int dst, const char *fmt, ...)
+{
+	va_list args;
+	int printed_len;
+
+	va_start(args, fmt);
+	printed_len = ve_vprintk(dst, fmt, args);
+	va_end(args);
+	return printed_len;
+}
+EXPORT_SYMBOL(ve_printk);
 
 #else
 
@@ -1014,6 +1165,8 @@ void printk_tick(void)
 
 int printk_needs_cpu(int cpu)
 {
+	if (unlikely(cpu_is_offline(cpu)))
+		printk_tick();
 	return per_cpu(printk_pending, cpu);
 }
 
@@ -1058,6 +1211,7 @@ void release_console_sem(void)
 		_con_start = con_start;
 		_log_end = log_end;
 		con_start = log_end;		/* Flush */
+		printk_cpu = UINT_MAX;
 		spin_unlock(&logbuf_lock);
 		stop_critical_timings();	/* don't trace print latency */
 		call_console_drivers(_con_start, _log_end);
@@ -1066,6 +1220,7 @@ void release_console_sem(void)
 	}
 	console_locked = 0;
 	up(&console_sem);
+	printk_cpu = UINT_MAX;
 	spin_unlock_irqrestore(&logbuf_lock, flags);
 	if (wake_klogd)
 		wake_up_klogd();
@@ -1404,4 +1559,192 @@ bool printk_timed_ratelimit(unsigned long *caller_jiffies,
 	return false;
 }
 EXPORT_SYMBOL(printk_timed_ratelimit);
+
+static DEFINE_SPINLOCK(dump_list_lock);
+static LIST_HEAD(dump_list);
+
+/**
+ * kmsg_dump_register - register a kernel log dumper.
+ * @dumper: pointer to the kmsg_dumper structure
+ *
+ * Adds a kernel log dumper to the system. The dump callback in the
+ * structure will be called when the kernel oopses or panics and must be
+ * set. Returns zero on success and %-EINVAL or %-EBUSY otherwise.
+ */
+int kmsg_dump_register(struct kmsg_dumper *dumper)
+{
+	unsigned long flags;
+	int err = -EBUSY;
+
+	/* The dump callback needs to be set */
+	if (!dumper->dump)
+		return -EINVAL;
+
+	spin_lock_irqsave(&dump_list_lock, flags);
+	/* Don't allow registering multiple times */
+	if (!dumper->registered) {
+		dumper->registered = 1;
+		list_add_tail(&dumper->list, &dump_list);
+		err = 0;
+	}
+	spin_unlock_irqrestore(&dump_list_lock, flags);
+
+	return err;
+}
+EXPORT_SYMBOL_GPL(kmsg_dump_register);
+
+/**
+ * kmsg_dump_unregister - unregister a kmsg dumper.
+ * @dumper: pointer to the kmsg_dumper structure
+ *
+ * Removes a dump device from the system. Returns zero on success and
+ * %-EINVAL otherwise.
+ */
+int kmsg_dump_unregister(struct kmsg_dumper *dumper)
+{
+	unsigned long flags;
+	int err = -EINVAL;
+
+	spin_lock_irqsave(&dump_list_lock, flags);
+	if (dumper->registered) {
+		dumper->registered = 0;
+		list_del(&dumper->list);
+		err = 0;
+	}
+	spin_unlock_irqrestore(&dump_list_lock, flags);
+
+	return err;
+}
+EXPORT_SYMBOL_GPL(kmsg_dump_unregister);
+
+static const char const *kmsg_reasons[] = {
+	[KMSG_DUMP_OOPS]	= "oops",
+	[KMSG_DUMP_PANIC]	= "panic",
+	[KMSG_DUMP_KEXEC]	= "kexec",
+	[KMSG_DUMP_RESTART]	= "restart",
+	[KMSG_DUMP_HALT]	= "halt",
+	[KMSG_DUMP_POWEROFF]	= "poweroff",
+	[KMSG_DUMP_EMERG]	= "emergency_restart",
+};
+
+static const char *kmsg_to_str(enum kmsg_dump_reason reason)
+{
+	if (reason >= ARRAY_SIZE(kmsg_reasons) || reason < 0)
+		return "unknown";
+
+	return kmsg_reasons[reason];
+}
+
+/**
+ * kmsg_dump - dump kernel log to kernel message dumpers.
+ * @reason: the reason (oops, panic etc) for dumping
+ *
+ * Iterate through each of the dump devices and call the oops/panic
+ * callbacks with the log buffer.
+ */
+void kmsg_dump(enum kmsg_dump_reason reason)
+{
+	unsigned long end;
+	unsigned chars;
+	struct kmsg_dumper *dumper;
+	const char *s1, *s2;
+	unsigned long l1, l2;
+	unsigned long flags;
+
+	if ((reason > KMSG_DUMP_OOPS) && !always_kmsg_dump)
+		return;
+
+	/* Theoretically, the log could move on after we do this, but
+	   there's not a lot we can do about that. The new messages
+	   will overwrite the start of what we dump. */
+	spin_lock_irqsave(&logbuf_lock, flags);
+	end = log_end & LOG_BUF_MASK;
+	chars = logged_chars;
+	spin_unlock_irqrestore(&logbuf_lock, flags);
+
+	if (chars > end) {
+		s1 = log_buf + log_buf_len - chars + end;
+		l1 = chars - end;
+
+		s2 = log_buf;
+		l2 = end;
+	} else {
+		s1 = "";
+		l1 = 0;
+
+		s2 = log_buf + end - chars;
+		l2 = chars;
+	}
+
+	if (!spin_trylock_irqsave(&dump_list_lock, flags)) {
+		printk(KERN_ERR "dump_kmsg: dump list lock is held during %s, skipping dump\n",
+				kmsg_to_str(reason));
+		return;
+	}
+	list_for_each_entry(dumper, &dump_list, list)
+		dumper->dump(dumper, reason, s1, l1, s2, l2);
+	spin_unlock_irqrestore(&dump_list_lock, flags);
+}
 #endif
+
+static cpumask_t nmi_show_regs_cpus = CPU_MASK_NONE;
+static unsigned long nmi_show_regs_timeout;
+
+void __attribute__((weak)) send_nmi_ipi_allbutself(void)
+{
+	cpus_clear(nmi_show_regs_cpus);
+}
+
+static void busted_show_regs(struct pt_regs *regs, int in_nmi)
+{
+	if (!regs || (in_nmi && spin_is_locked(&logbuf_lock)))
+		return;
+
+	bust_spinlocks(1);
+	printk("----------- IPI show regs -----------\n");
+	show_regs(regs);
+	bust_spinlocks(-1);
+}
+
+void nmi_show_regs(struct pt_regs *regs, int in_nmi)
+{
+	if (cpus_empty(nmi_show_regs_cpus))
+		goto doit;
+
+	/* Previous request still in progress */
+	if (time_before(jiffies, nmi_show_regs_timeout))
+		return;
+
+	if (!in_nmi || !spin_is_locked(&logbuf_lock)) {
+		int cpu;
+
+		bust_spinlocks(1);
+		printk("previous show regs lost IPI to: ");
+		for_each_cpu_mask(cpu, nmi_show_regs_cpus)
+			printk("%d ", cpu);
+		printk("\n");
+		bust_spinlocks(-1);
+	}
+
+doit:
+	nmi_show_regs_timeout = jiffies + HZ/10;
+	nmi_show_regs_cpus = cpu_online_map;
+	cpu_clear(raw_smp_processor_id(), nmi_show_regs_cpus);
+	busted_show_regs(regs, in_nmi);
+	send_nmi_ipi_allbutself();
+}
+
+/* call only from nmi handler */
+int do_nmi_show_regs(struct pt_regs *regs, int cpu)
+{
+	static DEFINE_SPINLOCK(nmi_show_regs_lock);
+
+	if (!cpu_isset(cpu, nmi_show_regs_cpus))
+		return 0;
+
+	spin_lock(&nmi_show_regs_lock);
+	busted_show_regs(regs, 1);
+	cpu_clear(cpu, nmi_show_regs_cpus);
+	spin_unlock(&nmi_show_regs_lock);
+	return 1;
+}

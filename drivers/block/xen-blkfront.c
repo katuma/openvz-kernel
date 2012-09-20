@@ -46,12 +46,18 @@
 #include <xen/grant_table.h>
 #include <xen/events.h>
 #include <xen/page.h>
+#include <xen/platform_pci.h>
 
 #include <xen/interface/grant_table.h>
 #include <xen/interface/io/blkif.h>
 #include <xen/interface/io/protocols.h>
 
 #include <asm/xen/hypervisor.h>
+
+static int sda_is_xvda;
+module_param(sda_is_xvda, bool, 0);
+MODULE_PARM_DESC(sda_is_xvda,
+		 "sdX in guest config translates to xvdX, not xvd(X+4)");
 
 enum blkif_state {
 	BLKIF_STATE_DISCONNECTED,
@@ -76,6 +82,7 @@ static const struct block_device_operations xlvbd_block_fops;
  */
 struct blkfront_info
 {
+	struct mutex mutex;
 	struct xenbus_device *xbdev;
 	struct gendisk *gd;
 	int vdevice;
@@ -90,17 +97,15 @@ struct blkfront_info
 	struct gnttab_free_callback callback;
 	struct blk_shadow shadow[BLK_RING_SIZE];
 	unsigned long shadow_free;
-	int feature_barrier;
+	unsigned int feature_flush;
 	int is_ready;
-
-	/**
-	 * The number of people holding this device open.  We won't allow a
-	 * hot-unplug unless this is 0.
-	 */
-	int users;
 };
 
 static DEFINE_SPINLOCK(blkif_io_lock);
+
+static unsigned int nr_minors;
+static unsigned long *minors;
+static DEFINE_SPINLOCK(minor_lock);
 
 #define MAXIMUM_OUTSTANDING_BLOCK_REQS \
 	(BLKIF_MAX_SEGMENTS_PER_REQUEST * BLK_RING_SIZE)
@@ -116,8 +121,14 @@ static DEFINE_SPINLOCK(blkif_io_lock);
 #define EXTENDED (1<<EXT_SHIFT)
 #define VDEV_IS_EXTENDED(dev) ((dev)&(EXTENDED))
 #define BLKIF_MINOR_EXT(dev) ((dev)&(~EXTENDED))
+#define EMULATED_HD_DISK_MINOR_OFFSET (0)
+#define EMULATED_HD_DISK_NAME_OFFSET (EMULATED_HD_DISK_MINOR_OFFSET / 256)
 
 #define DEV_NAME	"xvd"	/* name in /dev */
+
+/* module settings dependent on the "sda_is_xvda" module parameter */
+static int emulated_sd_disk_minor_offset = EMULATED_HD_DISK_MINOR_OFFSET + (4 * 16);
+static int emulated_sd_disk_name_offset = EMULATED_HD_DISK_NAME_OFFSET + 4;
 
 static int get_id_from_freelist(struct blkfront_info *info)
 {
@@ -134,6 +145,55 @@ static void add_id_to_freelist(struct blkfront_info *info,
 	info->shadow[id].req.id  = info->shadow_free;
 	info->shadow[id].request = 0;
 	info->shadow_free = id;
+}
+
+static int xlbd_reserve_minors(unsigned int minor, unsigned int nr)
+{
+	unsigned int end = minor + nr;
+	int rc;
+
+	if (end > nr_minors) {
+		unsigned long *bitmap, *old;
+
+		bitmap = kzalloc(BITS_TO_LONGS(end) * sizeof(*bitmap),
+				 GFP_KERNEL);
+		if (bitmap == NULL)
+			return -ENOMEM;
+
+		spin_lock(&minor_lock);
+		if (end > nr_minors) {
+			old = minors;
+			memcpy(bitmap, minors,
+			       BITS_TO_LONGS(nr_minors) * sizeof(*bitmap));
+			minors = bitmap;
+			nr_minors = BITS_TO_LONGS(end) * BITS_PER_LONG;
+		} else
+			old = bitmap;
+		spin_unlock(&minor_lock);
+		kfree(old);
+	}
+
+	spin_lock(&minor_lock);
+	if (find_next_bit(minors, end, minor) >= end) {
+		for (; minor < end; ++minor)
+			__set_bit(minor, minors);
+		rc = 0;
+	} else
+		rc = -EBUSY;
+	spin_unlock(&minor_lock);
+
+	return rc;
+}
+
+static void xlbd_release_minors(unsigned int minor, unsigned int nr)
+{
+	unsigned int end = minor + nr;
+
+	BUG_ON(end > nr_minors);
+	spin_lock(&minor_lock);
+	for (; minor < end; ++minor)
+		__clear_bit(minor, minors);
+	spin_unlock(&minor_lock);
 }
 
 static void blkif_restart_queue_callback(void *arg)
@@ -236,7 +296,7 @@ static int blkif_queue_request(struct request *req)
 
 	ring_req->operation = rq_data_dir(req) ?
 		BLKIF_OP_WRITE : BLKIF_OP_READ;
-	if (blk_barrier_rq(req))
+	if (req->cmd_flags & REQ_HARDBARRIER)
 		ring_req->operation = BLKIF_OP_WRITE_BARRIER;
 
 	ring_req->nr_segments = blk_rq_map_sg(req->q, req, info->sg);
@@ -307,7 +367,7 @@ static void do_blkif_request(struct request_queue *rq)
 
 		blk_start_request(req);
 
-		if (!blk_fs_request(req)) {
+		if (req->cmd_type != REQ_TYPE_FS) {
 			__blk_end_request_all(req, -EIO);
 			continue;
 		}
@@ -345,15 +405,14 @@ static int xlvbd_init_blk_queue(struct gendisk *gd, u16 sector_size)
 
 	/* Hard sector size and max sectors impersonate the equiv. hardware. */
 	blk_queue_logical_block_size(rq, sector_size);
-	blk_queue_max_sectors(rq, 512);
+	blk_queue_max_hw_sectors(rq, 512);
 
 	/* Each segment in a request is up to an aligned page in size. */
 	blk_queue_segment_boundary(rq, PAGE_SIZE - 1);
 	blk_queue_max_segment_size(rq, PAGE_SIZE);
 
 	/* Ensure a merged request will fit in a single I/O ring slot. */
-	blk_queue_max_phys_segments(rq, BLKIF_MAX_SEGMENTS_PER_REQUEST);
-	blk_queue_max_hw_segments(rq, BLKIF_MAX_SEGMENTS_PER_REQUEST);
+	blk_queue_max_segments(rq, BLKIF_MAX_SEGMENTS_PER_REQUEST);
 
 	/* Make sure buffer addresses are sector-aligned. */
 	blk_queue_dma_alignment(rq, 511);
@@ -367,23 +426,73 @@ static int xlvbd_init_blk_queue(struct gendisk *gd, u16 sector_size)
 }
 
 
-static int xlvbd_barrier(struct blkfront_info *info)
+static void xlvbd_flush(struct blkfront_info *info)
 {
-	int err;
-
-	err = blk_queue_ordered(info->rq,
-				info->feature_barrier ? QUEUE_ORDERED_DRAIN : QUEUE_ORDERED_NONE,
-				NULL);
-
-	if (err)
-		return err;
-
+	blk_queue_flush(info->rq, info->feature_flush);
 	printk(KERN_INFO "blkfront: %s: barriers %s\n",
 	       info->gd->disk_name,
-	       info->feature_barrier ? "enabled" : "disabled");
-	return 0;
+	       info->feature_flush ? "enabled" : "disabled");
 }
 
+static int xen_translate_vdev(int vdevice, int *minor, unsigned int *offset)
+{
+	int major;
+	major = BLKIF_MAJOR(vdevice);
+	*minor = BLKIF_MINOR(vdevice);
+	switch (major) {
+		case XEN_IDE0_MAJOR:
+			*offset = (*minor / 64) + EMULATED_HD_DISK_NAME_OFFSET;
+			*minor = ((*minor / 64) * PARTS_PER_DISK) +
+				EMULATED_HD_DISK_MINOR_OFFSET;
+			break;
+		case XEN_IDE1_MAJOR:
+			*offset = (*minor / 64) + 2 + EMULATED_HD_DISK_NAME_OFFSET;
+			*minor = (((*minor / 64) + 2) * PARTS_PER_DISK) +
+				EMULATED_HD_DISK_MINOR_OFFSET;
+			break;
+		case XEN_SCSI_DISK0_MAJOR:
+			*offset = (*minor / PARTS_PER_DISK) + emulated_sd_disk_name_offset;
+			*minor = *minor + emulated_sd_disk_minor_offset;
+			break;
+		case XEN_SCSI_DISK1_MAJOR:
+		case XEN_SCSI_DISK2_MAJOR:
+		case XEN_SCSI_DISK3_MAJOR:
+		case XEN_SCSI_DISK4_MAJOR:
+		case XEN_SCSI_DISK5_MAJOR:
+		case XEN_SCSI_DISK6_MAJOR:
+		case XEN_SCSI_DISK7_MAJOR:
+			*offset = (*minor / PARTS_PER_DISK) + 
+				((major - XEN_SCSI_DISK1_MAJOR + 1) * 16) +
+				emulated_sd_disk_name_offset;
+			*minor = *minor +
+				((major - XEN_SCSI_DISK1_MAJOR + 1) * 16 * PARTS_PER_DISK) +
+				emulated_sd_disk_minor_offset;
+			break;
+		case XEN_SCSI_DISK8_MAJOR:
+		case XEN_SCSI_DISK9_MAJOR:
+		case XEN_SCSI_DISK10_MAJOR:
+		case XEN_SCSI_DISK11_MAJOR:
+		case XEN_SCSI_DISK12_MAJOR:
+		case XEN_SCSI_DISK13_MAJOR:
+		case XEN_SCSI_DISK14_MAJOR:
+		case XEN_SCSI_DISK15_MAJOR:
+			*offset = (*minor / PARTS_PER_DISK) + 
+				((major - XEN_SCSI_DISK8_MAJOR + 8) * 16) +
+				emulated_sd_disk_name_offset;
+			*minor = *minor +
+				((major - XEN_SCSI_DISK8_MAJOR + 8) * 16 * PARTS_PER_DISK) +
+				emulated_sd_disk_minor_offset;
+			break;
+		case XENVBD_MAJOR:
+			*offset = *minor / PARTS_PER_DISK;
+			break;
+		default:
+			printk(KERN_WARNING "blkfront: your disk configuration is "
+					"incorrect, please use an xvd device instead\n");
+			return -ENODEV;
+	}
+	return 0;
+}
 
 static int xlvbd_alloc_gendisk(blkif_sector_t capacity,
 			       struct blkfront_info *info,
@@ -391,7 +500,7 @@ static int xlvbd_alloc_gendisk(blkif_sector_t capacity,
 {
 	struct gendisk *gd;
 	int nr_minors = 1;
-	int err = -ENODEV;
+	int err;
 	unsigned int offset;
 	int minor;
 	int nr_parts;
@@ -406,21 +515,32 @@ static int xlvbd_alloc_gendisk(blkif_sector_t capacity,
 	}
 
 	if (!VDEV_IS_EXTENDED(info->vdevice)) {
-		minor = BLKIF_MINOR(info->vdevice);
-		nr_parts = PARTS_PER_DISK;
+		err = xen_translate_vdev(info->vdevice, &minor, &offset);
+		if (err)
+			return err;		
+ 		nr_parts = PARTS_PER_DISK;
 	} else {
 		minor = BLKIF_MINOR_EXT(info->vdevice);
 		nr_parts = PARTS_PER_EXT_DISK;
+		offset = minor / nr_parts;
+		if (xen_hvm_domain() && offset < EMULATED_HD_DISK_NAME_OFFSET + 4)
+			printk(KERN_WARNING "blkfront: vdevice 0x%x might conflict with "
+					"emulated IDE disks,\n\t choose an xvd device name"
+					"from xvde on\n", info->vdevice);
 	}
+	err = -ENODEV;
 
 	if ((minor % nr_parts) == 0)
 		nr_minors = nr_parts;
 
+	err = xlbd_reserve_minors(minor, nr_minors);
+	if (err)
+		goto out;
+	err = -ENODEV;
+
 	gd = alloc_disk(nr_minors);
 	if (gd == NULL)
-		goto out;
-
-	offset = minor / nr_parts;
+		goto release;
 
 	if (nr_minors > 1) {
 		if (offset < 26)
@@ -449,14 +569,13 @@ static int xlvbd_alloc_gendisk(blkif_sector_t capacity,
 
 	if (xlvbd_init_blk_queue(gd, sector_size)) {
 		del_gendisk(gd);
-		goto out;
+		goto release;
 	}
 
 	info->rq = gd->queue;
 	info->gd = gd;
 
-	if (info->feature_barrier)
-		xlvbd_barrier(info);
+	xlvbd_flush(info);
 
 	if (vdisk_info & VDISK_READONLY)
 		set_disk_ro(gd, 1);
@@ -469,8 +588,43 @@ static int xlvbd_alloc_gendisk(blkif_sector_t capacity,
 
 	return 0;
 
+ release:
+	xlbd_release_minors(minor, nr_minors);
  out:
 	return err;
+}
+
+static void xlvbd_release_gendisk(struct blkfront_info *info)
+{
+	unsigned int minor, nr_minors;
+	unsigned long flags;
+
+	if (info->rq == NULL)
+		return;
+
+	spin_lock_irqsave(&blkif_io_lock, flags);
+
+	/* No more blkif_request(). */
+	blk_stop_queue(info->rq);
+
+	/* No more gnttab callback work. */
+	gnttab_cancel_free_callback(&info->callback);
+	spin_unlock_irqrestore(&blkif_io_lock, flags);
+
+	/* Flush gnttab callback work. Must be done with no locks held. */
+	flush_scheduled_work();
+
+	del_gendisk(info->gd);
+
+	minor = info->gd->first_minor;
+	nr_minors = info->gd->minors;
+	xlbd_release_minors(minor, nr_minors);
+
+	blk_cleanup_queue(info->rq);
+	info->rq = NULL;
+
+	put_disk(info->gd);
+	info->gd = NULL;
 }
 
 static void kick_pending_request_queues(struct blkfront_info *info)
@@ -567,8 +721,8 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 				printk(KERN_WARNING "blkfront: %s: write barrier op failed\n",
 				       info->gd->disk_name);
 				error = -EOPNOTSUPP;
-				info->feature_barrier = 0;
-				xlvbd_barrier(info);
+				info->feature_flush = 0;
+				xlvbd_flush(info);
 			}
 			/* fall through */
 		case BLKIF_OP_READ:
@@ -650,7 +804,7 @@ fail:
 
 
 /* Common code used when first setting up, and when resuming. */
-static int talk_to_backend(struct xenbus_device *dev,
+static int talk_to_blkback(struct xenbus_device *dev,
 			   struct blkfront_info *info)
 {
 	const char *message = NULL;
@@ -710,7 +864,6 @@ again:
 	return err;
 }
 
-
 /**
  * Entry point to this code when a new device is created.  Allocate the basic
  * structures and the ring buffer for communication with the backend, and
@@ -736,12 +889,81 @@ static int blkfront_probe(struct xenbus_device *dev,
 		}
 	}
 
+	/* 	
+	 * Prevent hooking up IDE if ide-unplug not supported;
+	 * Never hook up SCSI devices on pv-on-hvm guest
+	 */
+	if (xen_hvm_domain()) {
+		extern int xen_ide_unplug_unsupported;
+		int major;
+		int cfg = 1;
+		char* type;
+		int len;
+
+		if (!VDEV_IS_EXTENDED(vdevice))
+			major = BLKIF_MAJOR(vdevice);
+		else
+			major = XENVBD_MAJOR;
+
+		switch(major) {
+		case IDE0_MAJOR:
+		case IDE1_MAJOR:
+		case IDE2_MAJOR:
+		case IDE3_MAJOR:
+		case IDE4_MAJOR:
+		case IDE5_MAJOR:
+		case IDE6_MAJOR:
+		case IDE7_MAJOR:
+		case IDE8_MAJOR:
+		case IDE9_MAJOR:
+			if (xen_ide_unplug_unsupported)
+				cfg = 0;
+			break;
+		case SCSI_DISK0_MAJOR:
+		case SCSI_DISK1_MAJOR:
+		case SCSI_DISK2_MAJOR:
+		case SCSI_DISK3_MAJOR:
+		case SCSI_DISK4_MAJOR:
+		case SCSI_DISK5_MAJOR:
+		case SCSI_DISK6_MAJOR:
+		case SCSI_DISK7_MAJOR:
+		case SCSI_DISK8_MAJOR:
+		case SCSI_DISK9_MAJOR:
+		case SCSI_DISK10_MAJOR:
+		case SCSI_DISK11_MAJOR:
+		case SCSI_DISK12_MAJOR:
+		case SCSI_DISK13_MAJOR:
+		case SCSI_DISK14_MAJOR:
+		case SCSI_DISK15_MAJOR:
+			cfg = 0;
+			break;
+		}
+		if (cfg == 0) {
+			printk(KERN_INFO
+				"%s: HVM does not support vbd %d as xen block device\n",
+			__FUNCTION__, vdevice);
+			return -ENODEV;
+		}
+
+		/* do not create a PV cdrom device if we are an HVM guest */
+		type = xenbus_read(XBT_NIL, dev->nodename, "device-type", &len);
+		if (IS_ERR(type))
+			return -ENODEV;
+		if (strncmp(type, "cdrom", 5) == 0) {
+			kfree(type);
+			return -ENODEV;
+		}
+		kfree(type);
+	}
+
+
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
 	if (!info) {
 		xenbus_dev_fatal(dev, -ENOMEM, "allocating info structure");
 		return -ENOMEM;
 	}
 
+	mutex_init(&info->mutex);
 	info->xbdev = dev;
 	info->vdevice = vdevice;
 	info->connected = BLKIF_STATE_DISCONNECTED;
@@ -755,7 +977,7 @@ static int blkfront_probe(struct xenbus_device *dev,
 	info->handle = simple_strtoul(strrchr(dev->nodename, '/')+1, NULL, 0);
 	dev_set_drvdata(&dev->dev, info);
 
-	err = talk_to_backend(dev, info);
+	err = talk_to_blkback(dev, info);
 	if (err) {
 		kfree(info);
 		dev_set_drvdata(&dev->dev, NULL);
@@ -850,13 +1072,49 @@ static int blkfront_resume(struct xenbus_device *dev)
 
 	blkif_free(info, info->connected == BLKIF_STATE_CONNECTED);
 
-	err = talk_to_backend(dev, info);
+	err = talk_to_blkback(dev, info);
 	if (info->connected == BLKIF_STATE_SUSPENDED && !err)
 		err = blkif_recover(info);
 
 	return err;
 }
 
+static void
+blkfront_closing(struct blkfront_info *info)
+{
+	struct xenbus_device *xbdev = info->xbdev;
+	struct block_device *bdev = NULL;
+
+	mutex_lock(&info->mutex);
+
+	if (xbdev->state == XenbusStateClosing) {
+		mutex_unlock(&info->mutex);
+		return;
+	}
+
+	if (info->gd)
+		bdev = bdget_disk(info->gd, 0);
+
+	mutex_unlock(&info->mutex);
+
+	if (!bdev) {
+		xenbus_frontend_closed(xbdev);
+		return;
+	}
+
+	mutex_lock(&bdev->bd_mutex);
+
+	if (bdev->bd_openers) {
+		xenbus_dev_error(xbdev, -EBUSY,
+				 "Device in use; refusing to close");
+	} else {
+		xlvbd_release_gendisk(info);
+		xenbus_frontend_closed(xbdev);
+	}
+
+	mutex_unlock(&bdev->bd_mutex);
+	bdput(bdev);
+}
 
 /*
  * Invoked when the backend is finally 'ready' (and has told produced
@@ -868,10 +1126,35 @@ static void blkfront_connect(struct blkfront_info *info)
 	unsigned long sector_size;
 	unsigned int binfo;
 	int err;
+	int barrier;
+	dev_t devt;
 
-	if ((info->connected == BLKIF_STATE_CONNECTED) ||
-	    (info->connected == BLKIF_STATE_SUSPENDED) )
+	switch (info->connected) {
+	case BLKIF_STATE_CONNECTED:
+		/*
+		 * Potentially, the back-end may be signalling
+		 * a capacity change; update the capacity.
+		 */
+		err = xenbus_scanf(XBT_NIL, info->xbdev->otherend,
+				   "sectors", "%Lu", &sectors);
+		if (XENBUS_EXIST_ERR(err))
+			return;
+
+		devt = disk_devt(info->gd);
+		printk(KERN_INFO "Changing capacity of (%u, %u) to %Lu "
+		       "sectors\n", (unsigned)MAJOR(devt),
+		       (unsigned)MINOR(devt), sectors);
+
+		set_capacity(info->gd, sectors);
+		revalidate_disk(info->gd);
+
+		/* fall through */
+	case BLKIF_STATE_SUSPENDED:
 		return;
+	default:
+		/* keep gcc quiet; ISO C99 6.8.4.2p5, 6.8.3p6 */
+		;
+	}
 
 	dev_dbg(&info->xbdev->dev, "%s:%s.\n",
 		__func__, info->xbdev->otherend);
@@ -889,10 +1172,26 @@ static void blkfront_connect(struct blkfront_info *info)
 	}
 
 	err = xenbus_gather(XBT_NIL, info->xbdev->otherend,
-			    "feature-barrier", "%lu", &info->feature_barrier,
+			    "feature-barrier", "%d", &barrier,
 			    NULL);
-	if (err)
-		info->feature_barrier = 0;
+
+	/*
+	 * If there's no "feature-barrier" defined, then it means
+	 * we're dealing with a very old backend which writes
+	 * synchronously; nothing to do.
+	 *
+	 * If there are barriers, then we use flush.
+	 */
+	info->feature_flush = 0;
+
+	/*
+	 * The driver doesn't properly handled empty flushes, so
+	 * lets disable barrier support for now.
+	 */
+#if 0
+	if (!err && barrier)
+		info->feature_flush = REQ_FLUSH;
+#endif
 
 	err = xlvbd_alloc_gendisk(sectors, info, binfo, sector_size);
 	if (err) {
@@ -915,52 +1214,14 @@ static void blkfront_connect(struct blkfront_info *info)
 }
 
 /**
- * Handle the change of state of the backend to Closing.  We must delete our
- * device-layer structures now, to ensure that writes are flushed through to
- * the backend.  Once is this done, we can switch to Closed in
- * acknowledgement.
- */
-static void blkfront_closing(struct xenbus_device *dev)
-{
-	struct blkfront_info *info = dev_get_drvdata(&dev->dev);
-	unsigned long flags;
-
-	dev_dbg(&dev->dev, "blkfront_closing: %s removed\n", dev->nodename);
-
-	if (info->rq == NULL)
-		goto out;
-
-	spin_lock_irqsave(&blkif_io_lock, flags);
-
-	/* No more blkif_request(). */
-	blk_stop_queue(info->rq);
-
-	/* No more gnttab callback work. */
-	gnttab_cancel_free_callback(&info->callback);
-	spin_unlock_irqrestore(&blkif_io_lock, flags);
-
-	/* Flush gnttab callback work. Must be done with no locks held. */
-	flush_scheduled_work();
-
-	blk_cleanup_queue(info->rq);
-	info->rq = NULL;
-
-	del_gendisk(info->gd);
-
- out:
-	xenbus_frontend_closed(dev);
-}
-
-/**
  * Callback received when the backend's state changes.
  */
-static void backend_changed(struct xenbus_device *dev,
+static void blkback_changed(struct xenbus_device *dev,
 			    enum xenbus_state backend_state)
 {
 	struct blkfront_info *info = dev_get_drvdata(&dev->dev);
-	struct block_device *bd;
 
-	dev_dbg(&dev->dev, "blkfront:backend_changed.\n");
+	dev_dbg(&dev->dev, "blkfront:blkback_changed to state %d.\n", backend_state);
 
 	switch (backend_state) {
 	case XenbusStateInitialising:
@@ -975,35 +1236,52 @@ static void backend_changed(struct xenbus_device *dev,
 		break;
 
 	case XenbusStateClosing:
-		if (info->gd == NULL) {
-			xenbus_frontend_closed(dev);
-			break;
-		}
-		bd = bdget_disk(info->gd, 0);
-		if (bd == NULL)
-			xenbus_dev_fatal(dev, -ENODEV, "bdget failed");
-
-		mutex_lock(&bd->bd_mutex);
-		if (info->users > 0)
-			xenbus_dev_error(dev, -EBUSY,
-					 "Device in use; refusing to close");
-		else
-			blkfront_closing(dev);
-		mutex_unlock(&bd->bd_mutex);
-		bdput(bd);
+		blkfront_closing(info);
 		break;
 	}
 }
 
-static int blkfront_remove(struct xenbus_device *dev)
+static int blkfront_remove(struct xenbus_device *xbdev)
 {
-	struct blkfront_info *info = dev_get_drvdata(&dev->dev);
+	struct blkfront_info *info = dev_get_drvdata(&xbdev->dev);
+	struct block_device *bdev = NULL;
+	struct gendisk *disk;
 
-	dev_dbg(&dev->dev, "blkfront_remove: %s removed\n", dev->nodename);
+	dev_dbg(&xbdev->dev, "%s removed", xbdev->nodename);
 
 	blkif_free(info, 0);
 
-	kfree(info);
+	mutex_lock(&info->mutex);
+
+	disk = info->gd;
+	if (disk)
+		bdev = bdget_disk(disk, 0);
+
+	info->xbdev = NULL;
+	mutex_unlock(&info->mutex);
+
+	if (!bdev) {
+		kfree(info);
+		return 0;
+	}
+
+	/*
+	 * The xbdev was removed before we reached the Closed
+	 * state. See if it's safe to remove the disk. If the bdev
+	 * isn't closed yet, we let release take care of it.
+	 */
+
+	mutex_lock(&bdev->bd_mutex);
+	info = disk->private_data;
+
+	if (info && !bdev->bd_openers) {
+		xlvbd_release_gendisk(info);
+		disk->private_data = NULL;
+		kfree(info);
+	}
+
+	mutex_unlock(&bdev->bd_mutex);
+	bdput(bdev);
 
 	return 0;
 }
@@ -1012,30 +1290,70 @@ static int blkfront_is_ready(struct xenbus_device *dev)
 {
 	struct blkfront_info *info = dev_get_drvdata(&dev->dev);
 
-	return info->is_ready;
+	return info->is_ready && info->xbdev;
 }
 
 static int blkif_open(struct block_device *bdev, fmode_t mode)
 {
-	struct blkfront_info *info = bdev->bd_disk->private_data;
-	info->users++;
-	return 0;
+	struct gendisk *disk = bdev->bd_disk;
+	struct blkfront_info *info;
+	int err = 0;
+
+	info = disk->private_data;
+	if (!info) {
+		/* xbdev gone */
+		err = -ERESTARTSYS;
+		goto out;
+	}
+
+	mutex_lock(&info->mutex);
+
+	if (!info->gd)
+		/* xbdev is closed */
+		err = -ERESTARTSYS;
+
+	mutex_unlock(&info->mutex);
+
+out:
+	return err;
 }
 
 static int blkif_release(struct gendisk *disk, fmode_t mode)
 {
 	struct blkfront_info *info = disk->private_data;
-	info->users--;
-	if (info->users == 0) {
-		/* Check whether we have been instructed to close.  We will
-		   have ignored this request initially, as the device was
-		   still mounted. */
-		struct xenbus_device *dev = info->xbdev;
-		enum xenbus_state state = xenbus_read_driver_state(dev->otherend);
+	struct block_device *bdev;
+	struct xenbus_device *xbdev;
 
-		if (state == XenbusStateClosing && info->is_ready)
-			blkfront_closing(dev);
+	bdev = bdget_disk(disk, 0);
+
+	if (bdev->bd_openers)
+		goto out;
+
+	/*
+	 * Check if we have been instructed to close. We will have
+	 * deferred this request, because the bdev was still open.
+	 */
+
+	mutex_lock(&info->mutex);
+	xbdev = info->xbdev;
+
+	if (xbdev && xbdev->state == XenbusStateClosing) {
+		/* pending switch to state closed */
+		xlvbd_release_gendisk(info);
+		xenbus_frontend_closed(info->xbdev);
+ 	}
+
+	mutex_unlock(&info->mutex);
+
+	if (!xbdev) {
+		/* sudden device removal */
+		xlvbd_release_gendisk(info);
+		disk->private_data = NULL;
+		kfree(info);
 	}
+
+out:
+	bdput(bdev);
 	return 0;
 }
 
@@ -1061,22 +1379,39 @@ static struct xenbus_driver blkfront = {
 	.probe = blkfront_probe,
 	.remove = blkfront_remove,
 	.resume = blkfront_resume,
-	.otherend_changed = backend_changed,
+	.otherend_changed = blkback_changed,
 	.is_ready = blkfront_is_ready,
 };
 
 static int __init xlblk_init(void)
 {
+	int ret;
+
 	if (!xen_domain())
 		return -ENODEV;
 
+	if (xen_hvm_domain() && !xen_platform_pci_unplug)
+		return -ENODEV;
+
+	printk("%s: register_blkdev major: %d \n", __FUNCTION__, XENVBD_MAJOR);
 	if (register_blkdev(XENVBD_MAJOR, DEV_NAME)) {
 		printk(KERN_WARNING "xen_blk: can't get major %d with name %s\n",
 		       XENVBD_MAJOR, DEV_NAME);
 		return -ENODEV;
 	}
 
-	return xenbus_register_frontend(&blkfront);
+	if (sda_is_xvda) {
+		emulated_sd_disk_minor_offset = 0;
+		emulated_sd_disk_name_offset = emulated_sd_disk_minor_offset / 256;
+	}
+
+	ret = xenbus_register_frontend(&blkfront);
+	if (ret) {
+		unregister_blkdev(XENVBD_MAJOR, DEV_NAME);
+		return ret;
+	}
+
+	return 0;
 }
 module_init(xlblk_init);
 

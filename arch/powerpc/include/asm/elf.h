@@ -236,14 +236,10 @@ typedef elf_vrregset_t elf_fpxregset_t;
 #ifdef __powerpc64__
 # define SET_PERSONALITY(ex)					\
 do {								\
-	unsigned long new_flags = 0;				\
 	if ((ex).e_ident[EI_CLASS] == ELFCLASS32)		\
-		new_flags = _TIF_32BIT;				\
-	if ((current_thread_info()->flags & _TIF_32BIT)		\
-	    != new_flags)					\
-		set_thread_flag(TIF_ABI_PENDING);		\
+		set_thread_flag(TIF_32BIT);			\
 	else							\
-		clear_thread_flag(TIF_ABI_PENDING);		\
+		clear_thread_flag(TIF_32BIT);			\
 	if (personality(current->personality) != PER_LINUX32)	\
 		set_personality(PER_LINUX |			\
 			(current->personality & (~PER_MASK)));	\
@@ -270,6 +266,7 @@ extern int ucache_bsize;
 /* vDSO has arch_setup_additional_pages */
 #define ARCH_HAS_SETUP_ADDITIONAL_PAGES
 struct linux_binprm;
+export struct page *vdso32_pages[1];
 extern int arch_setup_additional_pages(struct linux_binprm *bprm,
 				       int uses_interp);
 #define VDSO_AUX_ENT(a,b) NEW_AUX_ENT(a,b);

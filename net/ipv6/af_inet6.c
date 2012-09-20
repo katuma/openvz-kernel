@@ -57,6 +57,10 @@
 #ifdef CONFIG_IPV6_TUNNEL
 #include <net/ip6_tunnel.h>
 #endif
+#ifdef CONFIG_IPV6_MIP6
+#include <net/mip6.h>
+#endif
+#include <bc/net.h>
 
 #include <asm/uaccess.h>
 #include <asm/system.h>
@@ -95,7 +99,8 @@ static __inline__ struct ipv6_pinfo *inet6_sk_generic(struct sock *sk)
 	return (struct ipv6_pinfo *)(((u8 *)sk) + offset);
 }
 
-static int inet6_create(struct net *net, struct socket *sock, int protocol)
+static int inet6_create(struct net *net, struct socket *sock, int protocol,
+			int kern)
 {
 	struct inet_sock *inet;
 	struct ipv6_pinfo *np;
@@ -157,8 +162,12 @@ lookup_protocol:
 			goto out_rcu_unlock;
 	}
 
+	err = vz_security_protocol_check(answer->protocol);
+	if (err < 0)
+		goto out_rcu_unlock;
+
 	err = -EPERM;
-	if (answer->capability > 0 && !capable(answer->capability))
+	if (sock->type == SOCK_RAW && !kern && !capable(CAP_NET_RAW))
 		goto out_rcu_unlock;
 
 	sock->ops = answer->ops;
@@ -173,6 +182,13 @@ lookup_protocol:
 	sk = sk_alloc(net, PF_INET6, GFP_KERNEL, answer_prot);
 	if (sk == NULL)
 		goto out;
+
+	err = -ENOBUFS;
+	if (ub_sock_charge(sk, PF_INET6, sock->type))
+		goto out_sk_free;
+	/* if charge was successful, sock_init_data() MUST be called to
+	 * set sk->sk_type. otherwise sk will be uncharged to wrong resource
+	 */
 
 	sock_init_data(sock, sk);
 
@@ -198,7 +214,7 @@ lookup_protocol:
 
 	inet_sk(sk)->pinet6 = np = inet6_sk_generic(sk);
 	np->hop_limit	= -1;
-	np->mcast_hops	= -1;
+	np->mcast_hops	= IPV6_DEFAULT_MCASTHOPS;
 	np->mc_loop	= 1;
 	np->pmtudisc	= IPV6_PMTUDISC_WANT;
 	np->ipv6only	= net->ipv6.sysctl.bindv6only;
@@ -212,6 +228,7 @@ lookup_protocol:
 	inet->mc_ttl	= 1;
 	inet->mc_index	= 0;
 	inet->mc_list	= NULL;
+	sk_extended(sk)->rcv_tos = 0;
 
 	if (ipv4_config.no_pmtu_disc)
 		inet->pmtudisc = IP_PMTUDISC_DONT;
@@ -248,6 +265,9 @@ out:
 out_rcu_unlock:
 	rcu_read_unlock();
 	goto out;
+out_sk_free:
+	sk_free(sk);
+	return err;
 }
 
 
@@ -340,7 +360,8 @@ int inet6_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 			 */
 			v4addr = LOOPBACK4_IPV6;
 			if (!(addr_type & IPV6_ADDR_MULTICAST))	{
-				if (!ipv6_chk_addr(net, &addr->sin6_addr,
+				if (!inet->transparent &&
+				    !ipv6_chk_addr(net, &addr->sin6_addr,
 						   dev, 0)) {
 					if (dev)
 						dev_put(dev);
@@ -1072,6 +1093,8 @@ static int __init inet6_init(void)
 		       "reboot required to enable\n");
 		goto out;
 	}
+
+	initialize_hashidentrnd();
 
 	err = proto_register(&tcpv6_prot, 1);
 	if (err)

@@ -7,6 +7,7 @@
 #include <linux/time.h>
 #include <linux/proc_fs.h>
 #include <linux/kernel.h>
+#include <linux/pid_namespace.h>
 #include <linux/mm.h>
 #include <linux/string.h>
 #include <linux/stat.h>
@@ -18,6 +19,8 @@
 #include <linux/module.h>
 #include <linux/smp_lock.h>
 #include <linux/sysctl.h>
+#include <linux/seq_file.h>
+#include <linux/mount.h>
 
 #include <asm/system.h>
 #include <asm/uaccess.h>
@@ -60,6 +63,10 @@ static void proc_delete_inode(struct inode *inode)
 	de = PROC_I(inode)->pde;
 	if (de)
 		de_put(de);
+	de = PROC_I(inode)->lpde;
+	if (de)
+		de_put(de);
+
 	if (PROC_I(inode)->sysctl)
 		sysctl_head_put(PROC_I(inode)->sysctl);
 	clear_inode(inode);
@@ -81,6 +88,7 @@ static struct inode *proc_alloc_inode(struct super_block *sb)
 	ei->fd = 0;
 	ei->op.proc_get_link = NULL;
 	ei->pde = NULL;
+	ei->lpde = NULL;
 	ei->sysctl = NULL;
 	ei->sysctl_entry = NULL;
 	inode = &ei->vfs_inode;
@@ -109,12 +117,26 @@ void __init proc_init_inodecache(void)
 					     init_once);
 }
 
+static int proc_show_options(struct seq_file *seq, struct vfsmount *mnt)
+{
+	struct pid_namespace *pid = mnt->mnt_sb->s_fs_info;
+
+	if (pid->pid_gid)
+		seq_printf(seq, ",gid=%lu", (unsigned long)pid->pid_gid);
+	if (pid->hide_pid != 0)
+		seq_printf(seq, ",hidepid=%u", pid->hide_pid);
+
+	return 0;
+}
+
 static const struct super_operations proc_sops = {
 	.alloc_inode	= proc_alloc_inode,
 	.destroy_inode	= proc_destroy_inode,
 	.drop_inode	= generic_delete_inode,
 	.delete_inode	= proc_delete_inode,
 	.statfs		= simple_statfs,
+	.remount_fs	= proc_remount,
+	.show_options	= proc_show_options,
 };
 
 static void __pde_users_dec(struct proc_dir_entry *pde)
@@ -335,7 +357,7 @@ static int proc_reg_open(struct inode *inode, struct file *file)
 	if (!pde->proc_fops) {
 		spin_unlock(&pde->pde_unload_lock);
 		kfree(pdeo);
-		return -EINVAL;
+		return -ENOENT;
 	}
 	pde->pde_users++;
 	open = pde->proc_fops->open;
@@ -442,22 +464,31 @@ static const struct file_operations proc_reg_file_ops_no_compat = {
 #endif
 
 struct inode *proc_get_inode(struct super_block *sb, unsigned int ino,
-				struct proc_dir_entry *de)
+		struct proc_dir_entry *de, struct proc_dir_entry *lde)
 {
 	struct inode * inode;
+	struct proc_dir_entry *de_lnk = de;
 
 	inode = iget_locked(sb, ino);
 	if (!inode)
 		return NULL;
 	if (inode->i_state & I_NEW) {
+		if (PROC_IS_HARDLINK(de_lnk))
+			de = de_lnk->data;
+		if (lde)
+			WARN_ON(PROC_IS_HARDLINK(de_lnk));
+
 		inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME;
 		PROC_I(inode)->fd = 0;
 		PROC_I(inode)->pde = de;
+#ifdef CONFIG_VE
+		PROC_I(inode)->lpde = lde;
+#endif
 
-		if (de->mode) {
-			inode->i_mode = de->mode;
-			inode->i_uid = de->uid;
-			inode->i_gid = de->gid;
+		if (de_lnk->mode) {
+			inode->i_mode = de_lnk->mode;
+			inode->i_uid = de_lnk->uid;
+			inode->i_gid = de_lnk->gid;
 		}
 		if (de->size)
 			inode->i_size = de->size;
@@ -479,8 +510,15 @@ struct inode *proc_get_inode(struct super_block *sb, unsigned int ino,
 			}
 		}
 		unlock_new_inode(inode);
-	} else
-	       de_put(de);
+		if (PROC_IS_HARDLINK(de_lnk)) {
+			de_get(de);
+			de_put(de_lnk);;
+		}
+	} else {
+		de_put(de_lnk);
+		if (lde)
+			de_put(lde);
+	}
 	return inode;
 }			
 
@@ -494,9 +532,11 @@ int proc_fill_super(struct super_block *s)
 	s->s_magic = PROC_SUPER_MAGIC;
 	s->s_op = &proc_sops;
 	s->s_time_gran = 1;
-	
-	de_get(&proc_root);
-	root_inode = proc_get_inode(s, PROC_ROOT_INO, &proc_root);
+
+	de_get(get_exec_env()->proc_root);
+	de_get(&glob_proc_root);
+	root_inode = proc_get_inode(s, PROC_ROOT_INO,
+			&glob_proc_root, get_exec_env()->proc_root);
 	if (!root_inode)
 		goto out_no_root;
 	root_inode->i_uid = 0;

@@ -55,7 +55,11 @@ void			svc_proc_unregister(const char *);
 void			svc_seq_show(struct seq_file *,
 				     const struct svc_stat *);
 
+#ifdef CONFIG_VE
+#define proc_net_rpc	(get_exec_env()->rpc_data->_proc_net_rpc)
+#else
 extern struct proc_dir_entry	*proc_net_rpc;
+#endif
 
 #else
 

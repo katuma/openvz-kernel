@@ -13,6 +13,7 @@ struct inotify_inode_mark_entry {
 	/* fsnotify_mark_entry MUST be the first thing */
 	struct fsnotify_mark_entry fsn_entry;
 	int wd;
+	struct path path;
 };
 
 extern void inotify_ignored_and_remove_idr(struct fsnotify_mark_entry *entry,

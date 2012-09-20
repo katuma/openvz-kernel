@@ -43,6 +43,7 @@ struct nlm_host {
 	struct sockaddr_storage	h_addr;		/* peer address */
 	size_t			h_addrlen;
 	struct sockaddr_storage	h_srcaddr;	/* our address (optional) */
+	size_t			h_srcaddrlen;
 	struct rpc_clnt		*h_rpcclnt;	/* RPC client to talk to peer */
 	char			*h_name;		/* remote hostname */
 	u32			h_version;	/* interface version */
@@ -66,6 +67,7 @@ struct nlm_host {
 	struct list_head	h_reclaim;	/* Locks in RECLAIM state */
 	struct nsm_handle	*h_nsmhandle;	/* NSM status handle */
 	char			*h_addrbuf;	/* address eyecatcher */
+	struct ve_struct *	owner_env;	/* VE owning the host */
 };
 
 /*
@@ -192,8 +194,10 @@ extern struct svc_procedure	nlmsvc_procedures[];
 #ifdef CONFIG_LOCKD_V4
 extern struct svc_procedure	nlmsvc_procedures4[];
 #endif
-extern int			nlmsvc_grace_period;
-extern unsigned long		nlmsvc_timeout;
+
+#include <linux/ve_nfs.h>
+extern unsigned long		_nlmsvc_timeout;
+
 extern int			nsm_use_hostnames;
 extern u32			nsm_local_state;
 

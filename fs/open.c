@@ -30,171 +30,9 @@
 #include <linux/audit.h>
 #include <linux/falloc.h>
 #include <linux/fs_struct.h>
+#include <linux/ima.h>
 
-int vfs_statfs(struct dentry *dentry, struct kstatfs *buf)
-{
-	int retval = -ENODEV;
-
-	if (dentry) {
-		retval = -ENOSYS;
-		if (dentry->d_sb->s_op->statfs) {
-			memset(buf, 0, sizeof(*buf));
-			retval = security_sb_statfs(dentry);
-			if (retval)
-				return retval;
-			retval = dentry->d_sb->s_op->statfs(dentry, buf);
-			if (retval == 0 && buf->f_frsize == 0)
-				buf->f_frsize = buf->f_bsize;
-		}
-	}
-	return retval;
-}
-
-EXPORT_SYMBOL(vfs_statfs);
-
-static int vfs_statfs_native(struct dentry *dentry, struct statfs *buf)
-{
-	struct kstatfs st;
-	int retval;
-
-	retval = vfs_statfs(dentry, &st);
-	if (retval)
-		return retval;
-
-	if (sizeof(*buf) == sizeof(st))
-		memcpy(buf, &st, sizeof(st));
-	else {
-		if (sizeof buf->f_blocks == 4) {
-			if ((st.f_blocks | st.f_bfree | st.f_bavail |
-			     st.f_bsize | st.f_frsize) &
-			    0xffffffff00000000ULL)
-				return -EOVERFLOW;
-			/*
-			 * f_files and f_ffree may be -1; it's okay to stuff
-			 * that into 32 bits
-			 */
-			if (st.f_files != -1 &&
-			    (st.f_files & 0xffffffff00000000ULL))
-				return -EOVERFLOW;
-			if (st.f_ffree != -1 &&
-			    (st.f_ffree & 0xffffffff00000000ULL))
-				return -EOVERFLOW;
-		}
-
-		buf->f_type = st.f_type;
-		buf->f_bsize = st.f_bsize;
-		buf->f_blocks = st.f_blocks;
-		buf->f_bfree = st.f_bfree;
-		buf->f_bavail = st.f_bavail;
-		buf->f_files = st.f_files;
-		buf->f_ffree = st.f_ffree;
-		buf->f_fsid = st.f_fsid;
-		buf->f_namelen = st.f_namelen;
-		buf->f_frsize = st.f_frsize;
-		memset(buf->f_spare, 0, sizeof(buf->f_spare));
-	}
-	return 0;
-}
-
-static int vfs_statfs64(struct dentry *dentry, struct statfs64 *buf)
-{
-	struct kstatfs st;
-	int retval;
-
-	retval = vfs_statfs(dentry, &st);
-	if (retval)
-		return retval;
-
-	if (sizeof(*buf) == sizeof(st))
-		memcpy(buf, &st, sizeof(st));
-	else {
-		buf->f_type = st.f_type;
-		buf->f_bsize = st.f_bsize;
-		buf->f_blocks = st.f_blocks;
-		buf->f_bfree = st.f_bfree;
-		buf->f_bavail = st.f_bavail;
-		buf->f_files = st.f_files;
-		buf->f_ffree = st.f_ffree;
-		buf->f_fsid = st.f_fsid;
-		buf->f_namelen = st.f_namelen;
-		buf->f_frsize = st.f_frsize;
-		memset(buf->f_spare, 0, sizeof(buf->f_spare));
-	}
-	return 0;
-}
-
-SYSCALL_DEFINE2(statfs, const char __user *, pathname, struct statfs __user *, buf)
-{
-	struct path path;
-	int error;
-
-	error = user_path(pathname, &path);
-	if (!error) {
-		struct statfs tmp;
-		error = vfs_statfs_native(path.dentry, &tmp);
-		if (!error && copy_to_user(buf, &tmp, sizeof(tmp)))
-			error = -EFAULT;
-		path_put(&path);
-	}
-	return error;
-}
-
-SYSCALL_DEFINE3(statfs64, const char __user *, pathname, size_t, sz, struct statfs64 __user *, buf)
-{
-	struct path path;
-	long error;
-
-	if (sz != sizeof(*buf))
-		return -EINVAL;
-	error = user_path(pathname, &path);
-	if (!error) {
-		struct statfs64 tmp;
-		error = vfs_statfs64(path.dentry, &tmp);
-		if (!error && copy_to_user(buf, &tmp, sizeof(tmp)))
-			error = -EFAULT;
-		path_put(&path);
-	}
-	return error;
-}
-
-SYSCALL_DEFINE2(fstatfs, unsigned int, fd, struct statfs __user *, buf)
-{
-	struct file * file;
-	struct statfs tmp;
-	int error;
-
-	error = -EBADF;
-	file = fget(fd);
-	if (!file)
-		goto out;
-	error = vfs_statfs_native(file->f_path.dentry, &tmp);
-	if (!error && copy_to_user(buf, &tmp, sizeof(tmp)))
-		error = -EFAULT;
-	fput(file);
-out:
-	return error;
-}
-
-SYSCALL_DEFINE3(fstatfs64, unsigned int, fd, size_t, sz, struct statfs64 __user *, buf)
-{
-	struct file * file;
-	struct statfs64 tmp;
-	int error;
-
-	if (sz != sizeof(*buf))
-		return -EINVAL;
-
-	error = -EBADF;
-	file = fget(fd);
-	if (!file)
-		goto out;
-	error = vfs_statfs64(file->f_path.dentry, &tmp);
-	if (!error && copy_to_user(buf, &tmp, sizeof(tmp)))
-		error = -EFAULT;
-	fput(file);
-out:
-	return error;
-}
+#include "internal.h"
 
 int do_truncate(struct dentry *dentry, loff_t length, unsigned int time_attrs,
 	struct file *filp)
@@ -268,7 +106,7 @@ static long do_sys_truncate(const char __user *pathname, loff_t length)
 	 * Make sure that there are no leases.  get_write_access() protects
 	 * against the truncate racing with a lease-granting setlease().
 	 */
-	error = break_lease(inode, FMODE_WRITE);
+	error = break_lease(inode, O_WRONLY);
 	if (error)
 		goto put_write_and_out;
 
@@ -415,6 +253,9 @@ int do_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	/* Check for wrap through zero too */
 	if (((offset + len) > inode->i_sb->s_maxbytes) || ((offset + len) < 0))
 		return -EFBIG;
+
+	if (file->f_op->fallocate)
+		return file->f_op->fallocate(file, mode, offset, len);
 
 	if (!inode->i_op->fallocate)
 		return -EOPNOTSUPP;
@@ -630,14 +471,20 @@ out:
 	return err;
 }
 
-SYSCALL_DEFINE3(fchmodat, int, dfd, const char __user *, filename, mode_t, mode)
+static int do_fchmodat(int dfd, const char __user *filename, mode_t mode, int flag)
 {
 	struct path path;
 	struct inode *inode;
 	int error;
 	struct iattr newattrs;
+	int follow;
 
-	error = user_path_at(dfd, filename, LOOKUP_FOLLOW, &path);
+	error = -EINVAL;
+	if ((flag & ~AT_SYMLINK_NOFOLLOW) != 0)
+		goto out;
+
+	follow = (flag & AT_SYMLINK_NOFOLLOW) ? 0 : LOOKUP_FOLLOW;
+	error = user_path_at(dfd, filename, follow, &path);
 	if (error)
 		goto out;
 	inode = path.dentry->d_inode;
@@ -659,9 +506,20 @@ out:
 	return error;
 }
 
+SYSCALL_DEFINE3(fchmodat, int, dfd, const char __user *, filename, mode_t, mode)
+{
+	return do_fchmodat(dfd, filename, mode, 0);
+}
+
 SYSCALL_DEFINE2(chmod, const char __user *, filename, mode_t, mode)
 {
-	return sys_fchmodat(AT_FDCWD, filename, mode);
+	return do_fchmodat(AT_FDCWD, filename, mode, 0);
+}
+EXPORT_SYMBOL_GPL(sys_chmod);
+
+SYSCALL_DEFINE2(lchmod, const char __user *, filename, mode_t, mode)
+{
+	return do_fchmodat(AT_FDCWD, filename, mode, AT_SYMLINK_NOFOLLOW);
 }
 
 static int chown_common(struct dentry * dentry, uid_t user, gid_t group)
@@ -707,6 +565,7 @@ out_release:
 out:
 	return error;
 }
+EXPORT_SYMBOL(sys_chown);
 
 SYSCALL_DEFINE5(fchownat, int, dfd, const char __user *, filename, uid_t, user,
 		gid_t, group, int, flag)
@@ -805,15 +664,14 @@ static inline int __get_file_write_access(struct inode *inode,
 }
 
 static struct file *__dentry_open(struct dentry *dentry, struct vfsmount *mnt,
-					int flags, struct file *f,
+					struct file *f,
 					int (*open)(struct inode *, struct file *),
 					const struct cred *cred)
 {
 	struct inode *inode;
 	int error;
 
-	f->f_flags = flags;
-	f->f_mode = (__force fmode_t)((flags+1) & O_ACCMODE) | FMODE_LSEEK |
+	f->f_mode = (__force fmode_t)((f->f_flags+1) & O_ACCMODE) | FMODE_LSEEK |
 				FMODE_PREAD | FMODE_PWRITE;
 	inode = dentry->d_inode;
 	if (f->f_mode & FMODE_WRITE) {
@@ -829,7 +687,7 @@ static struct file *__dentry_open(struct dentry *dentry, struct vfsmount *mnt,
 	f->f_path.mnt = mnt;
 	f->f_pos = 0;
 	f->f_op = fops_get(inode->i_fop);
-	file_move(f, &inode->i_sb->s_files);
+	file_sb_list_add(f, inode->i_sb);
 
 	error = security_dentry_open(f, cred);
 	if (error)
@@ -842,6 +700,7 @@ static struct file *__dentry_open(struct dentry *dentry, struct vfsmount *mnt,
 		if (error)
 			goto cleanup_all;
 	}
+	ima_counts_get(f);
 
 	f->f_flags &= ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
 
@@ -874,7 +733,7 @@ cleanup_all:
 			mnt_drop_write(mnt);
 		}
 	}
-	file_kill(f);
+	file_sb_list_del(f);
 	f->f_path.dentry = NULL;
 	f->f_path.mnt = NULL;
 cleanup_file:
@@ -913,7 +772,6 @@ struct file *lookup_instantiate_filp(struct nameidata *nd, struct dentry *dentry
 	if (IS_ERR(dentry))
 		goto out_err;
 	nd->intent.open.file = __dentry_open(dget(dentry), mntget(nd->path.mnt),
-					     nd->intent.open.flags - 1,
 					     nd->intent.open.file,
 					     open, cred);
 out:
@@ -932,7 +790,7 @@ EXPORT_SYMBOL_GPL(lookup_instantiate_filp);
  *
  * Note that this function destroys the original nameidata
  */
-struct file *nameidata_to_filp(struct nameidata *nd, int flags)
+struct file *nameidata_to_filp(struct nameidata *nd)
 {
 	const struct cred *cred = current_cred();
 	struct file *filp;
@@ -941,7 +799,7 @@ struct file *nameidata_to_filp(struct nameidata *nd, int flags)
 	filp = nd->intent.open.file;
 	/* Has the filesystem initialised the file for us? */
 	if (filp->f_path.dentry == NULL)
-		filp = __dentry_open(nd->path.dentry, nd->path.mnt, flags, filp,
+		filp = __dentry_open(nd->path.dentry, nd->path.mnt, filp,
 				     NULL, cred);
 	else
 		path_put(&nd->path);
@@ -972,6 +830,11 @@ struct file *dentry_open(struct dentry *dentry, struct vfsmount *mnt, int flags,
 		return ERR_PTR(-EINVAL);
 	}
 
+	if (!may_use_odirect())
+		flags &= ~O_DIRECT;
+	if (ve_fsync_behavior() == FSYNC_NEVER)
+		flags &= ~O_SYNC;
+
 	error = -ENFILE;
 	f = get_empty_filp();
 	if (f == NULL) {
@@ -980,7 +843,8 @@ struct file *dentry_open(struct dentry *dentry, struct vfsmount *mnt, int flags,
 		return ERR_PTR(error);
 	}
 
-	return __dentry_open(dentry, mnt, flags, f, NULL, cred);
+	f->f_flags = flags;
+	return __dentry_open(dentry, mnt, f, NULL, cred);
 }
 EXPORT_SYMBOL(dentry_open);
 
@@ -1062,6 +926,7 @@ SYSCALL_DEFINE3(open, const char __user *, filename, int, flags, int, mode)
 	asmlinkage_protect(3, ret, filename, flags, mode);
 	return ret;
 }
+EXPORT_SYMBOL(sys_open);
 
 SYSCALL_DEFINE4(openat, int, dfd, const char __user *, filename, int, flags,
 		int, mode)
@@ -1193,3 +1058,183 @@ int nonseekable_open(struct inode *inode, struct file *filp)
 }
 
 EXPORT_SYMBOL(nonseekable_open);
+
+/*
+ * require inode->i_mutex or unreachable inode
+ */
+int open_inode_peer(struct inode *inode, struct path *path,
+		    const struct cred *cred)
+{
+	struct inode *peer = path->dentry->d_inode;
+	struct address_space *mapping;
+	struct file *file;
+	struct user_beancounter *cur_ub;
+	const struct cred *cur_cred;
+	int err;
+
+	/*
+	 * We cannot open peers in the middle of transaction,
+	 * this shouldn't happens at all.
+	 */
+	err = -EDEADLK;
+	if (WARN_ON_ONCE(current->journal_info))
+		goto out_err;
+
+	err = -EBUSY;
+	if (inode->i_peer_file)
+		goto out_err;
+
+	err = -EINVAL;
+	if (!S_ISREG(inode->i_mode) || !S_ISREG(peer->i_mode) ||
+	    peer == inode || i_size_read(peer) != i_size_read(inode))
+		goto out_err;
+
+restart:
+	rcu_read_lock();
+	file = rcu_dereference(peer->i_peer_file);
+	if (file && file->f_mapping != peer->i_mapping) {
+		rcu_read_unlock();
+		err = -EMLINK;
+		goto out_err;
+	}
+	if (file && atomic_long_inc_not_zero(&file->f_count)) {
+		rcu_read_unlock();
+		path_put(path);
+		goto install;
+	}
+	rcu_read_unlock();
+
+	cur_ub = set_exec_ub(&ub0);
+	cur_cred = override_creds(cred);
+	file = dentry_open(path->dentry, path->mnt,
+			   O_RDONLY|O_LARGEFILE, cred);
+	revert_creds(cur_cred);
+	set_exec_ub(cur_ub);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	spin_lock(&peer->i_lock);
+	if (atomic_read(&peer->i_writecount) > 0) {
+		spin_unlock(&peer->i_lock);
+		fput(file);
+		return -ETXTBSY;
+	}
+	if (peer->i_size != inode->i_size) {
+		spin_unlock(&peer->i_lock);
+		fput(file);
+		return -EINVAL;
+	}
+	if (peer->i_peer_file && file_count(peer->i_peer_file)) {
+		spin_unlock(&peer->i_lock);
+		*path = file->f_path;
+		path_get(path);
+		fput(file);
+		goto restart;
+	}
+	atomic_dec(&peer->i_writecount);
+	rcu_assign_pointer(peer->i_peer_file, file);
+	spin_unlock(&peer->i_lock);
+
+install:
+	spin_lock(&inode->i_lock);
+	if (inode->i_peer_file)
+		goto undo;
+	rcu_assign_pointer(inode->i_peer_file, file);
+	spin_unlock(&inode->i_lock);
+
+	mapping = file->f_mapping;
+	spin_lock(&mapping->i_mmap_lock);
+	list_add(&inode->i_mapping->i_peer_list, &mapping->i_peer_list);
+	spin_unlock(&mapping->i_mmap_lock);
+
+	/* update peer atime */
+	file_accessed(file);
+
+	/* prune unused pages */
+	invalidate_mapping_pages(inode->i_mapping, 0, -1);
+
+	return 0;
+
+undo:
+	spin_unlock(&inode->i_lock);
+	if (atomic_long_dec_and_test(&file->f_count)) {
+		spin_lock(&peer->i_lock);
+		if (peer->i_peer_file == file)
+			rcu_assign_pointer(peer->i_peer_file, NULL);
+		atomic_inc(&peer->i_writecount);
+		spin_unlock(&peer->i_lock);
+		__fput(file);
+	}
+
+	return -EBUSY;
+
+out_err:
+	path_put(path);
+	return err;
+}
+EXPORT_SYMBOL(open_inode_peer);
+
+static void peer_fput(struct work_struct *work)
+{
+	struct file *file = container_of(work, struct file, f_work);
+
+	/* update peer atime */
+	file_accessed(file);
+
+	__fput(file);
+}
+
+/*
+ * require inode->i_mutex or unreachable inode
+ */
+void close_inode_peer(struct inode *inode)
+{
+	struct address_space *mapping = inode->i_mapping;
+	struct file *file = inode->i_peer_file;
+
+	if (!file)
+		return;
+
+	spin_lock(&inode->i_lock);
+	BUG_ON(inode->i_peer_file != file);
+	BUG_ON(file->f_mapping == mapping);
+	rcu_assign_pointer(inode->i_peer_file, NULL);
+	spin_unlock(&inode->i_lock);
+
+	if (mapping_mapped(mapping)) {
+		struct zap_details details = {
+			.check_mapping = file->f_mapping,
+			.first_index = 0,
+			.last_index = ULONG_MAX,
+		};
+
+		synchronize_mapping_faults(mapping);
+		zap_mapping_range(mapping, &details);
+	}
+
+	mapping = file->f_mapping;
+	spin_lock(&mapping->i_mmap_lock);
+	list_del_init(&inode->i_mapping->i_peer_list);
+	spin_unlock(&mapping->i_mmap_lock);
+
+	if (atomic_long_dec_and_test(&file->f_count)) {
+		struct inode *peer = mapping->host;
+
+		spin_lock(&peer->i_lock);
+		if (peer->i_peer_file == file)
+			rcu_assign_pointer(peer->i_peer_file, NULL);
+		atomic_inc(&peer->i_writecount);
+		spin_unlock(&peer->i_lock);
+
+		/*
+		 * We cannot fput file if we are in the middle of
+		 * fs-transaction, so schedule this fput to keventd.
+		 */
+		if (current->journal_info) {
+			INIT_WORK(&file->f_work, peer_fput);
+			schedule_work(&file->f_work);
+		} else
+			peer_fput(&file->f_work);
+	}
+}
+EXPORT_SYMBOL(close_inode_peer);

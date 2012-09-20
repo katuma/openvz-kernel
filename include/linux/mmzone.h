@@ -16,6 +16,8 @@
 #include <linux/nodemask.h>
 #include <linux/pageblock-flags.h>
 #include <linux/bounds.h>
+#include <linux/workqueue.h>
+#include <linux/mutex.h>
 #include <asm/atomic.h>
 #include <asm/page.h>
 
@@ -100,6 +102,7 @@ enum zone_stat_item {
 	NR_UNSTABLE_NFS,	/* NFS unstable pages */
 	NR_BOUNCE,
 	NR_VMSCAN_WRITE,
+	NR_VMSCAN_IMMEDIATE,	/* Prioritise for reclaim when writeback ends */
 	NR_WRITEBACK_TEMP,	/* Writeback using temporary buffers */
 	NR_ISOLATED_ANON,	/* Temporary isolated pages from anon lru */
 	NR_ISOLATED_FILE,	/* Temporary isolated pages from file lru */
@@ -112,6 +115,7 @@ enum zone_stat_item {
 	NUMA_LOCAL,		/* allocation from local node */
 	NUMA_OTHER,		/* allocation from other node */
 #endif
+	NR_ANON_TRANSPARENT_HUGEPAGES,
 	NR_VM_ZONE_STAT_ITEMS };
 
 /*
@@ -138,7 +142,8 @@ enum lru_list {
 
 #define for_each_lru(l) for (l = 0; l < NR_LRU_LISTS; l++)
 
-#define for_each_evictable_lru(l) for (l = 0; l <= LRU_ACTIVE_FILE; l++)
+#define for_each_evictable_lru(l) \
+	for (l = LRU_ACTIVE_FILE; (int)l >= LRU_INACTIVE_ANON; l--)
 
 static inline int is_file_lru(enum lru_list l)
 {
@@ -283,11 +288,61 @@ struct zone_reclaim_stat {
 	unsigned long		nr_saved_scan[NR_LRU_LISTS];
 };
 
+struct gang;
+
+#ifdef CONFIG_MEMORY_GANGS_MIGRATION
+struct gangs_migration_work {
+	struct delayed_work dwork;
+	nodemask_t src_nodes;
+	nodemask_t dest_nodes;
+	int cur_node, preferred_node;
+	unsigned long batch;
+	struct mutex lock;
+};
+#endif
+
+struct gang_set {
+#ifdef CONFIG_MEMORY_GANGS
+	struct gang		**gangs;
+#endif
+#ifdef CONFIG_MEMORY_GANGS_MIGRATION
+	struct gangs_migration_work migration_work;
+#endif
+};
+
+struct gang {
+	struct zone		*zone;
+	struct gang_set		*set;
+#ifdef CONFIG_MEMORY_GANGS
+	struct list_head	list;
+	struct list_head	rr_list;
+#endif
+	spinlock_t		lru_lock;
+	struct gang_lru {
+		struct list_head list;
+		unsigned long nr_pages;
+	} lru[NR_LRU_LISTS];
+	unsigned long		pages_scanned;
+	struct zone_reclaim_stat reclaim_stat;
+#ifdef CONFIG_MEMORY_GANGS_MIGRATION
+	unsigned long nr_migratepages; /* number of pages to migrate */
+#endif
+};
+
 struct zone {
 	/* Fields commonly accessed by the page allocator */
 
 	/* zone watermarks, access with *_wmark_pages(zone) macros */
 	unsigned long watermark[NR_WMARK];
+
+#ifndef __GENKSYMS__
+	/*
+	 * When free pages are below this point, additional steps are taken
+	 * when reading the number of free pages to avoid per-cpu counter
+	 * drift allowing watermarks to be breached
+	 */
+	unsigned long percpu_drift_mark;
+#endif
 
 	/*
 	 * We don't know if the memory that we're going to allocate will be freeable
@@ -328,15 +383,30 @@ struct zone {
 	unsigned long		*pageblock_flags;
 #endif /* CONFIG_SPARSEMEM */
 
+#ifdef CONFIG_COMPACTION
+	/*
+	 * On compaction failure, 1<<compact_defer_shift compactions
+	 * are skipped before trying again. The number attempted since
+	 * last failure is tracked with compact_considered.
+	 */
+	unsigned int		compact_considered;
+	unsigned int		compact_defer_shift;
+#endif
 
 	ZONE_PADDING(_pad1_)
 
 	/* Fields commonly accessed by the page reclaim scanner */
-	spinlock_t		lru_lock;	
-	struct zone_lru {
-		struct list_head list;
-	} lru[NR_LRU_LISTS];
 
+#ifndef CONFIG_MEMORY_GANGS
+	struct gang		init_gang;
+#else
+	spinlock_t		gangs_lock;
+	int			nr_gangs;
+	struct list_head	gangs;
+	struct list_head	gangs_rr;
+#endif /* CONFIG_MEMORY_GANGS */
+
+	spinlock_t		stat_lock;
 	struct zone_reclaim_stat reclaim_stat;
 
 	unsigned long		pages_scanned;	   /* since last reclaim */
@@ -422,12 +492,17 @@ struct zone {
 	 * rarely used fields:
 	 */
 	const char		*name;
+
+	unsigned long padding[16];
 } ____cacheline_internodealigned_in_smp;
 
 typedef enum {
 	ZONE_ALL_UNRECLAIMABLE,		/* all pages pinned */
 	ZONE_RECLAIM_LOCKED,		/* prevents concurrent reclaim */
 	ZONE_OOM_LOCKED,		/* zone is in OOM killer zonelist */
+	ZONE_CONGESTED,			/* zone has many dirty pages backed by
+					 * a congested BDI
+					 */
 } zone_flags_t;
 
 static inline void zone_set_flag(struct zone *zone, zone_flags_t flag)
@@ -448,6 +523,11 @@ static inline void zone_clear_flag(struct zone *zone, zone_flags_t flag)
 static inline int zone_is_all_unreclaimable(const struct zone *zone)
 {
 	return test_bit(ZONE_ALL_UNRECLAIMABLE, &zone->flags);
+}
+
+static inline int zone_is_reclaim_congested(const struct zone *zone)
+{
+	return test_bit(ZONE_CONGESTED, &zone->flags);
 }
 
 static inline int zone_is_reclaim_locked(const struct zone *zone)
@@ -613,6 +693,9 @@ struct bootmem_data;
 typedef struct pglist_data {
 	struct zone node_zones[MAX_NR_ZONES];
 	struct zonelist node_zonelists[MAX_ZONELISTS];
+#ifdef CONFIG_MEMORY_GANGS
+	struct gang init_gangs[MAX_NR_ZONES];
+#endif
 	int nr_zones;
 #ifdef CONFIG_FLAT_NODE_MEM_MAP	/* means !SPARSEMEM */
 	struct page *node_mem_map;
@@ -650,13 +733,23 @@ typedef struct pglist_data {
 #endif
 #define nid_page_nr(nid, pagenr) 	pgdat_page_nr(NODE_DATA(nid),(pagenr))
 
+#define node_start_pfn(nid)	(NODE_DATA(nid)->node_start_pfn)
+
+#define node_end_pfn(nid) ({\
+	pg_data_t *__pgdat = NODE_DATA(nid);\
+	__pgdat->node_start_pfn + __pgdat->node_spanned_pages;\
+})
+
 #include <linux/memory_hotplug.h>
 
+extern struct mutex zonelists_mutex;
 void get_zone_counts(unsigned long *active, unsigned long *inactive,
 			unsigned long *free);
-void build_all_zonelists(void);
+void build_all_zonelists(void *data);
 void wakeup_kswapd(struct zone *zone, int order);
-int zone_watermark_ok(struct zone *z, int order, unsigned long mark,
+bool zone_watermark_ok(struct zone *z, int order, unsigned long mark,
+		int classzone_idx, int alloc_flags);
+bool zone_watermark_ok_safe(struct zone *z, int order, unsigned long mark,
 		int classzone_idx, int alloc_flags);
 enum memmap_context {
 	MEMMAP_EARLY,
@@ -755,7 +848,7 @@ static inline int is_dma(struct zone *zone)
 
 /* These two functions are used to setup the per zone pages min values */
 struct ctl_table;
-int min_free_kbytes_sysctl_handler(struct ctl_table *, int,
+int free_kbytes_sysctl_handler(struct ctl_table *, int,
 					void __user *, size_t *, loff_t *);
 extern int sysctl_lowmem_reserve_ratio[MAX_NR_ZONES-1];
 int lowmem_reserve_ratio_sysctl_handler(struct ctl_table *, int,

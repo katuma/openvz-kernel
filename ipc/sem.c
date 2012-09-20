@@ -87,6 +87,8 @@
 #include <asm/uaccess.h>
 #include "util.h"
 
+#include <bc/kmem.h>
+
 #define sem_ids(ns)	((ns)->ids[IPC_SEM_IDS])
 
 #define sem_unlock(sma)		ipc_unlock(&(sma)->sem_perm)
@@ -129,6 +131,7 @@ void sem_init_ns(struct ipc_namespace *ns)
 void sem_exit_ns(struct ipc_namespace *ns)
 {
 	free_ipcs(ns, &sem_ids(ns), freeary);
+	idr_destroy(&ns->ids[IPC_SEM_IDS].ipcs_idr);
 }
 #endif
 
@@ -240,6 +243,7 @@ static int newary(struct ipc_namespace *ns, struct ipc_params *params)
 	key_t key = params->key;
 	int nsems = params->u.nsems;
 	int semflg = params->flg;
+	int semid = params->id;
 
 	if (!nsems)
 		return -EINVAL;
@@ -263,7 +267,7 @@ static int newary(struct ipc_namespace *ns, struct ipc_params *params)
 		return retval;
 	}
 
-	id = ipc_addid(&sem_ids(ns), &sma->sem_perm, ns->sc_semmni);
+	id = ipc_addid(&sem_ids(ns), &sma->sem_perm, ns->sc_semmni, semid);
 	if (id < 0) {
 		security_sem_free(sma);
 		ipc_rcu_putref(sma);
@@ -326,6 +330,7 @@ SYSCALL_DEFINE3(semget, key_t, key, int, nsems, int, semflg)
 	sem_params.key = key;
 	sem_params.flg = semflg;
 	sem_params.u.nsems = nsems;
+	sem_params.id = -1;
 
 	return ipcget(ns, &sem_ids(ns), &sem_ops, &sem_params);
 }
@@ -558,6 +563,8 @@ static unsigned long copy_semid_to_user(void __user *buf, struct semid64_ds *in,
 	case IPC_OLD:
 	    {
 		struct semid_ds out;
+
+		memset(&out, 0, sizeof(out));
 
 		ipc64_perm_to_ipc_perm(&in->sem_perm, &out.sem_perm);
 
@@ -948,7 +955,7 @@ static inline int get_undo_list(struct sem_undo_list **undo_listp)
 
 	undo_list = current->sysvsem.undo_list;
 	if (!undo_list) {
-		undo_list = kzalloc(sizeof(*undo_list), GFP_KERNEL);
+		undo_list = kzalloc(sizeof(*undo_list), GFP_KERNEL_UBC);
 		if (undo_list == NULL)
 			return -ENOMEM;
 		spin_lock_init(&undo_list->lock);
@@ -1013,7 +1020,8 @@ static struct sem_undo *find_alloc_undo(struct ipc_namespace *ns, int semid)
 	sem_getref_and_unlock(sma);
 
 	/* step 2: allocate new undo structure */
-	new = kzalloc(sizeof(struct sem_undo) + sizeof(short)*nsems, GFP_KERNEL);
+	new = kzalloc(sizeof(struct sem_undo) +	sizeof(short)*nsems,
+			GFP_KERNEL_UBC);
 	if (!new) {
 		sem_putref(sma);
 		return ERR_PTR(-ENOMEM);
@@ -1075,7 +1083,7 @@ SYSCALL_DEFINE4(semtimedop, int, semid, struct sembuf __user *, tsops,
 	if (nsops > ns->sc_semopm)
 		return -E2BIG;
 	if(nsops > SEMOPM_FAST) {
-		sops = kmalloc(sizeof(*sops)*nsops,GFP_KERNEL);
+		sops = kmalloc(sizeof(*sops)*nsops, GFP_KERNEL_UBC);
 		if(sops==NULL)
 			return -ENOMEM;
 	}
@@ -1377,4 +1385,58 @@ static int sysvipc_sem_proc_show(struct seq_file *s, void *it)
 			  sma->sem_otime,
 			  sma->sem_ctime);
 }
+#endif
+
+#ifdef CONFIG_VE
+#include <linux/module.h>
+
+int sysvipc_setup_sem(key_t key, int semid, size_t size, int semflg)
+{
+	struct ipc_namespace *ns;
+	struct ipc_ops sem_ops;
+	struct ipc_params sem_params;
+
+	ns = current->nsproxy->ipc_ns;
+
+	sem_ops.getnew = newary;
+	sem_ops.associate = sem_security;
+	sem_ops.more_checks = sem_more_checks;
+
+	sem_params.key = key;
+	sem_params.flg = semflg | IPC_CREAT;
+	sem_params.u.nsems = size;
+	sem_params.id = semid;
+
+	return ipcget(ns, &sem_ids(ns), &sem_ops, &sem_params);
+}
+EXPORT_SYMBOL_GPL(sysvipc_setup_sem);
+
+int sysvipc_walk_sem(int (*func)(int i, struct sem_array*, void *), void *arg)
+{
+	int err = 0;
+	struct sem_array *sma;
+	struct ipc_namespace *ns;
+	int next_id;
+	int total, in_use;
+
+	ns = current->nsproxy->ipc_ns;
+
+	down_write(&sem_ids(ns).rw_mutex);
+	in_use = sem_ids(ns).in_use;
+	for (total = 0, next_id = 0; total < in_use; next_id++) {
+		sma = idr_find(&sem_ids(ns).ipcs_idr, next_id);
+		if (sma == NULL)
+			continue;
+		ipc_lock_by_ptr(&sma->sem_perm);
+		err = func(ipc_buildid(next_id, sma->sem_perm.seq), sma, arg);
+		sem_unlock(sma);
+		if (err)
+			break;
+		total++;
+	}
+	up_write(&sem_ids(ns).rw_mutex);
+	return err;
+}
+EXPORT_SYMBOL_GPL(sysvipc_walk_sem);
+EXPORT_SYMBOL_GPL(exit_sem);
 #endif

@@ -12,6 +12,10 @@
 #include <linux/poll.h>
 #include <linux/proc_fs.h>
 #include <linux/fs.h>
+#include <linux/veprintk.h>
+#include <linux/sched.h>
+#include <linux/module.h>
+#include <linux/ve.h>
 
 #include <asm/uaccess.h>
 #include <asm/io.h>
@@ -41,19 +45,20 @@ static ssize_t kmsg_read(struct file *file, char __user *buf,
 
 static unsigned int kmsg_poll(struct file *file, poll_table *wait)
 {
-	poll_wait(file, &log_wait, wait);
+	poll_wait(file, &ve_log_wait, wait);
 	if (do_syslog(9, NULL, 0))
 		return POLLIN | POLLRDNORM;
 	return 0;
 }
 
 
-static const struct file_operations proc_kmsg_operations = {
+const struct file_operations proc_kmsg_operations = {
 	.read		= kmsg_read,
 	.poll		= kmsg_poll,
 	.open		= kmsg_open,
 	.release	= kmsg_release,
 };
+EXPORT_SYMBOL(proc_kmsg_operations);
 
 static int __init proc_kmsg_init(void)
 {

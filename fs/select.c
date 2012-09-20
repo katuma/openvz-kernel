@@ -29,6 +29,7 @@
 
 #include <asm/uaccess.h>
 
+#include <bc/kmem.h>
 
 /*
  * Estimate expected accuracy in ns from a timeval.
@@ -67,7 +68,7 @@ static long __estimate_accuracy(struct timespec *tv)
 	return slack;
 }
 
-static long estimate_accuracy(struct timespec *tv)
+long select_estimate_accuracy(struct timespec *tv)
 {
 	unsigned long ret;
 	struct timespec now;
@@ -417,7 +418,7 @@ int do_select(int n, fd_set_bits *fds, struct timespec *end_time)
 	}
 
 	if (end_time && !timed_out)
-		slack = estimate_accuracy(end_time);
+		slack = select_estimate_accuracy(end_time);
 
 	retval = 0;
 	for (;;) {
@@ -551,7 +552,8 @@ int core_sys_select(int n, fd_set __user *inp, fd_set __user *outp,
 	if (size > sizeof(stack_fds) / 6) {
 		/* Not enough space in on-stack array; must use kmalloc */
 		ret = -ENOMEM;
-		bits = kmalloc(6 * size, GFP_KERNEL);
+		bits = kmalloc(6 * size, size > PAGE_SIZE / 6 ?
+				GFP_KERNEL_UBC : GFP_KERNEL);
 		if (!bits)
 			goto out_nofds;
 	}
@@ -752,7 +754,7 @@ static int do_poll(unsigned int nfds,  struct poll_list *list,
 	}
 
 	if (end_time && !timed_out)
-		slack = estimate_accuracy(end_time);
+		slack = select_estimate_accuracy(end_time);
 
 	for (;;) {
 		struct poll_list *walk;
@@ -841,7 +843,7 @@ int do_sys_poll(struct pollfd __user *ufds, unsigned int nfds,
 
 		len = min(todo, POLLFD_PER_PAGE);
 		size = sizeof(struct poll_list) + sizeof(struct pollfd) * len;
-		walk = walk->next = kmalloc(size, GFP_KERNEL);
+		walk = walk->next = kmalloc(size, GFP_KERNEL_UBC);
 		if (!walk) {
 			err = -ENOMEM;
 			goto out_fds;
@@ -873,7 +875,7 @@ out_fds:
 	return err;
 }
 
-static long do_restart_poll(struct restart_block *restart_block)
+long do_restart_poll(struct restart_block *restart_block)
 {
 	struct pollfd __user *ufds = restart_block->poll.ufds;
 	int nfds = restart_block->poll.nfds;
@@ -894,9 +896,10 @@ static long do_restart_poll(struct restart_block *restart_block)
 	}
 	return ret;
 }
+EXPORT_SYMBOL(do_restart_poll);
 
 SYSCALL_DEFINE3(poll, struct pollfd __user *, ufds, unsigned int, nfds,
-		long, timeout_msecs)
+		int, timeout_msecs)
 {
 	struct timespec end_time, *to = NULL;
 	int ret;

@@ -1190,7 +1190,7 @@ static int ext2_remount (struct super_block * sb, int * flags, char * data)
 	es = sbi->s_es;
 	if (((sbi->s_mount_opt & EXT2_MOUNT_XIP) !=
 	    (old_mount_opt & EXT2_MOUNT_XIP)) &&
-	    invalidate_inodes(sb)) {
+	    invalidate_inodes(sb, true)) {
 		ext2_warning(sb, __func__, "refusing change of xip flag "
 			     "with busy inodes while remounting");
 		sbi->s_mount_opt &= ~EXT2_MOUNT_XIP;
@@ -1426,7 +1426,7 @@ static struct file_system_type ext2_fs_type = {
 	.name		= "ext2",
 	.get_sb		= ext2_get_sb,
 	.kill_sb	= kill_block_super,
-	.fs_flags	= FS_REQUIRES_DEV,
+	.fs_flags	= FS_REQUIRES_DEV | FS_VIRTUALIZED,
 };
 
 static int __init init_ext2_fs(void)

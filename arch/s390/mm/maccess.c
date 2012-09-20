@@ -11,6 +11,7 @@
 #include <linux/kernel.h>
 #include <linux/types.h>
 #include <linux/errno.h>
+#include <linux/gfp.h>
 #include <asm/system.h>
 
 /*
@@ -58,4 +59,101 @@ long probe_kernel_write(void *dst, void *src, size_t size)
 		size -= copied;
 	}
 	return copied < 0 ? -EFAULT : 0;
+}
+
+/*
+ * Copy memory in real mode (kernel to kernel)
+ */
+int memcpy_real(void *dest, void *src, size_t count)
+{
+	register unsigned long _dest asm("2") = (unsigned long) dest;
+	register unsigned long _len1 asm("3") = (unsigned long) count;
+	register unsigned long _src  asm("4") = (unsigned long) src;
+	register unsigned long _len2 asm("5") = (unsigned long) count;
+	unsigned long flags;
+	int rc = -EFAULT;
+
+	if (!count)
+		return 0;
+	flags = __raw_local_irq_stnsm(0xf8UL);
+	asm volatile (
+		"0:	mvcle	%1,%2,0x0\n"
+		"1:	jo	0b\n"
+		"	lhi	%0,0x0\n"
+		"2:\n"
+		EX_TABLE(1b,2b)
+		: "+d" (rc), "+d" (_dest), "+d" (_src), "+d" (_len1),
+		  "+d" (_len2), "=m" (*((long *) dest))
+		: "m" (*((long *) src))
+		: "cc", "memory");
+	__raw_local_irq_ssm(flags);
+	return rc;
+}
+
+/*
+ * Copy memory to absolute zero
+ */
+void copy_to_absolute_zero(void *dest, void *src, size_t count)
+{
+	unsigned long cr0;
+
+	BUG_ON((unsigned long) dest + count >= sizeof(struct _lowcore));
+	preempt_disable();
+	__ctl_store(cr0, 0, 0);
+	__ctl_clear_bit(0, 28); /* disable lowcore protection */
+	memcpy_real(dest + store_prefix(), src, count);
+	__ctl_load(cr0, 0, 0);
+	preempt_enable();
+}
+
+/*
+ * Copy memory from kernel (real) to user (virtual)
+ */
+int copy_to_user_real(void __user *dest, void *src, size_t count)
+{
+	int offs = 0, size, rc;
+	char *buf;
+
+	buf = (char *) __get_free_page(GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	rc = -EFAULT;
+	while (offs < count) {
+		size = min(PAGE_SIZE, count - offs);
+		if (memcpy_real(buf, src + offs, size))
+			goto out;
+		if (copy_to_user(dest + offs, buf, size))
+			goto out;
+		offs += size;
+	}
+	rc = 0;
+out:
+	free_page((unsigned long) buf);
+	return rc;
+}
+
+/*
+ * Copy memory from user (virtual) to kernel (real)
+ */
+int copy_from_user_real(void *dest, void __user *src, size_t count)
+{
+	int offs = 0, size, rc;
+	char *buf;
+
+	buf = (char *) __get_free_page(GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	rc = -EFAULT;
+	while (offs < count) {
+		size = min(PAGE_SIZE, count - offs);
+		if (copy_from_user(buf, src + offs, size))
+			goto out;
+		if (memcpy_real(dest + offs, buf, size))
+			goto out;
+		offs += size;
+	}
+	rc = 0;
+out:
+	free_page((unsigned long) buf);
+	return rc;
 }

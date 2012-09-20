@@ -20,6 +20,7 @@
 #include <linux/time.h>
 #include <linux/tick.h>
 #include <linux/stop_machine.h>
+#include <linux/pram.h>
 
 /* Structure holding internal timekeeping values. */
 struct timekeeper {
@@ -154,6 +155,7 @@ __cacheline_aligned_in_smp DEFINE_SEQLOCK(xtime_lock);
  * used instead.
  */
 struct timespec xtime __attribute__ ((aligned (16)));
+EXPORT_SYMBOL(xtime);
 struct timespec wall_to_monotonic __attribute__ ((aligned (16)));
 static struct timespec total_sleep_time;
 
@@ -177,7 +179,7 @@ void timekeeping_leap_insert(int leapsecond)
 {
 	xtime.tv_sec += leapsecond;
 	wall_to_monotonic.tv_sec -= leapsecond;
-	update_vsyscall(&xtime, timekeeper.clock);
+	update_vsyscall(&xtime, timekeeper.clock, timekeeper.mult);
 }
 
 #ifdef CONFIG_GENERIC_TIME
@@ -261,7 +263,7 @@ ktime_t ktime_get(void)
 	 */
 	return ktime_add_ns(ktime_set(secs, 0), nsecs);
 }
-EXPORT_SYMBOL_GPL(ktime_get);
+EXPORT_SYMBOL(ktime_get);
 
 /**
  * ktime_get_ts - get the monotonic clock in timespec format
@@ -337,7 +339,7 @@ int do_settimeofday(struct timespec *tv)
 	timekeeper.ntp_error = 0;
 	ntp_clear();
 
-	update_vsyscall(&xtime, timekeeper.clock);
+	update_vsyscall(&xtime, timekeeper.clock, timekeeper.mult);
 
 	write_sequnlock_irqrestore(&xtime_lock, flags);
 
@@ -488,6 +490,17 @@ int timekeeping_valid_for_hres(void)
 }
 
 /**
+ * timekeeping_max_deferment - Returns max time the clocksource can be deferred
+ *
+ * Caller must observe xtime_lock via read_seqbegin/read_seqretry to
+ * ensure that the clocksource does not change!
+ */
+u64 timekeeping_max_deferment(void)
+{
+	return timekeeper.clock->max_idle_ns;
+}
+
+/**
  * read_persistent_clock -  Return time from the persistent clock.
  *
  * Weak dummy function for arches that do not yet support it.
@@ -516,6 +529,80 @@ void __attribute__((weak)) read_boot_clock(struct timespec *ts)
 	ts->tv_sec = 0;
 	ts->tv_nsec = 0;
 }
+
+#if defined(CONFIG_KEXEC) && defined(CONFIG_PRAM)
+int kexec_preserve_uptime = 1;
+
+static struct timespec preserved_uptime;
+
+static inline void add_preserved_uptime(struct timespec *ts)
+{
+	*ts = timespec_add_safe(*ts, preserved_uptime);
+}
+
+static inline void sub_preserved_uptime(struct timespec *ts)
+{
+	*ts = timespec_sub(*ts, preserved_uptime);
+}
+
+#define PRESERVED_UPTIME_PRAM		"uptime"
+
+static void preserve_uptime(void)
+{
+	struct pram_stream stream;
+	static struct timespec uptime;
+	__u64 uptime_raw;
+	int err;
+
+	if (!kexec_preserve_uptime)
+		return;
+
+	do_posix_clock_monotonic_gettime(&uptime);
+	monotonic_to_bootbased(&uptime);
+	uptime_raw = (((__u64)uptime.tv_sec) << 32) + uptime.tv_nsec;
+
+	err = pram_open(PRESERVED_UPTIME_PRAM, PRAM_WRITE, &stream);
+	if (err)
+		goto out;
+	if (pram_write(&stream, &uptime_raw, 8) != 8)
+		err = -EIO;
+	pram_close(&stream, err);
+out:
+	if (err)
+		printk(KERN_ERR "Failed to preserve uptime: %d\n", err);
+	else
+		printk(KERN_INFO "Uptime preserved (%llu)\n",
+		       (unsigned long long)uptime_raw);
+}
+
+static void __init init_preserved_uptime(void)
+{
+	struct pram_stream stream;
+	__u64 uptime_raw;
+	int err;
+
+	err = pram_open(PRESERVED_UPTIME_PRAM, PRAM_READ, &stream);
+	if (err)
+		goto out;
+	if (pram_read(&stream, &uptime_raw, 8) != 8)
+		err = -EIO;
+	pram_close(&stream, err);
+out:
+	if (err && err != -ENOENT)
+		printk(KERN_ERR "Failed to preserve uptime: %d\n", err);
+	if (!err) {
+		preserved_uptime.tv_sec = uptime_raw >> 32;
+		preserved_uptime.tv_nsec = uptime_raw & 0xFFFFFFFF;
+		printk(KERN_INFO "Uptime preserved (%llu)\n",
+		       (unsigned long long)uptime_raw);
+	}
+}
+#else
+static inline void add_preserved_uptime(struct timespec *ts) { }
+static inline void sub_preserved_uptime(struct timespec *ts) { }
+static inline void preserve_uptime(void) { }
+static inline void init_preserved_uptime(void) { }
+#endif
 
 /*
  * timekeeping_init - Initializes the clocksource and common timekeeping values
@@ -552,6 +639,14 @@ void __init timekeeping_init(void)
 	total_sleep_time.tv_sec = 0;
 	total_sleep_time.tv_nsec = 0;
 	write_sequnlock_irqrestore(&xtime_lock, flags);
+
+	init_preserved_uptime();
+}
+
+static int timekeeping_shutdown(struct sys_device *dev)
+{
+	preserve_uptime();
+	return 0;
 }
 
 /* time in seconds when suspend began */
@@ -618,6 +713,7 @@ static int timekeeping_suspend(struct sys_device *dev, pm_message_t state)
 /* sysfs resume/suspend bits for timekeeping */
 static struct sysdev_class timekeeping_sysclass = {
 	.name		= "timekeeping",
+	.shutdown	= timekeeping_shutdown,
 	.resume		= timekeeping_resume,
 	.suspend	= timekeeping_suspend,
 };
@@ -722,6 +818,51 @@ static void timekeeping_adjust(s64 offset)
 				timekeeper.ntp_error_shift;
 }
 
+
+/**
+ * logarithmic_accumulation - shifted accumulation of cycles
+ *
+ * This functions accumulates a shifted interval of cycles into
+ * into a shifted interval nanoseconds. Allows for O(log) accumulation
+ * loop.
+ *
+ * Returns the unconsumed cycles.
+ */
+static cycle_t logarithmic_accumulation(cycle_t offset, int shift)
+{
+	u64 nsecps = (u64)NSEC_PER_SEC << timekeeper.shift;
+
+	/* If the offset is smaller then a shifted interval, do nothing */
+	if (offset < timekeeper.cycle_interval<<shift)
+		return offset;
+
+	/* Accumulate one shifted interval */
+	offset -= timekeeper.cycle_interval << shift;
+	timekeeper.clock->cycle_last += timekeeper.cycle_interval << shift;
+
+	timekeeper.xtime_nsec += timekeeper.xtime_interval << shift;
+	while (timekeeper.xtime_nsec >= nsecps) {
+		timekeeper.xtime_nsec -= nsecps;
+		xtime.tv_sec++;
+		second_overflow();
+	}
+
+	/* Accumulate into raw time */
+	raw_time.tv_nsec += timekeeper.raw_interval << shift;;
+	while (raw_time.tv_nsec >= NSEC_PER_SEC) {
+		raw_time.tv_nsec -= NSEC_PER_SEC;
+		raw_time.tv_sec++;
+	}
+
+	/* Accumulate error between NTP and clock interval */
+	timekeeper.ntp_error += tick_length << shift;
+	timekeeper.ntp_error -= timekeeper.xtime_interval <<
+				(timekeeper.ntp_error_shift + shift);
+
+	return offset;
+}
+
+
 /**
  * update_wall_time - Uses the current clocksource to increment the wall time
  *
@@ -732,6 +873,7 @@ void update_wall_time(void)
 	struct clocksource *clock;
 	cycle_t offset;
 	u64 nsecs;
+	int shift = 0, maxshift;
 
 	/* Make sure we're fully resumed: */
 	if (unlikely(timekeeping_suspended))
@@ -745,33 +887,23 @@ void update_wall_time(void)
 #endif
 	timekeeper.xtime_nsec = (s64)xtime.tv_nsec << timekeeper.shift;
 
-	/* normally this loop will run just once, however in the
-	 * case of lost or late ticks, it will accumulate correctly.
+	/*
+	 * With NO_HZ we may have to accumulate many cycle_intervals
+	 * (think "ticks") worth of time at once. To do this efficiently,
+	 * we calculate the largest doubling multiple of cycle_intervals
+	 * that is smaller then the offset. We then accumulate that
+	 * chunk in one go, and then try to consume the next smaller
+	 * doubled multiple.
 	 */
+	shift = ilog2(offset) - ilog2(timekeeper.cycle_interval);
+	shift = max(0, shift);
+	/* Bound shift to one less then what overflows tick_length */
+	maxshift = (8*sizeof(tick_length) - (ilog2(tick_length)+1)) - 1;
+	shift = min(shift, maxshift);
 	while (offset >= timekeeper.cycle_interval) {
-		u64 nsecps = (u64)NSEC_PER_SEC << timekeeper.shift;
-
-		/* accumulate one interval */
-		offset -= timekeeper.cycle_interval;
-		clock->cycle_last += timekeeper.cycle_interval;
-
-		timekeeper.xtime_nsec += timekeeper.xtime_interval;
-		if (timekeeper.xtime_nsec >= nsecps) {
-			timekeeper.xtime_nsec -= nsecps;
-			xtime.tv_sec++;
-			second_overflow();
-		}
-
-		raw_time.tv_nsec += timekeeper.raw_interval;
-		if (raw_time.tv_nsec >= NSEC_PER_SEC) {
-			raw_time.tv_nsec -= NSEC_PER_SEC;
-			raw_time.tv_sec++;
-		}
-
-		/* accumulate error between NTP and clock interval */
-		timekeeper.ntp_error += tick_length;
-		timekeeper.ntp_error -= timekeeper.xtime_interval <<
-					timekeeper.ntp_error_shift;
+		offset = logarithmic_accumulation(offset, shift);
+		if(offset < timekeeper.cycle_interval<<shift)
+			shift--;
 	}
 
 	/* correct the clock when NTP error is too big */
@@ -811,7 +943,7 @@ void update_wall_time(void)
 	update_xtime_cache(nsecs);
 
 	/* check to see if there is a new clocksource to use */
-	update_vsyscall(&xtime, timekeeper.clock);
+	update_vsyscall(&xtime, timekeeper.clock, timekeeper.mult);
 }
 
 /**
@@ -825,7 +957,7 @@ void update_wall_time(void)
  * basically means that however wrong your real time clock is at boot time,
  * you get the right time here).
  */
-void getboottime(struct timespec *ts)
+void getrealboottime(struct timespec *ts)
 {
 	struct timespec boottime = {
 		.tv_sec = wall_to_monotonic.tv_sec + total_sleep_time.tv_sec,
@@ -834,6 +966,14 @@ void getboottime(struct timespec *ts)
 
 	set_normalized_timespec(ts, -boottime.tv_sec, -boottime.tv_nsec);
 }
+EXPORT_SYMBOL_GPL(getrealboottime);
+
+void getboottime(struct timespec *ts)
+{
+	getrealboottime(ts);
+	sub_preserved_uptime(ts);
+}
+EXPORT_SYMBOL_GPL(getboottime);
 
 /**
  * monotonic_to_bootbased - Convert the monotonic time to boot based.
@@ -842,7 +982,9 @@ void getboottime(struct timespec *ts)
 void monotonic_to_bootbased(struct timespec *ts)
 {
 	*ts = timespec_add_safe(*ts, total_sleep_time);
+	add_preserved_uptime(ts);
 }
+EXPORT_SYMBOL_GPL(monotonic_to_bootbased);
 
 unsigned long get_seconds(void)
 {
@@ -885,4 +1027,19 @@ struct timespec get_monotonic_coarse(void)
 	set_normalized_timespec(&now, now.tv_sec + mono.tv_sec,
 				now.tv_nsec + mono.tv_nsec);
 	return now;
+}
+
+/**
+ *  * ktime_get_monotonic_offset() - get wall_to_monotonic in ktime_t format
+ *   */
+ktime_t ktime_get_monotonic_offset(void)
+{
+	unsigned long seq;
+	struct timespec wtom;
+
+	do {
+		seq = read_seqbegin(&xtime_lock);
+		wtom = wall_to_monotonic;
+	} while (read_seqretry(&xtime_lock, seq));
+	return timespec_to_ktime(wtom);
 }

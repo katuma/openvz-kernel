@@ -31,12 +31,16 @@
 #include <linux/cpu.h>
 #include <linux/console.h>
 #include <linux/vmalloc.h>
+#include <linux/swap.h>
+#include <linux/kmsg_dump.h>
+#include <linux/pram.h>
 
 #include <asm/page.h>
 #include <asm/uaccess.h>
 #include <asm/io.h>
 #include <asm/system.h>
 #include <asm/sections.h>
+#include <asm/setup.h>
 
 /* Per cpu memory for storing cpu states in case of system crash. */
 note_buf_t* crash_notes;
@@ -46,6 +50,7 @@ static unsigned char vmcoreinfo_data[VMCOREINFO_BYTES];
 u32 vmcoreinfo_note[VMCOREINFO_NOTE_SIZE/4];
 size_t vmcoreinfo_size;
 size_t vmcoreinfo_max_size = sizeof(vmcoreinfo_data);
+int kexec_load_disabled;
 
 /* Location of the reserved area for the crash kernel */
 struct resource crashk_res = {
@@ -114,6 +119,32 @@ static struct page *kimage_alloc_page(struct kimage *image,
 				       gfp_t gfp_mask,
 				       unsigned long dest);
 
+static struct kimage *alloc_kimage(void)
+{
+	struct kimage *image;
+
+	image = kzalloc(sizeof(*image), GFP_KERNEL);
+	if (!image)
+		return NULL;
+
+	image->head = 0;
+	image->entry = &image->head;
+	image->last_entry = &image->head;
+	image->control_page = ~0; /* By default this does not apply */
+	image->type = KEXEC_TYPE_DEFAULT;
+
+	/* Initialize the list of control pages */
+	INIT_LIST_HEAD(&image->control_pages);
+
+	/* Initialize the list of destination pages */
+	INIT_LIST_HEAD(&image->dest_pages);
+
+	/* Initialize the list of unuseable pages */
+	INIT_LIST_HEAD(&image->unuseable_pages);
+
+	return image;
+}
+
 static int do_kimage_alloc(struct kimage **rimage, unsigned long entry,
 	                    unsigned long nr_segments,
                             struct kexec_segment __user *segments)
@@ -125,25 +156,12 @@ static int do_kimage_alloc(struct kimage **rimage, unsigned long entry,
 
 	/* Allocate a controlling structure */
 	result = -ENOMEM;
-	image = kzalloc(sizeof(*image), GFP_KERNEL);
+	image = alloc_kimage();
 	if (!image)
 		goto out;
 
-	image->head = 0;
-	image->entry = &image->head;
-	image->last_entry = &image->head;
-	image->control_page = ~0; /* By default this does not apply */
+	/* Set the entry point */
 	image->start = entry;
-	image->type = KEXEC_TYPE_DEFAULT;
-
-	/* Initialize the list of control pages */
-	INIT_LIST_HEAD(&image->control_pages);
-
-	/* Initialize the list of destination pages */
-	INIT_LIST_HEAD(&image->dest_pages);
-
-	/* Initialize the list of unuseable pages */
-	INIT_LIST_HEAD(&image->unuseable_pages);
 
 	/* Read in the segments */
 	image->nr_segments = nr_segments;
@@ -493,7 +511,7 @@ static struct page *kimage_alloc_crash_control_pages(struct kimage *image,
 	while (hole_end <= crashk_res.end) {
 		unsigned long i;
 
-		if (hole_end > KEXEC_CONTROL_MEMORY_LIMIT)
+		if (hole_end > KEXEC_CRASH_CONTROL_MEMORY_LIMIT)
 			break;
 		if (hole_end > crashk_res.end)
 			break;
@@ -944,6 +962,9 @@ SYSCALL_DEFINE4(kexec_load, unsigned long, entry, unsigned long, nr_segments,
 	if (!capable(CAP_SYS_BOOT))
 		return -EPERM;
 
+	if (kexec_load_disabled)
+		return -EPERM;
+
 	/*
 	 * Verify we have a legal set of flags
 	 * This leaves us room for future extensions.
@@ -994,6 +1015,7 @@ SYSCALL_DEFINE4(kexec_load, unsigned long, entry, unsigned long, nr_segments,
 			kimage_free(xchg(&kexec_crash_image, NULL));
 			result = kimage_crash_alloc(&image, entry,
 						     nr_segments, segments);
+			crash_map_reserved_pages();
 		}
 		if (result)
 			goto out;
@@ -1010,6 +1032,8 @@ SYSCALL_DEFINE4(kexec_load, unsigned long, entry, unsigned long, nr_segments,
 				goto out;
 		}
 		kimage_terminate(image);
+		if (flags & KEXEC_ON_CRASH)
+			crash_unmap_reserved_pages();
 	}
 	/* Install the new kernel, and  Uninstall the old */
 	image = xchg(dest_image, image);
@@ -1020,6 +1044,18 @@ out:
 
 	return result;
 }
+
+/*
+ * Add and remove page tables for crashkernel memory
+ *
+ * Provide an empty default implementation here -- architecture
+ * code may override this
+ */
+void __weak crash_map_reserved_pages(void)
+{}
+
+void __weak crash_unmap_reserved_pages(void)
+{}
 
 #ifdef CONFIG_COMPAT
 asmlinkage long compat_sys_kexec_load(unsigned long entry,
@@ -1073,6 +1109,9 @@ void crash_kexec(struct pt_regs *regs)
 	if (mutex_trylock(&kexec_mutex)) {
 		if (kexec_crash_image) {
 			struct pt_regs fixed_regs;
+
+			kmsg_dump(KMSG_DUMP_KEXEC);
+
 			crash_setup_regs(&fixed_regs, regs);
 			crash_save_vmcoreinfo();
 			machine_crash_shutdown(&fixed_regs);
@@ -1080,6 +1119,79 @@ void crash_kexec(struct pt_regs *regs)
 		}
 		mutex_unlock(&kexec_mutex);
 	}
+}
+
+size_t crash_get_memory_size(void)
+{
+	size_t size = 0;
+	mutex_lock(&kexec_mutex);
+	if (crashk_res.end > crashk_res.start)
+		size = crashk_res.end - crashk_res.start + 1;
+	mutex_unlock(&kexec_mutex);
+	return size;
+}
+
+void __weak crash_free_reserved_phys_range(unsigned long begin,
+					   unsigned long end)
+{
+	unsigned long addr;
+
+	for (addr = begin; addr < end; addr += PAGE_SIZE) {
+		ClearPageReserved(pfn_to_page(addr >> PAGE_SHIFT));
+		init_page_count(pfn_to_page(addr >> PAGE_SHIFT));
+		free_page((unsigned long)__va(addr));
+		totalram_pages++;
+	}
+}
+
+int crash_shrink_memory(unsigned long new_size)
+{
+	int ret = 0;
+	unsigned long start, end, old_size;
+	struct resource *ram_res;
+
+	mutex_lock(&kexec_mutex);
+
+	if (kexec_crash_image) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+	start = crashk_res.start;
+	end = crashk_res.end;
+	old_size = (end == 0) ? 0 : end - start + 1;
+	if (new_size >= old_size) {
+		ret = (new_size == old_size) ? 0 : -EINVAL;
+		goto unlock;
+	}
+
+	ram_res = kzalloc(sizeof(*ram_res), GFP_KERNEL);
+	if (!ram_res) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+
+	start = roundup(start, KEXEC_CRASH_MEM_ALIGN);
+	end = roundup(start + new_size, KEXEC_CRASH_MEM_ALIGN);
+
+	crash_map_reserved_pages();
+	crash_free_reserved_phys_range(end, crashk_res.end);
+
+	if ((start == end) && (crashk_res.parent != NULL))
+		release_resource(&crashk_res);
+
+	ram_res->start = end;
+	ram_res->end = crashk_res.end;
+	ram_res->flags = IORESOURCE_BUSY | IORESOURCE_MEM;
+	ram_res->name = "System RAM";
+
+	crashk_res.end = end - 1;
+
+	insert_resource(&iomem_resource, ram_res);
+	crash_unmap_reserved_pages();
+
+unlock:
+	mutex_unlock(&kexec_mutex);
+	return ret;
 }
 
 static u32 *append_elf_note(u32 *buf, char *name, unsigned type, void *data,
@@ -1147,7 +1259,6 @@ static int __init crash_notes_memory_init(void)
 	}
 	return 0;
 }
-module_init(crash_notes_memory_init)
 
 
 /*
@@ -1167,7 +1278,8 @@ module_init(crash_notes_memory_init)
 static int __init parse_crashkernel_mem(char 			*cmdline,
 					unsigned long long	system_ram,
 					unsigned long long	*crash_size,
-					unsigned long long	*crash_base)
+					unsigned long long	*crash_base,
+					int			*strict)
 {
 	char *cur = cmdline, *tmp;
 
@@ -1238,6 +1350,8 @@ static int __init parse_crashkernel_mem(char 			*cmdline,
 						"after '@'\n");
 				return -EINVAL;
 			}
+			if (strict && *crash_base > 0 && *tmp != '+')
+				*strict = 1;
 		}
 	}
 
@@ -1253,7 +1367,8 @@ static int __init parse_crashkernel_mem(char 			*cmdline,
  */
 static int __init parse_crashkernel_simple(char 		*cmdline,
 					   unsigned long long 	*crash_size,
-					   unsigned long long 	*crash_base)
+					   unsigned long long 	*crash_base,
+					   int			*strict)
 {
 	char *cur = cmdline;
 
@@ -1263,11 +1378,51 @@ static int __init parse_crashkernel_simple(char 		*cmdline,
 		return -EINVAL;
 	}
 
-	if (*cur == '@')
+	if (*cur == '@') {
 		*crash_base = memparse(cur+1, &cur);
+		if (strict && *crash_base > 0 && *cur != '+')
+			*strict = 1;
+	}
 
 	return 0;
 }
+
+#ifdef CONFIG_KEXEC_AUTO_RESERVE
+#ifndef arch_default_crash_size
+unsigned long long __init arch_default_crash_size(unsigned long long total_size)
+{
+	/*
+	 * BIOS usually will reserve some memory regions for it's own use.
+	 * so we will get less than actual memory in e820 usable areas.
+	 * We workaround this by round up the total size to 128M which is
+	 * enough for our current 2G kdump auto reserve threshold.
+	 */
+	if (roundup(total_size, 0x8000000) < KEXEC_AUTO_THRESHOLD)
+		return 0;
+	else {
+		/*
+		 * Filtering logic in kdump initrd requires 2bits per 4K page.
+		 * Hence reserve 2bits per 4K of RAM (or 1byte per 16K of RAM)
+		 * on top of base of 128M (KEXEC_AUTO_RESERVED_SIZE).
+		 */
+		return KEXEC_AUTO_RESERVED_SIZE +
+			roundup((total_size - KEXEC_AUTO_RESERVED_SIZE)
+				/ (1ULL<<14), 1ULL<<20);
+	}
+}
+#define arch_default_crash_size arch_default_crash_size
+#endif
+
+#ifndef arch_default_crash_base
+unsigned long long __init arch_default_crash_base(void)
+{
+	/* 0 means find the base address automatically. */
+	return 0;
+}
+#define arch_default_crash_base arch_default_crash_base
+#endif
+
+#endif /*CONFIG_KEXEC_AUTO_RESERVE*/
 
 /*
  * That function is the entry point for command line parsing and should be
@@ -1276,14 +1431,18 @@ static int __init parse_crashkernel_simple(char 		*cmdline,
 int __init parse_crashkernel(char 		 *cmdline,
 			     unsigned long long system_ram,
 			     unsigned long long *crash_size,
-			     unsigned long long *crash_base)
+			     unsigned long long *crash_base,
+			     int		*strict)
 {
 	char 	*p = cmdline, *ck_cmdline = NULL;
 	char	*first_colon, *first_space;
+	int	ret = 0;
 
 	BUG_ON(!crash_size || !crash_base);
 	*crash_size = 0;
 	*crash_base = 0;
+	if (strict)
+		*strict = 0;
 
 	/* find crashkernel and use the last one if there are more */
 	p = strstr(p, "crashkernel=");
@@ -1297,6 +1456,39 @@ int __init parse_crashkernel(char 		 *cmdline,
 
 	ck_cmdline += 12; /* strlen("crashkernel=") */
 
+#ifdef CONFIG_KEXEC_AUTO_RESERVE
+	if (strncmp(ck_cmdline, "auto", 4) == 0) {
+		unsigned long long size;
+		int len;
+		char tmp[32];
+
+		size = arch_default_crash_size(system_ram);
+		if (size != 0) {
+			*crash_size = size;
+			*crash_base = arch_default_crash_base();
+			len = scnprintf(tmp, sizeof(tmp), "%luM@%luM",
+					(unsigned long)(*crash_size)>>20,
+					(unsigned long)(*crash_base)>>20);
+			/* 'len' can't be <= 4. */
+			if (likely((len - 4 + strlen(cmdline))
+					< COMMAND_LINE_SIZE - 1)) {
+				memmove(ck_cmdline + len, ck_cmdline + 4,
+					strlen(cmdline) - (ck_cmdline + 4 - cmdline) + 1);
+				memcpy(ck_cmdline, tmp, len);
+			}
+		} else {
+			/*
+			 * We can't reserve memory auotmatcally,
+			 * remove "crashkernel=auto" from cmdline.
+			 */
+			ck_cmdline += 4; /* strlen("auto") */
+			memmove(ck_cmdline - 16, ck_cmdline,
+				strlen(cmdline) - (ck_cmdline - cmdline) + 1);
+			ret = -ENOMEM;
+		}
+		goto out;
+	}
+#endif
 	/*
 	 * if the commandline contains a ':', then that's the extended
 	 * syntax -- if not, it must be the classic syntax
@@ -1304,32 +1496,46 @@ int __init parse_crashkernel(char 		 *cmdline,
 	first_colon = strchr(ck_cmdline, ':');
 	first_space = strchr(ck_cmdline, ' ');
 	if (first_colon && (!first_space || first_colon < first_space))
-		return parse_crashkernel_mem(ck_cmdline, system_ram,
-				crash_size, crash_base);
+		ret = parse_crashkernel_mem(ck_cmdline, system_ram,
+				crash_size, crash_base, strict);
 	else
-		return parse_crashkernel_simple(ck_cmdline, crash_size,
-				crash_base);
-
-	return 0;
+		ret = parse_crashkernel_simple(ck_cmdline, crash_size,
+				crash_base, strict);
+out:
+	if (ret == 0 && *crash_base < pram_low) {
+		*crash_base = pram_low;
+		if (strict)
+			*strict = 0;
+	}
+	return ret;
 }
 
 
-
-void crash_save_vmcoreinfo(void)
+static void update_vmcoreinfo_note(void)
 {
-	u32 *buf;
+	u32 *buf = vmcoreinfo_note;
 
 	if (!vmcoreinfo_size)
 		return;
-
-	vmcoreinfo_append_str("CRASHTIME=%ld", get_seconds());
-
-	buf = (u32 *)vmcoreinfo_note;
-
 	buf = append_elf_note(buf, VMCOREINFO_NOTE_NAME, 0, vmcoreinfo_data,
 			      vmcoreinfo_size);
-
 	final_note(buf);
+}
+
+void crash_save_vmcoreinfo(void)
+{
+	unsigned long time;
+
+	/*
+	 * If we panic early, timekeeping might have not been initialized yet
+	 * resulting in get_seconds() returning 0. Userspace utilities do not
+	 * like the zero-time so skip it then.
+	 */
+	time = get_seconds();
+	if (time > 0)
+		vmcoreinfo_append_str("CRASHTIME=%ld", time);
+
+	update_vmcoreinfo_note();
 }
 
 void vmcoreinfo_append_str(const char *fmt, ...)
@@ -1417,11 +1623,175 @@ static int __init crash_save_vmcoreinfo_init(void)
 	VMCOREINFO_NUMBER(PG_swapcache);
 
 	arch_crash_save_vmcoreinfo();
+	update_vmcoreinfo_note();
 
 	return 0;
 }
 
-module_init(crash_save_vmcoreinfo_init)
+static int __init crash_init(void)
+{
+	crash_notes_memory_init();
+	crash_save_vmcoreinfo_init();
+	return 0;
+}
+
+#ifdef CONFIG_KEXEC_REUSE_CRASH
+int kexec_reuse_crash = 1;
+
+struct kexec_pram_segment {
+	__u64	offset;
+	__u64	size;
+};
+
+struct kexec_pram_image {
+	__u64	start;
+	__u64	end;
+	__u64	entry_offset;
+	__u64	nr_segments;
+};
+
+#define KEXEC_CRASH_PRAM	"crash"
+
+static void kexec_crash_image_save(void)
+{
+	struct pram_stream stream;
+	struct kexec_pram_image pimage;
+	struct kexec_pram_segment psegment;
+	struct kimage *image;
+	unsigned long i;
+	int result;
+
+	if (!kexec_reuse_crash || !kexec_crash_image)
+		return;
+
+	image = kexec_crash_image;
+
+	result = pram_open(KEXEC_CRASH_PRAM, PRAM_WRITE, &stream);
+	if (result)
+		goto out;
+
+	pimage.start = __pa(crashk_res.start);
+	pimage.end = __pa(crashk_res.end);
+	pimage.entry_offset = image->start - crashk_res.start;
+	pimage.nr_segments = image->nr_segments;
+
+	result = -EIO;
+	if (pram_write(&stream, &pimage, sizeof(pimage)) != sizeof(pimage))
+		goto out_close_stream;
+
+	for (i = 0; i < image->nr_segments; i++) {
+		psegment.offset = image->segment[i].mem - crashk_res.start;
+		psegment.size = image->segment[i].memsz;
+		if (pram_write(&stream, &psegment, sizeof(psegment)) !=
+				sizeof(psegment))
+			goto out_close_stream;
+	}
+
+	printk(KERN_INFO "Crash image saved");
+	result = 0;
+
+out_close_stream:
+	pram_close(&stream, result);
+out:
+	if (result)
+		printk(KERN_ERR "Could not save crash image: %d\n", result);
+}
+
+static int __init __kexec_crash_image_reuse(struct kimage *image)
+{
+	int result;
+
+	image->control_page = crashk_res.start;
+	image->type = KEXEC_TYPE_CRASH;
+
+	result = -ENOMEM;
+	image->control_code_page = kimage_alloc_control_pages(image,
+					get_order(KEXEC_CONTROL_PAGE_SIZE));
+	if (!image->control_code_page)
+		goto out;
+
+	result = machine_kexec_prepare(image);
+	if (result)
+		goto out;
+
+	kimage_terminate(image);
+
+	kexec_crash_image = image;
+	result = 0;
+out:
+	return result;
+}
+
+static void __init kexec_crash_image_reuse(void)
+{
+	struct pram_stream stream;
+	struct kexec_pram_image pimage;
+	struct kexec_pram_segment psegment;
+	struct kimage *image;
+	unsigned long i;
+	int result;
+
+	if (WARN_ON(kexec_crash_image))
+		return;
+
+	result = pram_open(KEXEC_CRASH_PRAM, PRAM_READ, &stream);
+	if (result)
+		goto out;
+
+	result = -EIO;
+	if (pram_read(&stream, &pimage, sizeof(pimage)) != sizeof(pimage))
+		goto out_close_stream;
+
+	result = -EINVAL;
+	if (pimage.start != __pa(crashk_res.start) ||
+	    pimage.end != __pa(crashk_res.end) ||
+	    pimage.nr_segments > KEXEC_SEGMENT_MAX)
+		goto out_close_stream;
+
+	result = -ENOMEM;
+	image = alloc_kimage();
+	if (!image)
+		goto out_close_stream;
+
+	image->start = crashk_res.start + pimage.entry_offset;
+	image->nr_segments = pimage.nr_segments;
+
+	result = -EIO;
+	for (i = 0; i < pimage.nr_segments; i++) {
+		if (pram_read(&stream, &psegment, sizeof(psegment)) !=
+				sizeof(psegment))
+			goto out_free_image;
+		image->segment[i].mem = crashk_res.start + psegment.offset;
+		image->segment[i].memsz = psegment.size;
+	}
+
+	result = __kexec_crash_image_reuse(image);
+	if (result == 0) {
+		printk(KERN_INFO "Using crash image from previous kernel\n");
+		goto out_close_stream;
+	}
+
+out_free_image:
+	kfree(image);
+out_close_stream:
+	pram_close(&stream, 0);
+out:
+	if (result && result != -ENOENT)
+		printk(KERN_ERR "Could not load crash image: %d\n", result);
+}
+
+void __init kexec_crash_init(void)
+{
+	crash_init();
+	kexec_crash_image_reuse();
+}
+#else
+module_init(crash_init)
+
+static inline void kexec_crash_image_save(void)
+{
+}
+#endif /* CONFIG_KEXEC_REUSE_CRASH */
 
 /*
  * Move into place and start executing a preloaded standalone
@@ -1472,6 +1842,7 @@ int kernel_kexec(void)
 	} else
 #endif
 	{
+		kexec_crash_image_save();
 		kernel_restart_prepare(NULL);
 		printk(KERN_EMERG "Starting new kernel\n");
 		machine_shutdown();

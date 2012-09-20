@@ -29,6 +29,10 @@
 
 MODULE_LICENSE("GPL");
 
+int ip_conntrack_disable_ve0 = 0;
+module_param(ip_conntrack_disable_ve0, int, 0440);
+EXPORT_SYMBOL(ip_conntrack_disable_ve0);
+
 #ifdef CONFIG_PROC_FS
 int
 print_tuple(struct seq_file *s, const struct nf_conntrack_tuple *tuple,
@@ -51,7 +55,7 @@ static struct hlist_nulls_node *ct_get_first(struct seq_file *seq)
 	struct hlist_nulls_node *n;
 
 	for (st->bucket = 0;
-	     st->bucket < nf_conntrack_htable_size;
+	     st->bucket < net->ct.htable_size;
 	     st->bucket++) {
 		n = rcu_dereference(net->ct.hash[st->bucket].first);
 		if (!is_a_nulls(n))
@@ -69,7 +73,7 @@ static struct hlist_nulls_node *ct_get_next(struct seq_file *seq,
 	head = rcu_dereference(head->next);
 	while (is_a_nulls(head)) {
 		if (likely(get_nulls_value(head) == st->bucket)) {
-			if (++st->bucket >= nf_conntrack_htable_size)
+			if (++st->bucket >= net->ct.htable_size)
 				return NULL;
 		}
 		head = rcu_dereference(net->ct.hash[st->bucket].first);
@@ -342,10 +346,11 @@ static ctl_table nf_ct_sysctl_table[] = {
 	{
 		.ctl_name	= NET_NF_CONNTRACK_MAX,
 		.procname	= "nf_conntrack_max",
-		.data		= &nf_conntrack_max,
+		.data		= &init_net.ct.max,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
+		.strategy	= sysctl_intvec,
 	},
 	{
 		.ctl_name	= NET_NF_CONNTRACK_COUNT,
@@ -354,14 +359,16 @@ static ctl_table nf_ct_sysctl_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0444,
 		.proc_handler	= proc_dointvec,
+		.strategy	= sysctl_intvec,
 	},
 	{
 		.ctl_name       = NET_NF_CONNTRACK_BUCKETS,
 		.procname       = "nf_conntrack_buckets",
-		.data           = &nf_conntrack_htable_size,
+		.data           = &init_net.ct.htable_size,
 		.maxlen         = sizeof(unsigned int),
 		.mode           = 0444,
 		.proc_handler   = proc_dointvec,
+		.strategy	= sysctl_intvec,
 	},
 	{
 		.ctl_name	= NET_NF_CONNTRACK_CHECKSUM,
@@ -370,6 +377,7 @@ static ctl_table nf_ct_sysctl_table[] = {
 		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
+		.strategy	= sysctl_intvec,
 	},
 	{
 		.ctl_name	= NET_NF_CONNTRACK_LOG_INVALID,
@@ -385,10 +393,11 @@ static ctl_table nf_ct_sysctl_table[] = {
 	{
 		.ctl_name	= CTL_UNNUMBERED,
 		.procname	= "nf_conntrack_expect_max",
-		.data		= &nf_ct_expect_max,
+		.data		= &init_net.ct.expect_max,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
+		.strategy	= sysctl_intvec,
 	},
 	{ .ctl_name = 0 }
 };
@@ -399,7 +408,7 @@ static ctl_table nf_ct_netfilter_table[] = {
 	{
 		.ctl_name	= NET_NF_CONNTRACK_MAX,
 		.procname	= "nf_conntrack_max",
-		.data		= &nf_conntrack_max,
+		.data		= &init_net.ct.max,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
@@ -411,6 +420,8 @@ static struct ctl_path nf_ct_path[] = {
 	{ .procname = "net", .ctl_name = CTL_NET, },
 	{ }
 };
+
+static int zero;
 
 static int nf_conntrack_standalone_init_sysctl(struct net *net)
 {
@@ -428,9 +439,18 @@ static int nf_conntrack_standalone_init_sysctl(struct net *net)
 	if (!table)
 		goto out_kmemdup;
 
+	table[0].data = &net->ct.max;
 	table[1].data = &net->ct.count;
+	table[2].data = &net->ct.htable_size;
 	table[3].data = &net->ct.sysctl_checksum;
 	table[4].data = &net->ct.sysctl_log_invalid;
+	table[5].data = &net->ct.expect_max;
+
+	if (!net_eq(net, &init_net)) {
+		table[0].proc_handler = proc_dointvec_minmax;
+		table[0].extra1 = &zero;
+		table[0].extra2 = &init_net.ct.max;
+	}
 
 	net->ct.sysctl_header = register_net_sysctl_table(net,
 					nf_net_netfilter_sysctl_path, table);
@@ -495,20 +515,32 @@ out_init:
 	return ret;
 }
 
-static void nf_conntrack_net_exit(struct net *net)
+static void nf_conntrack_net_exit(struct list_head *net_exit_list)
 {
-	nf_conntrack_standalone_fini_sysctl(net);
-	nf_conntrack_standalone_fini_proc(net);
-	nf_conntrack_cleanup(net);
+	struct net *net;
+
+	list_for_each_entry(net, net_exit_list, exit_list) {
+		nf_conntrack_standalone_fini_sysctl(net);
+		nf_conntrack_standalone_fini_proc(net);
+	}
+	nf_conntrack_cleanup_list(net_exit_list);
 }
 
 static struct pernet_operations nf_conntrack_net_ops = {
 	.init = nf_conntrack_net_init,
-	.exit = nf_conntrack_net_exit,
+	.exit_batch = nf_conntrack_net_exit,
 };
 
 static int __init nf_conntrack_standalone_init(void)
 {
+	if (ip_conntrack_disable_ve0) {
+		printk("Disabling conntracks and NAT for ve0\n");
+		get_ve0()->ipt_mask &= ~(VE_NF_CONNTRACK_MOD | VE_IP_IPTABLE_NAT_MOD);
+	} else {
+		printk("Enabling conntracks and NAT for ve0\n");
+		get_ve0()->ipt_mask |= VE_NF_CONNTRACK_MOD | VE_IP_IPTABLE_NAT_MOD;
+	}
+
 	return register_pernet_subsys(&nf_conntrack_net_ops);
 }
 

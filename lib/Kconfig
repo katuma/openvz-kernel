@@ -7,6 +7,9 @@ config BINARY_PRINTF
 
 menu "Library routines"
 
+config RAID6_PQ
+	tristate
+
 config BITREVERSE
 	tristate
 
@@ -156,6 +159,9 @@ config TEXTSEARCH_BM
 config TEXTSEARCH_FSM
 	tristate
 
+config LIST_SORT
+	boolean
+
 config HAS_IOMEM
 	boolean
 	depends on !NO_IOMEM
@@ -199,5 +205,8 @@ config NLATTR
 #
 config GENERIC_ATOMIC64
        bool
+
+config AVERAGE
+	bool
 
 endmenu

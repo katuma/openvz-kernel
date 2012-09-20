@@ -43,10 +43,12 @@ enum {LAST_NORM, LAST_ROOT, LAST_DOT, LAST_DOTDOT, LAST_BIND};
  *  - internal "there are more path components" flag
  *  - locked when lookup done with dcache_lock held
  *  - dentry cache is untrusted; force a real lookup
+ *  - suppress terminal automount
  */
 #define LOOKUP_FOLLOW		 1
 #define LOOKUP_DIRECTORY	 2
 #define LOOKUP_CONTINUE		 4
+#define LOOKUP_AUTOMOUNT	 8
 #define LOOKUP_PARENT		16
 #define LOOKUP_REVAL		64
 /*
@@ -56,6 +58,9 @@ enum {LAST_NORM, LAST_ROOT, LAST_DOT, LAST_DOTDOT, LAST_BIND};
 #define LOOKUP_CREATE		0x0200
 #define LOOKUP_EXCL		0x0400
 #define LOOKUP_RENAME_TARGET	0x0800
+#define LOOKUP_STRICT		0x2000	/* no symlinks or other filesystems */
+#define LOOKUP_EMPTY		0x4000
+#define LOOKUP_DIVE		0x8000	/* no follow mount */
 
 extern int user_path_at(int, const char __user *, unsigned, struct path *);
 
@@ -72,13 +77,12 @@ extern int vfs_path_lookup(struct dentry *, struct vfsmount *,
 
 extern struct file *lookup_instantiate_filp(struct nameidata *nd, struct dentry *dentry,
 		int (*open)(struct inode *, struct file *));
-extern struct file *nameidata_to_filp(struct nameidata *nd, int flags);
-extern void release_open_intent(struct nameidata *);
 
 extern struct dentry *lookup_one_len(const char *, struct dentry *, int);
 extern struct dentry *lookup_one_noperm(const char *, struct dentry *);
 
 extern int follow_down(struct path *);
+extern int __follow_down(struct path *, bool);
 extern int follow_up(struct path *);
 
 extern struct dentry *lock_rename(struct dentry *, struct dentry *);

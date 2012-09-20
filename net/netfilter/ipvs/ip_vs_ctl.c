@@ -1856,21 +1856,27 @@ static int ip_vs_info_seq_show(struct seq_file *seq, void *v)
 		if (iter->table == ip_vs_svc_table) {
 #ifdef CONFIG_IP_VS_IPV6
 			if (svc->af == AF_INET6)
-				seq_printf(seq, "%s  [%pI6]:%04X %s ",
+				seq_printf(seq, "%s  [%pI6]:%04X %s%s ",
 					   ip_vs_proto_name(svc->protocol),
 					   &svc->addr.in6,
 					   ntohs(svc->port),
-					   svc->scheduler->name);
+					   svc->scheduler->name,
+					   (svc->flags & IP_VS_SVC_F_ONEPACKET)?
+					   " ops":"");
 			else
 #endif
-				seq_printf(seq, "%s  %08X:%04X %s ",
+				seq_printf(seq, "%s  %08X:%04X %s%s ",
 					   ip_vs_proto_name(svc->protocol),
 					   ntohl(svc->addr.ip),
 					   ntohs(svc->port),
-					   svc->scheduler->name);
+					   svc->scheduler->name,
+					   (svc->flags & IP_VS_SVC_F_ONEPACKET)?
+					   " ops":"");
 		} else {
-			seq_printf(seq, "FWM  %08X %s ",
-				   svc->fwmark, svc->scheduler->name);
+			seq_printf(seq, "FWM  %08X %s%s ",
+				   svc->fwmark, svc->scheduler->name,
+				   (svc->flags & IP_VS_SVC_F_ONEPACKET)?
+				   " ops":"");
 		}
 
 		if (svc->flags & IP_VS_SVC_F_PERSISTENT)
@@ -2128,8 +2134,9 @@ do_ip_vs_set_ctl(struct sock *sk, int cmd, void __user *user, unsigned int len)
 		}
 	}
 
-	/* Check for valid protocol: TCP or UDP, even for fwmark!=0 */
-	if (usvc.protocol != IPPROTO_TCP && usvc.protocol != IPPROTO_UDP) {
+	/* Check for valid protocol: TCP or UDP or SCTP, even for fwmark!=0 */
+	if (usvc.protocol != IPPROTO_TCP && usvc.protocol != IPPROTO_UDP &&
+	    usvc.protocol != IPPROTO_SCTP) {
 		pr_err("set_ctl: invalid protocol: %d %pI4:%d %s\n",
 		       usvc.protocol, &usvc.addr.ip,
 		       ntohs(usvc.port), usvc.sched_name);
@@ -2714,6 +2721,8 @@ static int ip_vs_genl_parse_service(struct ip_vs_service_user_kern *usvc,
 	if (!(nla_af && (nla_fwmark || (nla_port && nla_protocol && nla_addr))))
 		return -EINVAL;
 
+	memset(usvc, 0, sizeof(*usvc));
+
 	usvc->af = nla_get_u16(nla_af);
 #ifdef CONFIG_IP_VS_IPV6
 	if (usvc->af != AF_INET && usvc->af != AF_INET6)
@@ -2900,6 +2909,8 @@ static int ip_vs_genl_parse_dest(struct ip_vs_dest_user_kern *udest,
 
 	if (!(nla_addr && nla_port))
 		return -EINVAL;
+
+	memset(udest, 0, sizeof(*udest));
 
 	nla_memcpy(&udest->addr, nla_addr, sizeof(udest->addr));
 	udest->port = nla_get_u16(nla_port);

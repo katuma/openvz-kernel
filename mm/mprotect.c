@@ -26,8 +26,15 @@
 #include <linux/perf_event.h>
 #include <asm/uaccess.h>
 #include <asm/pgtable.h>
+#include <asm/pgalloc.h>
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
+
+#include <bc/vmpages.h>
+
+#ifndef arch_remove_exec_range
+#define arch_remove_exec_range(mm, limit)      do { ; } while (0)
+#endif
 
 #ifndef pgprot_modify
 static inline pgprot_t pgprot_modify(pgprot_t oldprot, pgprot_t newprot)
@@ -50,7 +57,12 @@ static void change_pte_range(struct mm_struct *mm, pmd_t *pmd,
 		if (pte_present(oldpte)) {
 			pte_t ptent;
 
-			ptent = ptep_modify_prot_start(mm, addr, pte);
+#ifdef CONFIG_PARAVIRT
+			if (likely(!paravirt_enabled()))
+				ptent = __ptep_modify_prot_start(mm, addr, pte);
+			else
+#endif
+				ptent = ptep_modify_prot_start(mm, addr, pte);
 			ptent = pte_modify(ptent, newprot);
 
 			/*
@@ -60,7 +72,12 @@ static void change_pte_range(struct mm_struct *mm, pmd_t *pmd,
 			if (dirty_accountable && pte_dirty(ptent))
 				ptent = pte_mkwrite(ptent);
 
-			ptep_modify_prot_commit(mm, addr, pte, ptent);
+#ifdef CONFIG_PARAVIRT
+			if (likely(!paravirt_enabled()))
+				__ptep_modify_prot_commit(mm, addr, pte, ptent);
+			else
+#endif
+				ptep_modify_prot_commit(mm, addr, pte, ptent);
 		} else if (PAGE_MIGRATION && !pte_file(oldpte)) {
 			swp_entry_t entry = pte_to_swp_entry(oldpte);
 
@@ -79,7 +96,7 @@ static void change_pte_range(struct mm_struct *mm, pmd_t *pmd,
 	pte_unmap_unlock(pte - 1, ptl);
 }
 
-static inline void change_pmd_range(struct mm_struct *mm, pud_t *pud,
+static inline void change_pmd_range(struct vm_area_struct *vma, pud_t *pud,
 		unsigned long addr, unsigned long end, pgprot_t newprot,
 		int dirty_accountable)
 {
@@ -89,13 +106,21 @@ static inline void change_pmd_range(struct mm_struct *mm, pud_t *pud,
 	pmd = pmd_offset(pud, addr);
 	do {
 		next = pmd_addr_end(addr, end);
+		if (pmd_trans_huge(*pmd)) {
+			if (next - addr != HPAGE_PMD_SIZE)
+				split_huge_page_pmd(vma->vm_mm, pmd);
+			else if (change_huge_pmd(vma, pmd, addr, newprot))
+				continue;
+			/* fall through */
+		}
 		if (pmd_none_or_clear_bad(pmd))
 			continue;
-		change_pte_range(mm, pmd, addr, next, newprot, dirty_accountable);
+		change_pte_range(vma->vm_mm, pmd, addr, next, newprot,
+				 dirty_accountable);
 	} while (pmd++, addr = next, addr != end);
 }
 
-static inline void change_pud_range(struct mm_struct *mm, pgd_t *pgd,
+static inline void change_pud_range(struct vm_area_struct *vma, pgd_t *pgd,
 		unsigned long addr, unsigned long end, pgprot_t newprot,
 		int dirty_accountable)
 {
@@ -107,7 +132,8 @@ static inline void change_pud_range(struct mm_struct *mm, pgd_t *pgd,
 		next = pud_addr_end(addr, end);
 		if (pud_none_or_clear_bad(pud))
 			continue;
-		change_pmd_range(mm, pud, addr, next, newprot, dirty_accountable);
+		change_pmd_range(vma, pud, addr, next, newprot,
+				 dirty_accountable);
 	} while (pud++, addr = next, addr != end);
 }
 
@@ -127,7 +153,8 @@ static void change_protection(struct vm_area_struct *vma,
 		next = pgd_addr_end(addr, end);
 		if (pgd_none_or_clear_bad(pgd))
 			continue;
-		change_pud_range(mm, pgd, addr, next, newprot, dirty_accountable);
+		change_pud_range(vma, pgd, addr, next, newprot,
+				 dirty_accountable);
 	} while (pgd++, addr = next, addr != end);
 	flush_tlb_range(vma, start, end);
 }
@@ -140,14 +167,22 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 	unsigned long oldflags = vma->vm_flags;
 	long nrpages = (end - start) >> PAGE_SHIFT;
 	unsigned long charged = 0;
+	unsigned long old_end;
 	pgoff_t pgoff;
 	int error;
 	int dirty_accountable = 0;
 
+	old_end = vma->vm_end;
 	if (newflags == oldflags) {
 		*pprev = vma;
 		return 0;
 	}
+
+	error = -ENOMEM;
+       if (!VM_UB_PRIVATE(oldflags, vma->vm_file) &&
+            VM_UB_PRIVATE(newflags, vma->vm_file) &&
+            charge_beancounter_fast(mm->mm_ub, UB_PRIVVMPAGES, nrpages, UB_SOFT))
+		goto fail_ch;
 
 	/*
 	 * If we make a private mapping writable we increase our commit;
@@ -160,7 +195,7 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 						VM_SHARED|VM_NORESERVE))) {
 			charged = nrpages;
 			if (security_vm_enough_memory(charged))
-				return -ENOMEM;
+				goto fail_sec;
 			newflags |= VM_ACCOUNT;
 		}
 	}
@@ -201,8 +236,13 @@ success:
 
 	if (vma_wants_writenotify(vma)) {
 		vma->vm_page_prot = vm_get_page_prot(newflags & ~VM_SHARED);
-		dirty_accountable = 1;
+		if (!vma->vm_file ||
+		    !test_bit(AS_CHECKPOINT, &vma->vm_file->f_mapping->flags))
+			dirty_accountable = 1;
 	}
+
+	if (oldflags & VM_EXEC)
+		arch_remove_exec_range(current->mm, old_end);
 
 	mmu_notifier_invalidate_range_start(mm, start, end);
 	if (is_vm_hugetlb_page(vma))
@@ -212,10 +252,21 @@ success:
 	mmu_notifier_invalidate_range_end(mm, start, end);
 	vm_stat_account(mm, oldflags, vma->vm_file, -nrpages);
 	vm_stat_account(mm, newflags, vma->vm_file, nrpages);
+
+       if (VM_UB_PRIVATE(oldflags, vma->vm_file) &&
+                       !VM_UB_PRIVATE(newflags, vma->vm_file))
+               uncharge_beancounter_fast(mm->mm_ub, UB_PRIVVMPAGES, nrpages);
+
+	perf_event_mmap(vma);
 	return 0;
 
 fail:
 	vm_unacct_memory(charged);
+fail_sec:
+       if (!VM_UB_PRIVATE(oldflags, vma->vm_file) &&
+                       VM_UB_PRIVATE(newflags, vma->vm_file))
+               uncharge_beancounter_fast(mm->mm_ub, UB_PRIVVMPAGES, nrpages);
+fail_ch:
 	return error;
 }
 
@@ -300,7 +351,6 @@ SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
 		error = mprotect_fixup(vma, &prev, nstart, tmp, newflags);
 		if (error)
 			goto out;
-		perf_event_mmap(vma);
 		nstart = tmp;
 
 		if (nstart < prev->vm_end)
@@ -318,3 +368,4 @@ out:
 	up_write(&current->mm->mmap_sem);
 	return error;
 }
+EXPORT_SYMBOL(sys_mprotect);

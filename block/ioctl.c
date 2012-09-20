@@ -12,12 +12,13 @@ static int blkpg_ioctl(struct block_device *bdev, struct blkpg_ioctl_arg __user 
 {
 	struct block_device *bdevp;
 	struct gendisk *disk;
-	struct hd_struct *part;
+	struct hd_struct *part, *lpart;
 	struct blkpg_ioctl_arg a;
 	struct blkpg_partition p;
 	struct disk_part_iter piter;
 	long long start, length;
 	int partno;
+	int err;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EACCES;
@@ -91,6 +92,71 @@ static int blkpg_ioctl(struct block_device *bdev, struct blkpg_ioctl_arg __user 
 			bdput(bdevp);
 
 			return 0;
+		case BLKPG_RESIZE_PARTITION:
+			start = p.start >> 9;
+			length = p.length >> 9;
+			/* check for fit in a hd_struct */
+			if (sizeof(sector_t) == sizeof(long) &&
+			    sizeof(long long) > sizeof(long)) {
+				long pstart = start, plength = length;
+				if (pstart != start || plength != length
+				    || pstart < 0 || plength < 0)
+					return -EINVAL;
+			}
+
+			part = disk_get_part(disk, partno);
+			if (!part)
+				return -ENXIO;
+			bdevp = bdget(part_devt(part));
+			if (!bdevp) {
+				disk_put_part(part);
+				return -ENOMEM;
+			}
+
+			err = 0;
+			mutex_lock(&bdevp->bd_mutex);
+			mutex_lock_nested(&bdev->bd_mutex, 1);
+
+			if (start != part->start_sect) {
+				err = -EINVAL;
+				goto resize_done;
+			}
+			/* overlap? */
+			disk_part_iter_init(&piter, disk,
+					    DISK_PITER_INCL_EMPTY);
+			while ((lpart = disk_part_iter_next(&piter))) {
+				if (lpart->partno != partno &&
+				    !(start + length <= lpart->start_sect ||
+				      start >= lpart->start_sect + lpart->nr_sects)) {
+					disk_part_iter_exit(&piter);
+					err = -EBUSY;
+					goto resize_done;
+				}
+			}
+			disk_part_iter_exit(&piter);
+			part_nr_sects_write(part, length);
+			i_size_write(bdevp->bd_inode, p.length);
+	resize_done:
+			mutex_unlock(&bdevp->bd_mutex);
+			mutex_unlock(&bdev->bd_mutex);
+			bdput(bdevp);
+			disk_put_part(part);
+			return err;
+		case BLKPG_GET_PARTITION:
+			mutex_lock(&bdev->bd_mutex);
+			part = disk_get_part(disk, partno);
+			if (!part)
+			{
+				mutex_unlock(&bdev->bd_mutex);
+				return -ENXIO;
+			}
+			p.start = part->start_sect << 9;
+			p.length = part->nr_sects << 9;
+			disk_put_part(part);
+			mutex_unlock(&bdev->bd_mutex);
+			if (copy_to_user(a.data, &p, sizeof(struct blkpg_partition)))
+				return -EFAULT;
+			return 0;
 		default:
 			return -EINVAL;
 	}
@@ -122,10 +188,9 @@ static int blk_ioctl_discard(struct block_device *bdev, uint64_t start,
 	start >>= 9;
 	len >>= 9;
 
-	if (start + len > (bdev->bd_inode->i_size >> 9))
+	if (start + len > (i_size_read(bdev->bd_inode) >> 9))
 		return -EINVAL;
-	return blkdev_issue_discard(bdev, start, len, GFP_KERNEL,
-				    DISCARD_FL_WAIT);
+	return blkdev_issue_discard(bdev, start, len, GFP_KERNEL, 0);
 }
 
 static int put_ushort(unsigned long arg, unsigned short val)
@@ -280,6 +345,8 @@ int blkdev_ioctl(struct block_device *bdev, fmode_t mode, unsigned cmd,
 		return put_uint(arg, bdev_io_opt(bdev));
 	case BLKALIGNOFF:
 		return put_int(arg, bdev_alignment_offset(bdev));
+	case BLKDISCARDZEROES:
+		return put_uint(arg, bdev_discard_zeroes_data(bdev));
 	case BLKSECTGET:
 		return put_ushort(arg, queue_max_sectors(bdev_get_queue(bdev)));
 	case BLKRASET:
@@ -316,12 +383,12 @@ int blkdev_ioctl(struct block_device *bdev, fmode_t mode, unsigned cmd,
 		unlock_kernel();
 		break;
 	case BLKGETSIZE:
-		size = bdev->bd_inode->i_size;
+		size = i_size_read(bdev->bd_inode);
 		if ((size >> 9) > ~0UL)
 			return -EFBIG;
 		return put_ulong(arg, size >> 9);
 	case BLKGETSIZE64:
-		return put_u64(arg, bdev->bd_inode->i_size);
+		return put_u64(arg, i_size_read(bdev->bd_inode));
 	case BLKTRACESTART:
 	case BLKTRACESTOP:
 	case BLKTRACESETUP:

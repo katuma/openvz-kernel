@@ -103,8 +103,13 @@ struct vmcore {
 #ifdef CONFIG_PROC_FS
 
 extern void proc_root_init(void);
+extern struct file_system_type proc_fs_type;
+extern const struct file_operations proc_kmsg_operations;
 
 void proc_flush_task(struct task_struct *task);
+
+extern int proc_dentry_of_dead_task(struct dentry *dentry);
+extern struct file_operations dummy_proc_pid_file_operations;
 
 extern struct proc_dir_entry *create_proc_entry(const char *name, mode_t mode,
 						struct proc_dir_entry *parent);
@@ -148,6 +153,16 @@ extern struct proc_dir_entry *proc_symlink(const char *,
 extern struct proc_dir_entry *proc_mkdir(const char *,struct proc_dir_entry *);
 extern struct proc_dir_entry *proc_mkdir_mode(const char *name, mode_t mode,
 			struct proc_dir_entry *parent);
+extern struct proc_dir_entry *create_proc_hardlink(
+			const char *name, mode_t mode, 
+			struct proc_dir_entry *parent,
+			struct proc_dir_entry *link);
+extern struct proc_dir_entry *__proc_lookup(struct proc_dir_entry *dir,
+		const char *name, int namelen);
+extern struct proc_dir_entry *proc_lookup_entry(const char *name, 
+			struct proc_dir_entry *parent);
+
+extern struct proc_dir_entry glob_proc_root;
 
 static inline struct proc_dir_entry *proc_create(const char *name, mode_t mode,
 	struct proc_dir_entry *parent, const struct file_operations *proc_fops)
@@ -183,6 +198,8 @@ extern void dup_mm_exe_file(struct mm_struct *oldmm, struct mm_struct *newmm);
 
 #define proc_net_fops_create(net, name, mode, fops)  ({ (void)(mode), NULL; })
 static inline void proc_net_remove(struct net *net, const char *name) {}
+
+static inline int proc_dentry_of_dead_task(struct dentry *dentry) { return 0; }
 
 static inline void proc_flush_task(struct task_struct *task)
 {
@@ -268,6 +285,9 @@ struct proc_inode {
 	struct proc_dir_entry *pde;
 	struct ctl_table_header *sysctl;
 	struct ctl_table *sysctl_entry;
+#ifdef CONFIG_VE
+	struct proc_dir_entry *lpde;
+#endif
 	struct inode vfs_inode;
 };
 
@@ -281,17 +301,18 @@ static inline struct proc_dir_entry *PDE(const struct inode *inode)
 	return PROC_I(inode)->pde;
 }
 
+static inline struct proc_dir_entry *LPDE(const struct inode *inode)
+{
+#ifdef CONFIG_VE
+	return PROC_I(inode)->lpde;
+#else
+	return NULL;
+#endif
+}
+
 static inline struct net *PDE_NET(struct proc_dir_entry *pde)
 {
 	return pde->parent->data;
 }
-
-struct proc_maps_private {
-	struct pid *pid;
-	struct task_struct *task;
-#ifdef CONFIG_MMU
-	struct vm_area_struct *tail_vma;
-#endif
-};
 
 #endif /* _LINUX_PROC_FS_H */

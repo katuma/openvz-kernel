@@ -21,6 +21,8 @@
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
 
+#include <bc/vmpages.h>
+
 #include "internal.h"
 
 static void zap_pte(struct mm_struct *mm, struct vm_area_struct *vma,
@@ -36,7 +38,7 @@ static void zap_pte(struct mm_struct *mm, struct vm_area_struct *vma,
 		page = vm_normal_page(vma, addr, pte);
 		if (page) {
 			if (pte_dirty(pte))
-				set_page_dirty(page);
+				set_page_dirty_mm(page, mm);
 			page_remove_rmap(page);
 			page_cache_release(page);
 			update_hiwater_rss(mm);
@@ -64,7 +66,7 @@ static int install_file_pte(struct mm_struct *mm, struct vm_area_struct *vma,
 	if (!pte)
 		goto out;
 
-	if (!pte_none(*pte))
+       if (!pte_none(*pte))
 		zap_pte(mm, vma, addr, pte);
 
 	set_pte_at(mm, addr, pte, pgoff_to_pte(pgoff));
@@ -125,7 +127,6 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 {
 	struct mm_struct *mm = current->mm;
 	struct address_space *mapping;
-	unsigned long end = start + size;
 	struct vm_area_struct *vma;
 	int err = -EINVAL;
 	int has_write_lock = 0;
@@ -140,6 +141,10 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 
 	/* Does the address range wrap, or is the span zero-sized? */
 	if (start + size <= start)
+		return err;
+
+	/* Does pgoff wrap? */
+	if (pgoff + (size >> PAGE_SHIFT) < pgoff)
 		return err;
 
 	/* Can we represent this offset inside this architecture's pte's? */
@@ -168,7 +173,7 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 	if (!(vma->vm_flags & VM_CAN_NONLINEAR))
 		goto out;
 
-	if (end <= start || start < vma->vm_start || end > vma->vm_end)
+	if (start < vma->vm_start || start + size > vma->vm_end)
 		goto out;
 
 	/* Must set VM_NONLINEAR before any pages are populated. */
@@ -222,7 +227,7 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 		 * drop PG_Mlocked flag for over-mapped range
 		 */
 		unsigned int saved_flags = vma->vm_flags;
-		munlock_vma_pages_range(vma, start, start + size);
+		__munlock_vma_pages_range(vma, start, start + size, 0);
 		vma->vm_flags = saved_flags;
 	}
 
@@ -258,3 +263,4 @@ out:
 
 	return err;
 }
+EXPORT_SYMBOL(sys_remap_file_pages);

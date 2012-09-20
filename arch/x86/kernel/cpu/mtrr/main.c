@@ -35,6 +35,7 @@
 
 #include <linux/types.h> /* FIXME: kvm_para.h needs this */
 
+#include <linux/stop_machine.h>
 #include <linux/kvm_para.h>
 #include <linux/uaccess.h>
 #include <linux/module.h>
@@ -65,7 +66,7 @@ static struct mtrr_ops *mtrr_ops[X86_VENDOR_NUM];
 struct mtrr_ops *mtrr_if;
 
 static void set_mtrr(unsigned int reg, unsigned long base,
-		     unsigned long size, mtrr_type type);
+		     unsigned long size, mtrr_type type, bool force);
 
 void set_mtrr_ops(struct mtrr_ops *ops)
 {
@@ -135,8 +136,6 @@ static void __init init_table(void)
 }
 
 struct set_mtrr_data {
-	atomic_t	count;
-	atomic_t	gate;
 	unsigned long	smp_base;
 	unsigned long	smp_size;
 	unsigned int	smp_reg;
@@ -144,40 +143,38 @@ struct set_mtrr_data {
 };
 
 /**
- * ipi_handler - Synchronisation handler. Executed by "other" CPUs.
+ * mtrr_rendezvous_handler - Work done in the synchronization handler. Executed
+ * by all the CPUs.
+ * @info: pointer to mtrr configuration data
  *
  * Returns nothing.
  */
-static void ipi_handler(void *info)
+static int mtrr_rendezvous_handler(void *info)
 {
 #ifdef CONFIG_SMP
 	struct set_mtrr_data *data = info;
-	unsigned long flags;
 
-	local_irq_save(flags);
-
-	atomic_dec(&data->count);
-	while (!atomic_read(&data->gate))
-		cpu_relax();
-
-	/*  The master has cleared me to execute  */
+	/*
+	 * We use this same function to initialize the mtrrs during boot,
+	 * resume, runtime cpu online and on an explicit request to set a
+	 * specific MTRR.
+	 *
+	 * During boot or suspend, the state of the boot cpu's mtrrs has been
+	 * saved, and we want to replicate that across all the cpus that come
+	 * online (either at the end of boot or resume or during a runtime cpu
+	 * online). If we're doing that, @reg is set to something special and on
+	 * all the cpu's we do mtrr_if->set_all() (On the logical cpu that
+	 * started the boot/resume sequence, this might be a duplicate
+	 * set_all()).
+	 */
 	if (data->smp_reg != ~0U) {
 		mtrr_if->set(data->smp_reg, data->smp_base,
 			     data->smp_size, data->smp_type);
-	} else if (mtrr_aps_delayed_init) {
-		/*
-		 * Initialize the MTRRs inaddition to the synchronisation.
-		 */
+	} else if (mtrr_aps_delayed_init || !cpu_online(smp_processor_id())) {
 		mtrr_if->set_all();
 	}
-
-	atomic_dec(&data->count);
-	while (atomic_read(&data->gate))
-		cpu_relax();
-
-	atomic_dec(&data->count);
-	local_irq_restore(flags);
 #endif
+	return 0;
 }
 
 static inline int types_compatible(mtrr_type type1, mtrr_type type2)
@@ -197,7 +194,7 @@ static inline int types_compatible(mtrr_type type1, mtrr_type type2)
  *
  * This is kinda tricky, but fortunately, Intel spelled it out for us cleanly:
  *
- * 1. Send IPI to do the following:
+ * 1. Queue work to do the following on all processors:
  * 2. Disable Interrupts
  * 3. Wait for all procs to do so
  * 4. Enter no-fill cache mode
@@ -213,81 +210,37 @@ static inline int types_compatible(mtrr_type type1, mtrr_type type2)
  * 14. Wait for buddies to catch up
  * 15. Enable interrupts.
  *
- * What does that mean for us? Well, first we set data.count to the number
- * of CPUs. As each CPU disables interrupts, it'll decrement it once. We wait
- * until it hits 0 and proceed. We set the data.gate flag and reset data.count.
- * Meanwhile, they are waiting for that flag to be set. Once it's set, each
- * CPU goes through the transition of updating MTRRs.
- * The CPU vendors may each do it differently,
- * so we call mtrr_if->set() callback and let them take care of it.
- * When they're done, they again decrement data->count and wait for data.gate
- * to be reset.
- * When we finish, we wait for data.count to hit 0 and toggle the data.gate flag
- * Everyone then enables interrupts and we all continue on.
+ * What does that mean for us? Well, stop_machine() will ensure that
+ * the rendezvous handler is started on each CPU. And in lockstep they
+ * do the state transition of disabling interrupts, updating MTRR's
+ * (the CPU vendors may each do it differently, so we call mtrr_if->set()
+ * callback and let them take care of it.) and enabling interrupts.
  *
  * Note that the mechanism is the same for UP systems, too; all the SMP stuff
  * becomes nops.
  */
 static void
-set_mtrr(unsigned int reg, unsigned long base, unsigned long size, mtrr_type type)
+set_mtrr(unsigned int reg, unsigned long base, unsigned long size, mtrr_type type, bool force)
 {
-	struct set_mtrr_data data;
-	unsigned long flags;
+	struct set_mtrr_data data = { .smp_reg = reg,
+				      .smp_base = base,
+				      .smp_size = size,
+				      .smp_type = type
+				    };
+	stop_machine(mtrr_rendezvous_handler, &data, cpu_online_mask);
+}
 
-	data.smp_reg = reg;
-	data.smp_base = base;
-	data.smp_size = size;
-	data.smp_type = type;
-	atomic_set(&data.count, num_booting_cpus() - 1);
+static void set_mtrr_from_inactive_cpu(unsigned int reg, unsigned long base,
+				      unsigned long size, mtrr_type type)
+{
+	struct set_mtrr_data data = { .smp_reg = reg,
+				      .smp_base = base,
+				      .smp_size = size,
+				      .smp_type = type
+				    };
 
-	/* Make sure data.count is visible before unleashing other CPUs */
-	smp_wmb();
-	atomic_set(&data.gate, 0);
-
-	/* Start the ball rolling on other CPUs */
-	if (smp_call_function(ipi_handler, &data, 0) != 0)
-		panic("mtrr: timed out waiting for other CPUs\n");
-
-	local_irq_save(flags);
-
-	while (atomic_read(&data.count))
-		cpu_relax();
-
-	/* Ok, reset count and toggle gate */
-	atomic_set(&data.count, num_booting_cpus() - 1);
-	smp_wmb();
-	atomic_set(&data.gate, 1);
-
-	/* Do our MTRR business */
-
-	/*
-	 * HACK!
-	 * We use this same function to initialize the mtrrs on boot.
-	 * The state of the boot cpu's mtrrs has been saved, and we want
-	 * to replicate across all the APs.
-	 * If we're doing that @reg is set to something special...
-	 */
-	if (reg != ~0U)
-		mtrr_if->set(reg, base, size, type);
-	else if (!mtrr_aps_delayed_init)
-		mtrr_if->set_all();
-
-	/* Wait for the others */
-	while (atomic_read(&data.count))
-		cpu_relax();
-
-	atomic_set(&data.count, num_booting_cpus() - 1);
-	smp_wmb();
-	atomic_set(&data.gate, 0);
-
-	/*
-	 * Wait here for everyone to have seen the gate change
-	 * So we're the last ones to touch 'data'
-	 */
-	while (atomic_read(&data.count))
-		cpu_relax();
-
-	local_irq_restore(flags);
+	stop_machine_from_inactive_cpu(mtrr_rendezvous_handler, &data,
+				       cpu_callout_mask);
 }
 
 /**
@@ -409,7 +362,7 @@ int mtrr_add_page(unsigned long base, unsigned long size,
 	/* Search for an empty MTRR */
 	i = mtrr_if->get_free_region(base, size, replace);
 	if (i >= 0) {
-		set_mtrr(i, base, size, type);
+		set_mtrr(i, base, size, type, false);
 		if (likely(replace < 0)) {
 			mtrr_usage_table[i] = 1;
 		} else {
@@ -417,7 +370,7 @@ int mtrr_add_page(unsigned long base, unsigned long size,
 			if (increment)
 				mtrr_usage_table[i]++;
 			if (unlikely(replace != i)) {
-				set_mtrr(replace, 0, 0, 0);
+				set_mtrr(replace, 0, 0, 0, false);
 				mtrr_usage_table[replace] = 0;
 			}
 		}
@@ -544,7 +497,7 @@ int mtrr_del_page(int reg, unsigned long base, unsigned long size)
 		goto out;
 	}
 	if (--mtrr_usage_table[reg] < 1)
-		set_mtrr(reg, 0, 0, 0);
+		set_mtrr(reg, 0, 0, 0, false);
 	error = reg;
  out:
 	mutex_unlock(&mtrr_mutex);
@@ -619,7 +572,8 @@ static int mtrr_restore(struct sys_device *sysdev)
 		if (mtrr_value[i].lsize) {
 			set_mtrr(i, mtrr_value[i].lbase,
 				    mtrr_value[i].lsize,
-				    mtrr_value[i].ltype);
+				    mtrr_value[i].ltype,
+				    true);
 		}
 	}
 	return 0;
@@ -742,7 +696,7 @@ void mtrr_ap_init(void)
 	 *   2. cpu hotadd time. We let mtrr_add/del_page hold cpuhotplug
 	 *      lock to prevent mtrr entry changes
 	 */
-	set_mtrr(~0U, 0, 0, 0);
+	set_mtrr_from_inactive_cpu(~0U, 0, 0, 0);
 }
 
 /**
@@ -769,7 +723,7 @@ void mtrr_aps_init(void)
 	if (!use_intel())
 		return;
 
-	set_mtrr(~0U, 0, 0, 0);
+	set_mtrr(~0U, 0, 0, 0, false);
 	mtrr_aps_delayed_init = false;
 }
 

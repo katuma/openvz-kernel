@@ -4,9 +4,13 @@
 
 #include <linux/module.h>
 #include <linux/lockd/bind.h>
+#include <linux/sched.h>
+#include <linux/ve_nfs.h>
 
+#ifndef CONFIG_VE
 static LIST_HEAD(grace_list);
 static DEFINE_SPINLOCK(grace_lock);
+#endif
 
 /**
  * locks_start_grace
@@ -21,9 +25,13 @@ static DEFINE_SPINLOCK(grace_lock);
  */
 void locks_start_grace(struct lock_manager *lm)
 {
+#ifdef CONFIG_VE
+	atomic_inc(&nlm_in_grace);
+#else
 	spin_lock(&grace_lock);
 	list_add(&lm->list, &grace_list);
 	spin_unlock(&grace_lock);
+#endif
 }
 EXPORT_SYMBOL_GPL(locks_start_grace);
 
@@ -39,9 +47,13 @@ EXPORT_SYMBOL_GPL(locks_start_grace);
  */
 void locks_end_grace(struct lock_manager *lm)
 {
+#ifdef CONFIG_VE
+	atomic_dec(&nlm_in_grace);
+#else
 	spin_lock(&grace_lock);
 	list_del_init(&lm->list);
 	spin_unlock(&grace_lock);
+#endif
 }
 EXPORT_SYMBOL_GPL(locks_end_grace);
 
@@ -54,6 +66,10 @@ EXPORT_SYMBOL_GPL(locks_end_grace);
  */
 int locks_in_grace(void)
 {
+#ifdef CONFIG_VE
+	return atomic_read(&nlm_in_grace) != 0;
+#else
 	return !list_empty(&grace_list);
+#endif
 }
 EXPORT_SYMBOL_GPL(locks_in_grace);

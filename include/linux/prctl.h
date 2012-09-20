@@ -102,4 +102,8 @@
 
 #define PR_MCE_KILL_GET 34
 
+#define PR_SET_DATA_CSUM	100500
+# define PR_DATA_CSUM_OFF	0
+# define PR_DATA_CSUM_ON	1
+
 #endif /* _LINUX_PRCTL_H */

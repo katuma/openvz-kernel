@@ -58,6 +58,7 @@ struct ipc_params {
 		size_t size;	/* for shared memories */
 		int nsems;	/* for semaphores */
 	} u;			/* holds the getnew() specific param */
+	int id;
 };
 
 /*
@@ -87,14 +88,10 @@ void __init ipc_init_proc_interface(const char *path, const char *header,
 #define ipc_init_proc_interface(path, header, ids, show) do {} while (0)
 #endif
 
-#define IPC_SEM_IDS	0
-#define IPC_MSG_IDS	1
-#define IPC_SHM_IDS	2
-
 #define ipcid_to_idx(id) ((id) % SEQ_MULTIPLIER)
 
 /* must be called with ids->rw_mutex acquired for writing */
-int ipc_addid(struct ipc_ids *, struct kern_ipc_perm *, int);
+int ipc_addid(struct ipc_ids *, struct kern_ipc_perm *, int, int);
 
 /* must be called with ids->rw_mutex acquired for reading */
 int ipc_get_maxid(struct ipc_ids *);
@@ -121,7 +118,6 @@ void* ipc_rcu_alloc(int size);
 void ipc_rcu_getref(void *ptr);
 void ipc_rcu_putref(void *ptr);
 
-struct kern_ipc_perm *ipc_lock(struct ipc_ids *, int);
 
 void kernel_to_ipc64_perm(struct kern_ipc_perm *in, struct ipc64_perm *out);
 void ipc64_perm_to_ipc_perm(struct ipc64_perm *in, struct ipc_perm *out);
@@ -161,12 +157,6 @@ static inline void ipc_lock_by_ptr(struct kern_ipc_perm *perm)
 {
 	rcu_read_lock();
 	spin_lock(&perm->lock);
-}
-
-static inline void ipc_unlock(struct kern_ipc_perm *perm)
-{
-	spin_unlock(&perm->lock);
-	rcu_read_unlock();
 }
 
 struct kern_ipc_perm *ipc_lock_check(struct ipc_ids *ids, int id);

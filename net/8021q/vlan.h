@@ -16,6 +16,21 @@ struct vlan_priority_tci_mapping {
 	struct vlan_priority_tci_mapping	*next;
 };
 
+
+/**
+ *	struct vlan_rx_stats - VLAN percpu rx stats
+ *	@rx_packets: number of received packets
+ *	@rx_bytes: number of received bytes
+ *	@multicast: number of received multicast packets
+ *	@rx_errors: number of errors
+ */
+struct vlan_rx_stats {
+	unsigned long rx_packets;
+	unsigned long rx_bytes;
+	unsigned long multicast;
+	unsigned long rx_errors;
+};
+
 /**
  *	struct vlan_dev_info - VLAN private device data
  *	@nr_ingress_mappings: number of ingress priority mappings
@@ -29,6 +44,7 @@ struct vlan_priority_tci_mapping {
  *	@dent: proc dir entry
  *	@cnt_inc_headroom_on_tx: statistic - number of skb expansions on TX
  *	@cnt_encap_on_xmit: statistic - number of skb encapsulations on TX
+ *	@vlan_rx_stats: ptr to percpu rx stats
  */
 struct vlan_dev_info {
 	unsigned int				nr_ingress_mappings;
@@ -45,6 +61,7 @@ struct vlan_dev_info {
 	struct proc_dir_entry			*dent;
 	unsigned long				cnt_inc_headroom_on_tx;
 	unsigned long				cnt_encap_on_xmit;
+	struct vlan_rx_stats			*vlan_rx_stats;
 };
 
 static inline struct vlan_dev_info *vlan_dev_info(const struct net_device *dev)
@@ -76,34 +93,31 @@ void vlan_dev_set_ingress_priority(const struct net_device *dev,
 				   u32 skb_prio, u16 vlan_prio);
 int vlan_dev_set_egress_priority(const struct net_device *dev,
 				 u32 skb_prio, u16 vlan_prio);
-int vlan_dev_change_flags(const struct net_device *dev, u32 flag, u32 mask);
+int vlan_dev_change_flags(struct net_device *dev, u32 flag, u32 mask);
 void vlan_dev_get_realdev_name(const struct net_device *dev, char *result);
 
 int vlan_check_real_dev(struct net_device *real_dev, u16 vlan_id);
 void vlan_setup(struct net_device *dev);
 int register_vlan_dev(struct net_device *dev);
-void unregister_vlan_dev(struct net_device *dev);
+void unregister_vlan_dev(struct net_device *dev, struct list_head *head);
+void vlan_transfer_features(struct net_device *dev, struct net_device *vlandev);
 
 static inline u32 vlan_get_ingress_priority(struct net_device *dev,
 					    u16 vlan_tci)
 {
 	struct vlan_dev_info *vip = vlan_dev_info(dev);
 
-	return vip->ingress_priority_map[(vlan_tci >> 13) & 0x7];
+	return vip->ingress_priority_map[(vlan_tci >> VLAN_PRIO_SHIFT) & 0x7];
 }
 
 #ifdef CONFIG_VLAN_8021Q_GVRP
 extern int vlan_gvrp_request_join(const struct net_device *dev);
 extern void vlan_gvrp_request_leave(const struct net_device *dev);
-extern int vlan_gvrp_init_applicant(struct net_device *dev);
-extern void vlan_gvrp_uninit_applicant(struct net_device *dev);
 extern int vlan_gvrp_init(void);
 extern void vlan_gvrp_uninit(void);
 #else
 static inline int vlan_gvrp_request_join(const struct net_device *dev) { return 0; }
 static inline void vlan_gvrp_request_leave(const struct net_device *dev) {}
-static inline int vlan_gvrp_init_applicant(struct net_device *dev) { return 0; }
-static inline void vlan_gvrp_uninit_applicant(struct net_device *dev) {}
 static inline int vlan_gvrp_init(void) { return 0; }
 static inline void vlan_gvrp_uninit(void) {}
 #endif
@@ -114,11 +128,6 @@ extern int vlan_netlink_init(void);
 extern void vlan_netlink_fini(void);
 
 extern struct rtnl_link_ops vlan_link_ops;
-
-static inline int is_vlan_dev(struct net_device *dev)
-{
-	return dev->priv_flags & IFF_802_1Q_VLAN;
-}
 
 extern int vlan_net_id;
 

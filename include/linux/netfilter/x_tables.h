@@ -375,6 +375,7 @@ struct xt_table_info
 {
 	/* Size per table */
 	unsigned int size;
+	unsigned int alloc_size;
 	/* Number of entries: FIXME. --RR */
 	unsigned int number;
 	/* Initial number of entries. Needed for module usage count */
@@ -605,6 +606,23 @@ extern int xt_compat_target_to_user(struct xt_entry_target *t,
 				    void __user **dstptr, unsigned int *size);
 
 #endif /* CONFIG_COMPAT */
+
+#ifdef CONFIG_VE
+static inline bool ve_xt_table_forbidden(struct xt_table *xt)
+{
+	/*
+	 * The only purpose to have this check as a separate
+	 * helper is "grep"-a-bility
+	 *
+	 * If this helper hit it means that a VE has been
+	 * configured without the particular xt_table support
+	 */
+	return xt == NULL;
+}
+#else
+static inline bool ve_xt_table_forbidden(struct xt_table *xt) { return true; }
+#endif
+
 #endif /* __KERNEL__ */
 
 #endif /* _X_TABLES_H */

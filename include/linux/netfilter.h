@@ -33,6 +33,8 @@
 
 #define NF_QUEUE_NR(x) ((((x) << NF_VERDICT_BITS) & NF_VERDICT_QMASK) | NF_QUEUE)
 
+#define NF_DROP_ERR(x) (((-x) << NF_VERDICT_BITS) | NF_DROP)
+
 /* only for userspace compatibility */
 #ifndef __KERNEL__
 /* Generic cache responses from hook functions.
@@ -352,6 +354,34 @@ extern void (*nf_ct_destroy)(struct nf_conntrack *);
 #else
 static inline void nf_ct_attach(struct sk_buff *new, struct sk_buff *skb) {}
 #endif
+
+#ifdef CONFIG_VE_IPTABLES
+#include <linux/vziptable_defs.h>
+
+#define net_ipt_permitted(netns, ipt)					\
+	(mask_ipt_allow((netns)->owner_ve->ipt_mask, ipt))
+
+#define net_ipt_module_set(netns, ipt)					\
+	({								\
+		(netns)->owner_ve->_iptables_modules |= ipt##_MOD;	\
+	})
+
+#define net_ipt_module_clear(netns, ipt)				\
+	({								\
+		(netns)->owner_ve->_iptables_modules &= ~ipt##_MOD;	\
+	})
+
+#define net_is_ipt_module_set(netns, ipt)				\
+	((netns)->owner_ve->_iptables_modules & (ipt##_MOD))
+
+#else /* CONFIG_VE_IPTABLES */
+
+#define net_ipt_permitted(netns, ipt)		(1)
+#define net_is_ipt_module_set(netns, ipt)	(1)
+#define net_ipt_module_set(netns, ipt)
+#define net_ipt_module_clear(netns, ipt)
+
+#endif /* CONFIG_VE_IPTABLES */
 
 #endif /*__KERNEL__*/
 #endif /*__LINUX_NETFILTER_H*/

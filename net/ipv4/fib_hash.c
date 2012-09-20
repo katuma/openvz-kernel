@@ -769,10 +769,10 @@ static int fn_hash_dump(struct fib_table *tb, struct sk_buff *skb, struct netlin
 void __init fib_hash_init(void)
 {
 	fn_hash_kmem = kmem_cache_create("ip_fib_hash", sizeof(struct fib_node),
-					 0, SLAB_PANIC, NULL);
+					 0, SLAB_PANIC | SLAB_UBC, NULL);
 
 	fn_alias_kmem = kmem_cache_create("ip_fib_alias", sizeof(struct fib_alias),
-					  0, SLAB_PANIC, NULL);
+					  0, SLAB_PANIC | SLAB_UBC, NULL);
 
 }
 

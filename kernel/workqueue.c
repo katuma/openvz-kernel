@@ -66,6 +66,7 @@ struct workqueue_struct {
 #ifdef CONFIG_LOCKDEP
 	struct lockdep_map lockdep_map;
 #endif
+	struct ve_struct *owner_env;
 };
 
 /* Serializes the accesses to the list of workqueues. */
@@ -313,6 +314,9 @@ static int worker_thread(void *__cwq)
 {
 	struct cpu_workqueue_struct *cwq = __cwq;
 	DEFINE_WAIT(wait);
+	struct ve_struct *orig_ve;
+
+	orig_ve = set_exec_env(cwq->wq->owner_env);
 
 	if (cwq->wq->freezeable)
 		set_freezable();
@@ -332,6 +336,8 @@ static int worker_thread(void *__cwq)
 
 		run_workqueue(cwq);
 	}
+
+	(void)set_exec_env(orig_ve);
 
 	return 0;
 }
@@ -786,14 +792,14 @@ init_cpu_workqueue(struct workqueue_struct *wq, int cpu)
 	return cwq;
 }
 
-static int create_workqueue_thread(struct cpu_workqueue_struct *cwq, int cpu)
+static int create_workqueue_thread(struct cpu_workqueue_struct *cwq, int cpu, struct ve_struct *ve)
 {
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO-1 };
 	struct workqueue_struct *wq = cwq->wq;
 	const char *fmt = is_wq_single_threaded(wq) ? "%s" : "%s/%d";
 	struct task_struct *p;
 
-	p = kthread_create(worker_thread, cwq, fmt, wq->name, cpu);
+	p = kthread_create_ve(ve, worker_thread, cwq, fmt, wq->name, cpu);
 	/*
 	 * Nobody can add the work_struct to this cwq,
 	 *	if (caller is __create_workqueue)
@@ -829,11 +835,14 @@ struct workqueue_struct *__create_workqueue_key(const char *name,
 						int freezeable,
 						int rt,
 						struct lock_class_key *key,
-						const char *lock_name)
+						const char *lock_name,
+						void *ve)
 {
 	struct workqueue_struct *wq;
 	struct cpu_workqueue_struct *cwq;
 	int err = 0, cpu;
+	char *dname;
+	struct ve_struct *env;
 
 	wq = kzalloc(sizeof(*wq), GFP_KERNEL);
 	if (!wq)
@@ -845,7 +854,22 @@ struct workqueue_struct *__create_workqueue_key(const char *name,
 		return NULL;
 	}
 
-	wq->name = name;
+	if ((ve == NULL) || ve_is_super(ve)) {
+		env = get_ve0();
+		dname = (char *)name;
+	} else {
+		dname = kmalloc(strlen(name) + 32, GFP_KERNEL);
+		if (dname == NULL) {
+			free_percpu(wq->cpu_wq);
+			kfree(wq);
+			return NULL;
+		}
+		env = get_ve(ve);
+		sprintf(dname, "%s/%d", name, env->veid);
+	}
+
+	wq->name = dname;
+	wq->owner_env = env;
 	lockdep_init_map(&wq->lockdep_map, lock_name, key, 0);
 	wq->singlethread = singlethread;
 	wq->freezeable = freezeable;
@@ -854,7 +878,7 @@ struct workqueue_struct *__create_workqueue_key(const char *name,
 
 	if (singlethread) {
 		cwq = init_cpu_workqueue(wq, singlethread_cpu);
-		err = create_workqueue_thread(cwq, singlethread_cpu);
+		err = create_workqueue_thread(cwq, singlethread_cpu, env);
 		start_workqueue_thread(cwq, -1);
 	} else {
 		cpu_maps_update_begin();
@@ -877,7 +901,7 @@ struct workqueue_struct *__create_workqueue_key(const char *name,
 			cwq = init_cpu_workqueue(wq, cpu);
 			if (err || !cpu_online(cpu))
 				continue;
-			err = create_workqueue_thread(cwq, cpu);
+			err = create_workqueue_thread(cwq, cpu, env);
 			start_workqueue_thread(cwq, cpu);
 		}
 		cpu_maps_update_done();
@@ -930,16 +954,24 @@ void destroy_workqueue(struct workqueue_struct *wq)
 	const struct cpumask *cpu_map = wq_cpu_map(wq);
 	int cpu;
 
-	cpu_maps_update_begin();
-	spin_lock(&workqueue_lock);
-	list_del(&wq->list);
-	spin_unlock(&workqueue_lock);
+	if (is_wq_single_threaded(wq))
+		cleanup_workqueue_thread(per_cpu_ptr(wq->cpu_wq,
+					 singlethread_cpu));
+	else {
+		cpu_maps_update_begin();
+		spin_lock(&workqueue_lock);
+		list_del(&wq->list);
+		spin_unlock(&workqueue_lock);
 
-	for_each_cpu(cpu, cpu_map)
-		cleanup_workqueue_thread(per_cpu_ptr(wq->cpu_wq, cpu));
- 	cpu_maps_update_done();
-
+		for_each_cpu(cpu, cpu_map)
+			cleanup_workqueue_thread(per_cpu_ptr(wq->cpu_wq, cpu));
+		cpu_maps_update_done();
+	}
 	free_percpu(wq->cpu_wq);
+	if (!ve_is_super(wq->owner_env)) {
+		kfree(wq->name);
+		put_ve(wq->owner_env);
+	}
 	kfree(wq);
 }
 EXPORT_SYMBOL_GPL(destroy_workqueue);
@@ -965,7 +997,7 @@ undo:
 
 		switch (action) {
 		case CPU_UP_PREPARE:
-			if (!create_workqueue_thread(cwq, cpu))
+			if (!create_workqueue_thread(cwq, cpu, wq->owner_env))
 				break;
 			printk(KERN_ERR "workqueue [%s] for %i failed\n",
 				wq->name, cpu);

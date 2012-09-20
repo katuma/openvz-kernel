@@ -6,7 +6,7 @@ VDSO64-$(CONFIG_X86_64)		:= y
 VDSO32-$(CONFIG_X86_32)		:= y
 VDSO32-$(CONFIG_COMPAT)		:= y
 
-vdso-install-$(VDSO64-y)	+= vdso.so
+vdso-install-$(VDSO64-y)	+= vdso-rhel5.so vdso.so
 vdso-install-$(VDSO32-y)	+= $(vdso32-images)
 
 
@@ -14,23 +14,30 @@ vdso-install-$(VDSO32-y)	+= $(vdso32-images)
 vobjs-y := vdso-note.o vclock_gettime.o vgetcpu.o vvar.o
 
 # files to link into kernel
-obj-$(VDSO64-y)			+= vma.o vdso.o
+obj-$(VDSO64-y)			+= vma.o vdso.o vdso-rhel5.o
 obj-$(VDSO32-y)			+= vdso32.o vdso32-setup.o
 
 vobjs := $(foreach F,$(vobjs-y),$(obj)/$F)
 
 $(obj)/vdso.o: $(obj)/vdso.so
+$(obj)/vdso-rhel5.o: $(obj)/vdso-rhel5.so
 
-targets += vdso.so vdso.so.dbg vdso.lds $(vobjs-y)
+targets += vdso-rhel5.so vdso.so vdso-rhel5.so.dbg vdso.so.dbg vdso.lds vdso-rhel5.lds $(vobjs-y)
 
 export CPPFLAGS_vdso.lds += -P -C
 
-VDSO_LDFLAGS_vdso.lds = -m elf_x86_64 -Wl,-soname=linux-vdso.so.1 \
+VDSO_LDFLAGS_vdso.lds = -m64 -Wl,-soname=linux-vdso.so.1 \
 		      	-Wl,-z,max-page-size=4096 -Wl,-z,common-page-size=4096
+
+VDSO_LDFLAGS_vdso-rhel5.lds = ${VDSO_LDFLAGS_vdso.lds}
 
 $(obj)/vdso.o: $(src)/vdso.S $(obj)/vdso.so
 
+$(obj)/vdso-rhel5.o: $(src)/vdso-rhel5.S $(obj)/vdso-rhel5.so
+
 $(obj)/vdso.so.dbg: $(src)/vdso.lds $(vobjs) FORCE
+	$(call if_changed,vdso)
+$(obj)/vdso-rhel5.so.dbg: $(src)/vdso-rhel5.lds $(vobjs) FORCE
 	$(call if_changed,vdso)
 
 $(obj)/%.so: OBJCOPYFLAGS := -S
@@ -44,6 +51,7 @@ $(vobjs): KBUILD_CFLAGS += $(CFL)
 
 targets += vdso-syms.lds
 obj-$(VDSO64-y)			+= vdso-syms.lds
+obj-$(VDSO64-y)			+= vdso-rhel5-syms.lds
 
 #
 # Match symbols in the DSO that look like VDSO*; produce a file of constants.
@@ -69,7 +77,7 @@ vdso32.so-$(VDSO32-y)		+= sysenter
 vdso32-images			= $(vdso32.so-y:%=vdso32-%.so)
 
 CPPFLAGS_vdso32.lds = $(CPPFLAGS_vdso.lds)
-VDSO_LDFLAGS_vdso32.lds = -m elf_i386 -Wl,-soname=linux-gate.so.1
+VDSO_LDFLAGS_vdso32.lds = -m32 -Wl,-soname=linux-gate.so.1
 
 # This makes sure the $(obj) subdirectory exists even though vdso32/
 # is not a kbuild sub-make subdirectory.
@@ -120,7 +128,8 @@ $(obj)/vdso32-syms.lds: $(vdso32.so-y:%=$(obj)/vdso32-%-syms.lds) FORCE
 quiet_cmd_vdso = VDSO    $@
       cmd_vdso = $(CC) -nostdlib -o $@ \
 		       $(VDSO_LDFLAGS) $(VDSO_LDFLAGS_$(filter %.lds,$(^F))) \
-		       -Wl,-T,$(filter %.lds,$^) $(filter %.o,$^)
+		       -Wl,-T,$(filter %.lds,$^) $(filter %.o,$^) \
+		 $(if $(AFTER_LINK),; $(AFTER_LINK))
 
 VDSO_LDFLAGS = -fPIC -shared $(call cc-ldoption, -Wl$(comma)--hash-style=sysv)
 GCOV_PROFILE := n

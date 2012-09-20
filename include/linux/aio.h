@@ -24,6 +24,7 @@ struct kioctx;
 #define KIOCB_C_COMPLETE	0x02
 
 #define KIOCB_SYNC_KEY		(~0U)
+#define KIOCB_KERNEL_KEY		(~1U)
 
 /* ki_flags bits */
 /*
@@ -99,6 +100,7 @@ struct kiocb {
 	union {
 		void __user		*user;
 		struct task_struct	*tsk;
+		void			(*complete)(u64 user_data, long res);
 	} ki_obj;
 
 	__u64			ki_user_data;	/* user's data for completion */
@@ -124,9 +126,11 @@ struct kiocb {
 	 * this is the underlying eventfd context to deliver events to.
 	 */
 	struct eventfd_ctx	*ki_eventfd;
+	struct iov_iter		*ki_iter;
 };
 
 #define is_sync_kiocb(iocb)	((iocb)->ki_key == KIOCB_SYNC_KEY)
+#define is_kernel_kiocb(iocb)	((iocb)->ki_key == KIOCB_KERNEL_KEY)
 #define init_sync_kiocb(x, filp)			\
 	do {						\
 		struct task_struct *tsk = current;	\
@@ -204,23 +208,45 @@ struct kioctx {
 	struct rcu_head		rcu_head;
 };
 
+extern spinlock_t aio_nr_lock;
+extern unsigned long aio_nr;
+extern struct kmem_cache	*kioctx_cachep;
+
 /* prototypes */
 extern unsigned aio_max_size;
 
 #ifdef CONFIG_AIO
+extern void aio_kick_handler(struct work_struct *);
+extern void wait_for_all_aios(struct kioctx *ctx);
 extern ssize_t wait_on_sync_kiocb(struct kiocb *iocb);
 extern int aio_put_req(struct kiocb *iocb);
 extern void kick_iocb(struct kiocb *iocb);
 extern int aio_complete(struct kiocb *iocb, long res, long res2);
 struct mm_struct;
 extern void exit_aio(struct mm_struct *mm);
+extern long do_io_submit(aio_context_t ctx_id, long nr,
+			 struct iocb __user *__user *iocbpp, bool compat);
+struct kiocb *aio_kernel_alloc(gfp_t gfp);
+void aio_kernel_free(struct kiocb *iocb);
+void aio_kernel_init_iter(struct kiocb *iocb, struct file *filp,
+			  unsigned short op, struct iov_iter *iter, loff_t off);
+void aio_kernel_init_callback(struct kiocb *iocb,
+			      void (*complete)(u64 user_data, long res),
+			      u64 user_data);
+int aio_kernel_submit(struct kiocb *iocb);
 #else
+static void wait_for_all_aios(struct kioctx *ctx) { }
+static void aio_kick_handler(struct work_struct *) { }
+static void wait_for_all_aios(struct kioctx *ctx) { }
 static inline ssize_t wait_on_sync_kiocb(struct kiocb *iocb) { return 0; }
 static inline int aio_put_req(struct kiocb *iocb) { return 0; }
 static inline void kick_iocb(struct kiocb *iocb) { }
 static inline int aio_complete(struct kiocb *iocb, long res, long res2) { return 0; }
 struct mm_struct;
 static inline void exit_aio(struct mm_struct *mm) { }
+static inline long do_io_submit(aio_context_t ctx_id, long nr,
+				struct iocb __user * __user *iocbpp,
+				bool compat) { return 0; }
 #endif /* CONFIG_AIO */
 
 #define io_wait_to_kiocb(wait) container_of(wait, struct kiocb, ki_wait)

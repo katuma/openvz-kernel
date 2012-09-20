@@ -112,6 +112,7 @@ extern int		ip_rt_init(void);
 extern void		ip_rt_redirect(__be32 old_gw, __be32 dst, __be32 new_gw,
 				       __be32 src, struct net_device *dev);
 extern void		rt_cache_flush(struct net *net, int how);
+extern void		rt_cache_flush_batch(void);
 extern int		__ip_route_output_key(struct net *, struct rtable **, const struct flowi *flp);
 extern int		ip_route_output_key(struct net *, struct rtable **, struct flowi *flp);
 extern int		ip_route_output_flow(struct net *, struct rtable **rp, struct flowi *flp, struct sock *sk, int flags);
@@ -138,6 +139,7 @@ static inline void ip_rt_put(struct rtable * rt)
 #define IPTOS_RT_MASK	(IPTOS_TOS_MASK & ~3)
 
 extern const __u8 ip_tos2prio[16];
+extern int ip_rt_src_check;
 
 static inline char rt_tos2priority(u8 tos)
 {
@@ -189,6 +191,8 @@ static inline int ip_route_newports(struct rtable **rp, u8 protocol,
 		fl.fl_ip_sport = sport;
 		fl.fl_ip_dport = dport;
 		fl.proto = protocol;
+		if (inet_sk(sk)->transparent)
+			fl.flags |= FLOWI_FLAG_ANYSRC;
 		ip_rt_put(*rp);
 		*rp = NULL;
 		security_sk_classify_flow(sk, &fl);

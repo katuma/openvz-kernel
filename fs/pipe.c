@@ -22,6 +22,8 @@
 #include <asm/uaccess.h>
 #include <asm/ioctls.h>
 
+#include <bc/kmem.h>
+
 /*
  * We use a start+len construction, which provides full use of the 
  * allocated memory.
@@ -526,7 +528,7 @@ redo1:
 			int error, atomic = 1;
 
 			if (!page) {
-				page = alloc_page(GFP_HIGHUSER);
+				page = alloc_page(GFP_HIGHUSER | __GFP_UBC);
 				if (unlikely(!page)) {
 					ret = ret ? : -ENOMEM;
 					break;
@@ -683,7 +685,7 @@ pipe_poll(struct file *filp, poll_table *wait)
 	return mask;
 }
 
-static int
+int
 pipe_release(struct inode *inode, int decr, int decw)
 {
 	struct pipe_inode_info *pipe;
@@ -704,6 +706,7 @@ pipe_release(struct inode *inode, int decr, int decw)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(pipe_release);
 
 static int
 pipe_read_fasync(int fd, struct file *filp, int on)
@@ -875,7 +878,7 @@ struct pipe_inode_info * alloc_pipe_info(struct inode *inode)
 {
 	struct pipe_inode_info *pipe;
 
-	pipe = kzalloc(sizeof(struct pipe_inode_info), GFP_KERNEL);
+	pipe = kzalloc(sizeof(struct pipe_inode_info), GFP_KERNEL_UBC);
 	if (pipe) {
 		init_waitqueue_head(&pipe->wait);
 		pipe->r_counter = pipe->w_counter = 1;
@@ -884,6 +887,7 @@ struct pipe_inode_info * alloc_pipe_info(struct inode *inode)
 
 	return pipe;
 }
+EXPORT_SYMBOL_GPL(alloc_pipe_info);
 
 void __free_pipe_info(struct pipe_inode_info *pipe)
 {
@@ -904,6 +908,30 @@ void free_pipe_info(struct inode *inode)
 	__free_pipe_info(inode->i_pipe);
 	inode->i_pipe = NULL;
 }
+
+static void __swap_pipe_info(struct inode *to, struct inode *from)
+{
+	BUG_ON(!from->i_pipe);
+	BUG_ON(!to->i_pipe);
+	swap(to->i_pipe, from->i_pipe);
+	swap(to->i_pipe->inode, from->i_pipe->inode);
+	swap(to->i_pipe->readers, from->i_pipe->readers);
+	swap(to->i_pipe->writers, from->i_pipe->writers);
+	swap(to->i_pipe->r_counter, from->i_pipe->r_counter);
+	swap(to->i_pipe->w_counter, from->i_pipe->w_counter);
+}
+
+void swap_pipe_info(struct inode *to, struct inode *from)
+{
+	BUG_ON(!S_ISFIFO(to->i_mode));
+	BUG_ON(!S_ISFIFO(from->i_mode));
+	mutex_lock(&from->i_mutex);
+	mutex_lock(&to->i_mutex);
+	__swap_pipe_info(to, from);
+	mutex_unlock(&to->i_mutex);
+	mutex_unlock(&from->i_mutex);
+}
+EXPORT_SYMBOL_GPL(swap_pipe_info);
 
 static struct vfsmount *pipe_mnt __read_mostly;
 static int pipefs_delete_dentry(struct dentry *dentry)
@@ -974,7 +1002,7 @@ struct file *create_write_pipe(int flags)
 	int err;
 	struct inode *inode;
 	struct file *f;
-	struct dentry *dentry;
+	struct path path;
 	struct qstr name = { .name = "" };
 
 	err = -ENFILE;
@@ -983,21 +1011,22 @@ struct file *create_write_pipe(int flags)
 		goto err;
 
 	err = -ENOMEM;
-	dentry = d_alloc(pipe_mnt->mnt_sb->s_root, &name);
-	if (!dentry)
+	path.dentry = d_alloc(pipe_mnt->mnt_sb->s_root, &name);
+	if (!path.dentry)
 		goto err_inode;
+	path.mnt = mntget(pipe_mnt);
 
-	dentry->d_op = &pipefs_dentry_operations;
+	path.dentry->d_op = &pipefs_dentry_operations;
 	/*
 	 * We dont want to publish this dentry into global dentry hash table.
 	 * We pretend dentry is already hashed, by unsetting DCACHE_UNHASHED
 	 * This permits a working /proc/$pid/fd/XXX on pipes
 	 */
-	dentry->d_flags &= ~DCACHE_UNHASHED;
-	d_instantiate(dentry, inode);
+	path.dentry->d_flags &= ~DCACHE_UNHASHED;
+	d_instantiate(path.dentry, inode);
 
 	err = -ENFILE;
-	f = alloc_file(pipe_mnt, dentry, FMODE_WRITE, &write_pipefifo_fops);
+	f = alloc_file(&path, FMODE_WRITE, &write_pipefifo_fops);
 	if (!f)
 		goto err_dentry;
 	f->f_mapping = inode->i_mapping;
@@ -1009,7 +1038,7 @@ struct file *create_write_pipe(int flags)
 
  err_dentry:
 	free_pipe_info(inode);
-	dput(dentry);
+	path_put(&path);
 	return ERR_PTR(err);
 
  err_inode:
@@ -1028,20 +1057,14 @@ void free_write_pipe(struct file *f)
 
 struct file *create_read_pipe(struct file *wrf, int flags)
 {
-	struct file *f = get_empty_filp();
+	/* Grab pipe from the writer */
+	struct file *f = alloc_file(&wrf->f_path, FMODE_READ,
+				    &read_pipefifo_fops);
 	if (!f)
 		return ERR_PTR(-ENFILE);
 
-	/* Grab pipe from the writer */
-	f->f_path = wrf->f_path;
 	path_get(&wrf->f_path);
-	f->f_mapping = wrf->f_path.dentry->d_inode->i_mapping;
-
-	f->f_pos = 0;
 	f->f_flags = O_RDONLY | (flags & O_NONBLOCK);
-	f->f_op = &read_pipefifo_fops;
-	f->f_mode = FMODE_READ;
-	f->f_version = 0;
 
 	return f;
 }
@@ -1090,6 +1113,7 @@ int do_pipe_flags(int *fd, int flags)
 	free_write_pipe(fw);
 	return error;
 }
+EXPORT_SYMBOL(do_pipe_flags);
 
 /*
  * sys_pipe() is the normal C calling standard for creating

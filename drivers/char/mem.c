@@ -845,6 +845,9 @@ static ssize_t kmsg_write(struct file * file, const char __user * buf,
 	char *tmp;
 	ssize_t ret;
 
+	if (!ve_is_super(get_exec_env()))
+		return count;
+
 	tmp = kmalloc(count + 1, GFP_KERNEL);
 	if (tmp == NULL)
 		return -ENOMEM;

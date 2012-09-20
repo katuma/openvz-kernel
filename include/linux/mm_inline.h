@@ -1,6 +1,8 @@
 #ifndef LINUX_MM_INLINE_H
 #define LINUX_MM_INLINE_H
 
+#include <linux/huge_mm.h>
+
 /**
  * page_is_file_cache - should the page be on a file LRU or anon LRU?
  * @page: the page to test
@@ -20,18 +22,31 @@ static inline int page_is_file_cache(struct page *page)
 }
 
 static inline void
-add_page_to_lru_list(struct zone *zone, struct page *page, enum lru_list l)
+__add_page_to_lru_list(struct gang *gang, struct page *page, enum lru_list l,
+		       struct list_head *head)
 {
-	list_add(&page->lru, &zone->lru[l].list);
-	__inc_zone_state(zone, NR_LRU_BASE + l);
+	int numpages = hpage_nr_pages(page);
+
+	list_add(&page->lru, head);
+	gang->lru[l].nr_pages += numpages;
+	__mod_zone_page_state(gang_zone(gang), NR_LRU_BASE + l, numpages);
 	mem_cgroup_add_lru_list(page, l);
 }
 
 static inline void
-del_page_from_lru_list(struct zone *zone, struct page *page, enum lru_list l)
+add_page_to_lru_list(struct gang *gang, struct page *page, enum lru_list l)
 {
+	__add_page_to_lru_list(gang, page, l, &gang->lru[l].list);
+}
+
+static inline void
+del_page_from_lru_list(struct gang *gang, struct page *page, enum lru_list l)
+{
+	int numpages = hpage_nr_pages(page);
+
 	list_del(&page->lru);
-	__dec_zone_state(zone, NR_LRU_BASE + l);
+	gang->lru[l].nr_pages -= numpages;
+	__mod_zone_page_state(gang_zone(gang), NR_LRU_BASE + l, -numpages);
 	mem_cgroup_del_lru_list(page, l);
 }
 
@@ -51,9 +66,10 @@ static inline enum lru_list page_lru_base_type(struct page *page)
 }
 
 static inline void
-del_page_from_lru(struct zone *zone, struct page *page)
+del_page_from_lru(struct gang *gang, struct page *page)
 {
 	enum lru_list l;
+	int numpages = hpage_nr_pages(page);
 
 	list_del(&page->lru);
 	if (PageUnevictable(page)) {
@@ -66,7 +82,8 @@ del_page_from_lru(struct zone *zone, struct page *page)
 			l += LRU_ACTIVE;
 		}
 	}
-	__dec_zone_state(zone, NR_LRU_BASE + l);
+	gang->lru[l].nr_pages -= numpages;
+	__mod_zone_page_state(gang_zone(gang), NR_LRU_BASE + l, -numpages);
 	mem_cgroup_del_lru_list(page, l);
 }
 

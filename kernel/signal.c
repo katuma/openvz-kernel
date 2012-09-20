@@ -27,19 +27,40 @@
 #include <linux/freezer.h>
 #include <linux/pid_namespace.h>
 #include <linux/nsproxy.h>
-#include <trace/events/sched.h>
+#include <linux/interrupt.h>
+#define CREATE_TRACE_POINTS
+#include <trace/events/signal.h>
 
 #include <asm/param.h>
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
 #include <asm/siginfo.h>
+#include <bc/misc.h>
 #include "audit.h"	/* audit_signal_info() */
 
 /*
  * SLAB caches for signal bits.
  */
 
-static struct kmem_cache *sigqueue_cachep;
+struct kmem_cache *sigqueue_cachep;
+EXPORT_SYMBOL(sigqueue_cachep);
+
+static int sig_ve_ignored(int sig, struct siginfo *info, struct task_struct *t)
+{
+	struct ve_struct *ve;
+
+	/* always allow signals from the kernel */
+	if (info == SEND_SIG_FORCED ||
+		       (!is_si_special(info) && SI_FROMKERNEL(info)))
+		return 0;
+
+	ve = current->ve_task_info.owner_env;
+	if (get_env_init(ve) != t)
+		return 0;
+	if (ve_is_super(get_exec_env()))
+		return 0;
+	return !sig_user_defined(t, sig) || sig_kernel_only(sig);
+}
 
 static void __user *sig_handler(struct task_struct *t, int sig)
 {
@@ -118,7 +139,7 @@ static inline int has_pending_signals(sigset_t *signal, sigset_t *blocked)
 
 #define PENDING(p,b) has_pending_signals(&(p)->signal, (b))
 
-static int recalc_sigpending_tsk(struct task_struct *t)
+int recalc_sigpending_tsk(struct task_struct *t)
 {
 	if (t->signal->group_stop_count > 0 ||
 	    PENDING(&t->pending, &t->blocked) ||
@@ -133,6 +154,7 @@ static int recalc_sigpending_tsk(struct task_struct *t)
 	 */
 	return 0;
 }
+EXPORT_SYMBOL(recalc_sigpending_tsk);
 
 /*
  * After recalculating TIF_SIGPENDING, we need to make sure the task wakes up.
@@ -209,8 +231,13 @@ static struct sigqueue *__sigqueue_alloc(struct task_struct *t, gfp_t flags,
 	atomic_inc(&user->sigpending);
 	if (override_rlimit ||
 	    atomic_read(&user->sigpending) <=
-			t->signal->rlim[RLIMIT_SIGPENDING].rlim_cur)
+			t->signal->rlim[RLIMIT_SIGPENDING].rlim_cur) {
 		q = kmem_cache_alloc(sigqueue_cachep, flags);
+		if (q && ub_siginfo_charge(q, get_task_ub(t), flags)) {
+			kmem_cache_free(sigqueue_cachep, q);
+			q = NULL;
+		}
+	}
 	if (unlikely(q == NULL)) {
 		atomic_dec(&user->sigpending);
 		free_uid(user);
@@ -229,6 +256,7 @@ static void __sigqueue_free(struct sigqueue *q)
 		return;
 	atomic_dec(&q->user->sigpending);
 	free_uid(q->user);
+	ub_siginfo_uncharge(q);
 	kmem_cache_free(sigqueue_cachep, q);
 }
 
@@ -409,7 +437,18 @@ still_pending:
 static int __dequeue_signal(struct sigpending *pending, sigset_t *mask,
 			siginfo_t *info)
 {
-	int sig = next_signal(pending, mask);
+	int sig = 0;
+
+	/* SIGKILL must have priority, otherwise it is quite easy
+	 * to create an unkillable process, sending sig < SIGKILL
+	 * to self */
+	if (unlikely(sigismember(&pending->signal, SIGKILL))) {
+		if (!sigismember(mask, SIGKILL))
+			sig = SIGKILL;
+	}
+
+	if (likely(!sig))
+		sig = next_signal(pending, mask);
 
 	if (sig) {
 		if (current->notifier) {
@@ -532,6 +571,7 @@ void signal_wake_up(struct task_struct *t, int resume)
 	if (!wake_up_state(t, mask))
 		kick_process(t);
 }
+EXPORT_SYMBOL(signal_wake_up);
 
 /*
  * Remove signals in mask from the pending set and queue.
@@ -591,7 +631,7 @@ static int rm_from_queue(unsigned long mask, struct sigpending *s)
 static int check_kill_permission(int sig, struct siginfo *info,
 				 struct task_struct *t)
 {
-	const struct cred *cred = current_cred(), *tcred;
+	const struct cred *cred, *tcred;
 	struct pid *sid;
 	int error;
 
@@ -605,8 +645,10 @@ static int check_kill_permission(int sig, struct siginfo *info,
 	if (error)
 		return error;
 
+	cred = current_cred();
 	tcred = __task_cred(t);
-	if ((cred->euid ^ tcred->suid) &&
+	if (!same_thread_group(current, t) &&
+	    (cred->euid ^ tcred->suid) &&
 	    (cred->euid ^ tcred->uid) &&
 	    (cred->uid  ^ tcred->suid) &&
 	    (cred->uid  ^ tcred->uid) &&
@@ -655,7 +697,7 @@ static int prepare_signal(int sig, struct task_struct *p, int from_ancestor_ns)
 		t = p;
 		do {
 			rm_from_queue(sigmask(SIGCONT), &t->pending);
-		} while_each_thread(p, t);
+		} while_each_thread_all(p, t);
 	} else if (sig == SIGCONT) {
 		unsigned int why;
 		/*
@@ -687,7 +729,7 @@ static int prepare_signal(int sig, struct task_struct *p, int from_ancestor_ns)
 				state |= TASK_INTERRUPTIBLE;
 			}
 			wake_up_state(t, state);
-		} while_each_thread(p, t);
+		} while_each_thread_all(p, t);
 
 		/*
 		 * Notify the parent with CLD_CONTINUED if we were stopped.
@@ -809,7 +851,7 @@ static void complete_signal(int sig, struct task_struct *p, int group)
 			do {
 				sigaddset(&t->pending.signal, SIGKILL);
 				signal_wake_up(t, 1);
-			} while_each_thread(p, t);
+			} while_each_thread_all(p, t);
 			return;
 		}
 	}
@@ -833,13 +875,13 @@ static int __send_signal(int sig, struct siginfo *info, struct task_struct *t,
 	struct sigpending *pending;
 	struct sigqueue *q;
 	int override_rlimit;
-
-	trace_sched_signal_send(sig, t);
+	int ret = 0, result;
 
 	assert_spin_locked(&t->sighand->siglock);
 
+	result = TRACE_SIGNAL_IGNORED;
 	if (!prepare_signal(sig, t, from_ancestor_ns))
-		return 0;
+		goto ret;
 
 	pending = group ? &t->signal->shared_pending : &t->pending;
 	/*
@@ -847,8 +889,11 @@ static int __send_signal(int sig, struct siginfo *info, struct task_struct *t,
 	 * exactly one non-rt signal, so that we can get more
 	 * detailed information about the cause of the signal.
 	 */
+	result = TRACE_SIGNAL_ALREADY_PENDING;
 	if (legacy_queue(pending, sig))
-		return 0;
+		goto ret;
+
+	result = TRACE_SIGNAL_DELIVERED;
 	/*
 	 * fast-pathed signals for kernel-internal things like SIGSTOP
 	 * or SIGKILL.
@@ -896,19 +941,31 @@ static int __send_signal(int sig, struct siginfo *info, struct task_struct *t,
 			break;
 		}
 	} else if (!is_si_special(info)) {
-		if (sig >= SIGRTMIN && info->si_code != SI_USER)
-		/*
-		 * Queue overflow, abort.  We may abort if the signal was rt
-		 * and sent by user using something other than kill().
-		 */
-			return -EAGAIN;
+		if (sig >= SIGRTMIN && info->si_code != SI_USER) {
+			/*
+			 * Queue overflow, abort.  We may abort if the
+			 * signal was rt and sent by user using something
+			 * other than kill().
+			 */
+			result = TRACE_SIGNAL_OVERFLOW_FAIL;
+			ret = -EAGAIN;
+			goto ret;
+		} else {
+			/*
+			 * This is a silent loss of information.  We still
+			 * send the signal, but the *info bits are lost.
+			 */
+			result = TRACE_SIGNAL_LOSE_INFO;
+		}
 	}
 
 out_set:
 	signalfd_notify(t, sig);
 	sigaddset(&pending->signal, sig);
 	complete_signal(sig, t, group);
-	return 0;
+ret:
+	trace_signal_generate(sig, info, t, group, result);
+	return ret;
 }
 
 static int send_signal(int sig, struct siginfo *info, struct task_struct *t,
@@ -939,7 +996,8 @@ static void print_fatal_signal(struct pt_regs *regs, int signr)
 		for (i = 0; i < 16; i++) {
 			unsigned char insn;
 
-			__get_user(insn, (unsigned char *)(regs->ip + i));
+			if (get_user(insn, (unsigned char *)(regs->ip + i)))
+				break;
 			printk("%02x ", insn);
 		}
 	}
@@ -1079,7 +1137,8 @@ int group_send_sig_info(int sig, struct siginfo *info, struct task_struct *p)
 	int ret = check_kill_permission(sig, info, p);
 
 	if (!ret && sig)
-		ret = do_send_sig_info(sig, info, p, true);
+		ret = sig_ve_ignored(sig, info, p) ? 0 :
+			do_send_sig_info(sig, info, p, true);
 
 	return ret;
 }
@@ -1204,7 +1263,7 @@ static int kill_something_info(int sig, struct siginfo *info, pid_t pid)
 		int retval = 0, count = 0;
 		struct task_struct * p;
 
-		for_each_process(p) {
+		for_each_process_ve(p) {
 			if (task_pid_vnr(p) > 1 &&
 					!same_thread_group(p, current)) {
 				int err = group_send_sig_info(sig, info, p);
@@ -1338,7 +1397,7 @@ int send_sigqueue(struct sigqueue *q, struct task_struct *t, int group)
 	int sig = q->info.si_signo;
 	struct sigpending *pending;
 	unsigned long flags;
-	int ret;
+	int ret, result;
 
 	BUG_ON(!(q->flags & SIGQUEUE_PREALLOC));
 
@@ -1347,6 +1406,7 @@ int send_sigqueue(struct sigqueue *q, struct task_struct *t, int group)
 		goto ret;
 
 	ret = 1; /* the signal is ignored */
+	result = TRACE_SIGNAL_IGNORED;
 	if (!prepare_signal(sig, t, 0))
 		goto out;
 
@@ -1358,6 +1418,7 @@ int send_sigqueue(struct sigqueue *q, struct task_struct *t, int group)
 		 */
 		BUG_ON(q->info.si_code != SI_TIMER);
 		q->info.si_overrun++;
+		result = TRACE_SIGNAL_ALREADY_PENDING;
 		goto out;
 	}
 	q->info.si_overrun = 0;
@@ -1367,7 +1428,9 @@ int send_sigqueue(struct sigqueue *q, struct task_struct *t, int group)
 	list_add_tail(&q->list, &pending->list);
 	sigaddset(&pending->signal, sig);
 	complete_signal(sig, t, group);
+	result = TRACE_SIGNAL_DELIVERED;
 out:
+	trace_signal_generate(sig, &q->info, t, group, result);
 	unlock_task_sighand(t, &flags);
 ret:
 	return ret;
@@ -1394,6 +1457,14 @@ int do_notify_parent(struct task_struct *tsk, int sig)
 
 	BUG_ON(!task_ptrace(tsk) &&
 	       (tsk->group_leader != tsk || !thread_group_empty(tsk)));
+
+#ifdef CONFIG_VE
+	/* Allow to send only SIGCHLD from VE */
+	if (sig != SIGCHLD &&
+			tsk->ve_task_info.owner_env != 
+			tsk->parent->ve_task_info.owner_env)
+		sig = SIGCHLD;
+#endif
 
 	info.si_signo = sig;
 	info.si_errno = 0;
@@ -1461,7 +1532,7 @@ int do_notify_parent(struct task_struct *tsk, int sig)
 	return ret;
 }
 
-static void do_notify_parent_cldstop(struct task_struct *tsk, int why)
+void do_notify_parent_cldstop(struct task_struct *tsk, int why)
 {
 	struct siginfo info;
 	unsigned long flags;
@@ -1719,7 +1790,9 @@ static int do_signal_stop(int signr)
 
 	/* Now we don't run again until woken by SIGCONT or SIGKILL */
 	do {
+		set_stop_state(current);
 		schedule();
+		clear_stop_state(current);
 	} while (try_to_freeze());
 
 	tracehook_finish_jctl();
@@ -1731,7 +1804,7 @@ static int do_signal_stop(int signr)
 static int ptrace_signal(int signr, siginfo_t *info,
 			 struct pt_regs *regs, void *cookie)
 {
-	if (!task_ptrace(current))
+	if (!(task_ptrace(current) & PT_PTRACED))
 		return signr;
 
 	ptrace_signal_deliver(regs, cookie);
@@ -1807,11 +1880,6 @@ relock:
 
 	for (;;) {
 		struct k_sigaction *ka;
-
-		if (unlikely(signal->group_stop_count > 0) &&
-		    do_signal_stop(0))
-			goto relock;
-
 		/*
 		 * Tracing can induce an artifical signal and choose sigaction.
 		 * The return value in @signr determines the default action,
@@ -1823,6 +1891,10 @@ relock:
 		if (unlikely(signr != 0))
 			ka = return_ka;
 		else {
+			if (unlikely(signal->group_stop_count > 0) &&
+			    do_signal_stop(0))
+				goto relock;
+
 			signr = dequeue_signal(current, &current->blocked,
 					       info);
 
@@ -1838,6 +1910,9 @@ relock:
 
 			ka = &sighand->action[signr-1];
 		}
+
+		/* Trace actually delivered signals. */
+		trace_signal_deliver(signr, info, ka);
 
 		if (ka->sa.sa_handler == SIG_IGN) /* Do nothing.  */
 			continue;
@@ -2153,6 +2228,14 @@ int copy_siginfo_to_user(siginfo_t __user *to, siginfo_t *from)
 #ifdef __ARCH_SI_TRAPNO
 		err |= __put_user(from->si_trapno, &to->si_trapno);
 #endif
+#ifdef BUS_MCEERR_AO
+		/* 
+		 * Other callers might not initialize the si_lsb field,
+	 	 * so check explicitely for the right codes here.
+		 */
+		if (from->si_code == BUS_MCEERR_AR || from->si_code == BUS_MCEERR_AO)
+			err |= __put_user(from->si_addr_lsb, &to->si_addr_lsb);
+#endif
 		break;
 	case __SI_CHLD:
 		err |= __put_user(from->si_pid, &to->si_pid);
@@ -2280,7 +2363,8 @@ do_send_specific(pid_t tgid, pid_t pid, int sig, struct siginfo *info)
 		 * probe.  No signal is actually delivered.
 		 */
 		if (!error && sig) {
-			error = do_send_sig_info(sig, info, p, false);
+			if (!sig_ve_ignored(sig, info, p))
+				error = do_send_sig_info(sig, info, p, false);
 			/*
 			 * If lock_task_sighand() failed we pretend the task
 			 * dies after receiving the signal. The window is tiny,
@@ -2348,9 +2432,13 @@ SYSCALL_DEFINE3(rt_sigqueueinfo, pid_t, pid, int, sig,
 		return -EFAULT;
 
 	/* Not even root can pretend to send signals from the kernel.
-	   Nor can they impersonate a kill(), which adds source info.  */
-	if (info.si_code >= 0)
+	 * Nor can they impersonate a kill()/tgkill(), which adds source info.
+	 */
+	if (info.si_code >= 0 || info.si_code == SI_TKILL) {
+		/* We used to allow any < 0 si_code */
+		WARN_ON_ONCE(info.si_code < 0);
 		return -EPERM;
+	}
 	info.si_signo = sig;
 
 	/* POSIX.1b doesn't mention process groups.  */
@@ -2364,9 +2452,13 @@ long do_rt_tgsigqueueinfo(pid_t tgid, pid_t pid, int sig, siginfo_t *info)
 		return -EINVAL;
 
 	/* Not even root can pretend to send signals from the kernel.
-	   Nor can they impersonate a kill(), which adds source info.  */
-	if (info->si_code >= 0)
+	 * Nor can they impersonate a kill()/tgkill(), which adds source info.
+	 */
+	if (info->si_code >= 0 || info->si_code == SI_TKILL) {
+		/* We used to allow any < 0 si_code */
+		WARN_ON_ONCE(info->si_code < 0);
 		return -EPERM;
+	}
 	info->si_signo = sig;
 
 	return do_send_specific(tgid, pid, sig, info);
@@ -2677,5 +2769,5 @@ __attribute__((weak)) const char *arch_vma_name(struct vm_area_struct *vma)
 
 void __init signals_init(void)
 {
-	sigqueue_cachep = KMEM_CACHE(sigqueue, SLAB_PANIC);
+	sigqueue_cachep = KMEM_CACHE(sigqueue, SLAB_PANIC|SLAB_UBC);
 }

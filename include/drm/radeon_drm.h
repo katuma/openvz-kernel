@@ -33,7 +33,7 @@
 #ifndef __RADEON_DRM_H__
 #define __RADEON_DRM_H__
 
-#include <linux/types.h>
+#include "drm.h"
 
 /* WARNING: If you change any of these defines, make sure to change the
  * defines in the X server file (radeon_sarea.h)
@@ -509,6 +509,7 @@ typedef struct {
 #define DRM_RADEON_GEM_SET_TILING	0x28
 #define DRM_RADEON_GEM_GET_TILING	0x29
 #define DRM_RADEON_GEM_BUSY		0x2a
+#define DRM_RADEON_GEM_VA		0x2b
 
 #define DRM_IOCTL_RADEON_CP_INIT    DRM_IOW( DRM_COMMAND_BASE + DRM_RADEON_CP_INIT, drm_radeon_init_t)
 #define DRM_IOCTL_RADEON_CP_START   DRM_IO(  DRM_COMMAND_BASE + DRM_RADEON_CP_START)
@@ -547,9 +548,10 @@ typedef struct {
 #define DRM_IOCTL_RADEON_GEM_WAIT_IDLE	DRM_IOW(DRM_COMMAND_BASE + DRM_RADEON_GEM_WAIT_IDLE, struct drm_radeon_gem_wait_idle)
 #define DRM_IOCTL_RADEON_CS		DRM_IOWR(DRM_COMMAND_BASE + DRM_RADEON_CS, struct drm_radeon_cs)
 #define DRM_IOCTL_RADEON_INFO		DRM_IOWR(DRM_COMMAND_BASE + DRM_RADEON_INFO, struct drm_radeon_info)
-#define DRM_IOCTL_RADEON_SET_TILING	DRM_IOWR(DRM_COMMAND_BASE + DRM_RADEON_GEM_SET_TILING, struct drm_radeon_gem_set_tiling)
-#define DRM_IOCTL_RADEON_GET_TILING	DRM_IOWR(DRM_COMMAND_BASE + DRM_RADEON_GEM_GET_TILING, struct drm_radeon_gem_get_tiling)
+#define DRM_IOCTL_RADEON_GEM_SET_TILING	DRM_IOWR(DRM_COMMAND_BASE + DRM_RADEON_GEM_SET_TILING, struct drm_radeon_gem_set_tiling)
+#define DRM_IOCTL_RADEON_GEM_GET_TILING	DRM_IOWR(DRM_COMMAND_BASE + DRM_RADEON_GEM_GET_TILING, struct drm_radeon_gem_get_tiling)
 #define DRM_IOCTL_RADEON_GEM_BUSY	DRM_IOWR(DRM_COMMAND_BASE + DRM_RADEON_GEM_BUSY, struct drm_radeon_gem_busy)
+#define DRM_IOCTL_RADEON_GEM_VA		DRM_IOWR(DRM_COMMAND_BASE + DRM_RADEON_GEM_VA, struct drm_radeon_gem_va)
 
 typedef struct drm_radeon_init {
 	enum {
@@ -641,7 +643,7 @@ typedef struct drm_radeon_vertex2 {
 } drm_radeon_vertex2_t;
 
 /* v1.3 - obsoletes drm_radeon_vertex2
- *      - allows arbitarily large cliprect list
+ *      - allows arbitrarily large cliprect list
  *      - allows updating of tcl packet, vector and scalar state
  *      - allows memory-efficient description of state updates
  *      - allows state to be emitted without a primitive
@@ -808,6 +810,7 @@ struct drm_radeon_gem_create {
 #define RADEON_TILING_SWAP_32BIT  0x8
 #define RADEON_TILING_SURFACE     0x10 /* this object requires a surface
 					* when mapped - i.e. front buffer */
+#define RADEON_TILING_MICRO_SQUARE 0x20
 
 struct drm_radeon_gem_set_tiling {
 	uint32_t	handle;
@@ -871,14 +874,48 @@ struct drm_radeon_gem_pwrite {
 	uint64_t data_ptr;
 };
 
+#define RADEON_VA_MAP			1
+#define RADEON_VA_UNMAP			2
+
+#define RADEON_VA_RESULT_OK		0
+#define RADEON_VA_RESULT_ERROR		1
+#define RADEON_VA_RESULT_VA_EXIST	2
+
+#define RADEON_VM_PAGE_VALID		(1 << 0)
+#define RADEON_VM_PAGE_READABLE		(1 << 1)
+#define RADEON_VM_PAGE_WRITEABLE	(1 << 2)
+#define RADEON_VM_PAGE_SYSTEM		(1 << 3)
+#define RADEON_VM_PAGE_SNOOPED		(1 << 4)
+
+struct drm_radeon_gem_va {
+	uint32_t		handle;
+	uint32_t		operation;
+	uint32_t		vm_id;
+	uint32_t		flags;
+	uint64_t		offset;
+};
+
 #define RADEON_CHUNK_ID_RELOCS	0x01
 #define RADEON_CHUNK_ID_IB	0x02
+#define RADEON_CHUNK_ID_FLAGS	0x03
+
+/* The first dword of RADEON_CHUNK_ID_FLAGS is a uint32 of these flags: */
+#define RADEON_CS_KEEP_TILING_FLAGS 0x01
+#define RADEON_CS_USE_VM            0x02
+/* The second dword of RADEON_CHUNK_ID_FLAGS is a uint32 that sets the ring type */
+#define RADEON_CS_RING_GFX          0
+#define RADEON_CS_RING_COMPUTE      1
+/* The third dword of RADEON_CHUNK_ID_FLAGS is a sint32 that sets the priority */
+/* 0 = normal, + = higher priority, - = lower priority */
 
 struct drm_radeon_cs_chunk {
 	uint32_t		chunk_id;
 	uint32_t		length_dw;
 	uint64_t		chunk_data;
 };
+
+/* drm_radeon_cs_reloc.flags */
+#define RADEON_RELOC_DONT_SYNC		0x01
 
 struct drm_radeon_cs_reloc {
 	uint32_t		handle;
@@ -901,6 +938,20 @@ struct drm_radeon_cs {
 #define RADEON_INFO_NUM_GB_PIPES	0x01
 #define RADEON_INFO_NUM_Z_PIPES 	0x02
 #define RADEON_INFO_ACCEL_WORKING	0x03
+#define RADEON_INFO_CRTC_FROM_ID	0x04
+#define RADEON_INFO_ACCEL_WORKING2	0x05
+#define RADEON_INFO_TILING_CONFIG	0x06
+#define RADEON_INFO_WANT_HYPERZ		0x07
+#define RADEON_INFO_WANT_CMASK		0x08 /* get access to CMASK on r300 */
+#define RADEON_INFO_CLOCK_CRYSTAL_FREQ	0x09 /* clock crystal frequency */
+#define RADEON_INFO_NUM_BACKENDS	0x0a /* DB/backends for r600+ - need for OQ */
+#define RADEON_INFO_NUM_TILE_PIPES	0x0b /* tile pipes for r600+ */
+#define RADEON_INFO_FUSION_GART_WORKING	0x0c /* fusion writes to GTT were broken before this */
+#define RADEON_INFO_BACKEND_MAP		0x0d /* pipe to backend map, needed by mesa */
+/* virtual address start, va < start are reserved by the kernel */
+#define RADEON_INFO_VA_START		0x0e
+/* maximum size of ib using the virtual memory cs */
+#define RADEON_INFO_IB_VM_MAX_SIZE	0x0f
 
 struct drm_radeon_info {
 	uint32_t		request;

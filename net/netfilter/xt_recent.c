@@ -17,6 +17,8 @@
 #include <linux/ipv6.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/nsproxy.h>
+#include <linux/sched.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/string.h>
@@ -58,6 +60,9 @@ MODULE_PARM_DESC(ip_list_perms, "permissions on /proc/net/xt_recent/* files");
 MODULE_PARM_DESC(ip_list_uid,"owner of /proc/net/xt_recent/* files");
 MODULE_PARM_DESC(ip_list_gid,"owning group of /proc/net/xt_recent/* files");
 
+static int init_ipt_recent(struct ve_struct *ve);
+static void fini_ipt_recent(struct ve_struct *ve);
+
 struct recent_entry {
 	struct list_head	list;
 	struct list_head	lru_list;
@@ -78,15 +83,27 @@ struct recent_table {
 	struct list_head	iphash[0];
 };
 
+#if defined(CONFIG_VE_IPTABLES)
+#define tables		(get_exec_env()->_ipt_recent->tables)
+#else
 static LIST_HEAD(tables);
+#endif
 static DEFINE_SPINLOCK(recent_lock);
 static DEFINE_MUTEX(recent_mutex);
 
 #ifdef CONFIG_PROC_FS
 #ifdef CONFIG_NETFILTER_XT_MATCH_RECENT_PROC_COMPAT
+#if defined(CONFIG_VE_IPTABLES)
+#define proc_old_dir	(get_exec_env()->_ipt_recent->proc_old_dir)
+#else
 static struct proc_dir_entry *proc_old_dir;
 #endif
+#endif
+#if defined(CONFIG_VE_IPTABLES)
+#define recent_proc_dir (get_exec_env()->_ipt_recent->proc_dir)
+#else
 static struct proc_dir_entry *recent_proc_dir;
+#endif
 static const struct file_operations recent_old_fops, recent_mt_fops;
 #endif
 
@@ -173,10 +190,10 @@ recent_entry_init(struct recent_table *t, const union nf_inet_addr *addr,
 
 static void recent_entry_update(struct recent_table *t, struct recent_entry *e)
 {
+	e->index %= ip_pkt_list_tot;
 	e->stamps[e->index++] = jiffies;
 	if (e->index > e->nstamps)
 		e->nstamps = e->index;
-	e->index %= ip_pkt_list_tot;
 	list_move_tail(&e->lru_list, &t->lru_list);
 }
 
@@ -260,7 +277,7 @@ recent_mt(const struct sk_buff *skb, const struct xt_match_param *par)
 		for (i = 0; i < e->nstamps; i++) {
 			if (info->seconds && time_after(time, e->stamps[i]))
 				continue;
-			if (++hits >= info->hit_count) {
+			if (!info->hit_count || ++hits >= info->hit_count) {
 				ret = !ret;
 				break;
 			}
@@ -299,6 +316,9 @@ static bool recent_mt_check(const struct xt_mtchk_param *par)
 	if (info->name[0] == '\0' ||
 	    strnlen(info->name, XT_RECENT_NAME_LEN) == XT_RECENT_NAME_LEN)
 		return false;
+
+	if (init_ipt_recent(get_exec_env()))
+		return 0;
 
 	mutex_lock(&recent_mutex);
 	t = recent_table_lookup(info->name);
@@ -351,6 +371,13 @@ static void recent_mt_destroy(const struct xt_mtdtor_param *par)
 {
 	const struct xt_recent_mtinfo *info = par->matchinfo;
 	struct recent_table *t;
+	struct ve_struct *ve;
+
+	ve = get_exec_env();
+#ifdef CONFIG_VE_IPTABLES
+	if (!ve->_ipt_recent)
+		return;
+#endif
 
 	mutex_lock(&recent_mutex);
 	t = recent_table_lookup(info->name);
@@ -368,6 +395,8 @@ static void recent_mt_destroy(const struct xt_mtdtor_param *par)
 		kfree(t);
 	}
 	mutex_unlock(&recent_mutex);
+	if (!ve_is_super(ve) && list_empty(&tables))
+		fini_ipt_recent(ve);
 }
 
 #ifdef CONFIG_PROC_FS
@@ -482,8 +511,7 @@ static ssize_t recent_old_proc_write(struct file *file,
 	if (copy_from_user(buf, input, size))
 		return -EFAULT;
 
-	while (isspace(*c))
-		c++;
+	c = skip_spaces(c);
 
 	if (size - (c - buf) < 5)
 		return c - buf;
@@ -637,6 +665,62 @@ static struct xt_match recent_mt_reg[] __read_mostly = {
 	},
 };
 
+static int init_ipt_recent(struct ve_struct *ve)
+{
+	int err = 0;
+
+#ifdef CONFIG_VE_IPTABLES
+	if (ve->_ipt_recent)
+		return 0;
+
+	ve->_ipt_recent = kzalloc(sizeof(struct ve_ipt_recent), GFP_KERNEL);
+	if (!ve->_ipt_recent) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	INIT_LIST_HEAD(&tables);
+#endif
+#ifdef CONFIG_PROC_FS
+	recent_proc_dir = proc_mkdir("xt_recent", ve->ve_netns->proc_net);
+	if (recent_proc_dir == NULL) {
+		err = -ENOMEM;
+		goto out_mem;
+	}
+#ifdef CONFIG_NETFILTER_XT_MATCH_RECENT_PROC_COMPAT
+	proc_old_dir = proc_mkdir("ipt_recent", ve->ve_netns->proc_net);
+	if (proc_old_dir == NULL) {
+		err = -ENOMEM;
+		remove_proc_entry("xt_recent", ve->ve_netns->proc_net);
+		goto out_mem;
+	}
+#endif
+#endif
+out:
+	return err;
+
+out_mem:
+#ifdef CONFIG_VE_IPTABLES
+	kfree(ve->_ipt_recent);
+	ve->_ipt_recent = NULL;
+#endif
+	goto out;
+}
+
+static void fini_ipt_recent(struct ve_struct *ve)
+{
+#ifdef CONFIG_PROC_FS
+#ifdef CONFIG_NETFILTER_XT_MATCH_RECENT_PROC_COMPAT
+	remove_proc_entry("ipt_recent", ve->ve_netns->proc_net);
+#endif
+	remove_proc_entry("xt_recent", ve->ve_netns->proc_net);
+#endif
+#ifdef CONFIG_VE_IPTABLES
+	kfree(ve->_ipt_recent);
+	ve->_ipt_recent = NULL;
+#endif
+}
+
 static int __init recent_mt_init(void)
 {
 	int err;
@@ -646,25 +730,11 @@ static int __init recent_mt_init(void)
 	ip_list_hash_size = 1 << fls(ip_list_tot);
 
 	err = xt_register_matches(recent_mt_reg, ARRAY_SIZE(recent_mt_reg));
-#ifdef CONFIG_PROC_FS
 	if (err)
 		return err;
-	recent_proc_dir = proc_mkdir("xt_recent", init_net.proc_net);
-	if (recent_proc_dir == NULL) {
+	err = init_ipt_recent(&ve0);
+	if (err)
 		xt_unregister_matches(recent_mt_reg, ARRAY_SIZE(recent_mt_reg));
-		err = -ENOMEM;
-	}
-#ifdef CONFIG_NETFILTER_XT_MATCH_RECENT_PROC_COMPAT
-	if (err < 0)
-		return err;
-	proc_old_dir = proc_mkdir("ipt_recent", init_net.proc_net);
-	if (proc_old_dir == NULL) {
-		remove_proc_entry("xt_recent", init_net.proc_net);
-		xt_unregister_matches(recent_mt_reg, ARRAY_SIZE(recent_mt_reg));
-		err = -ENOMEM;
-	}
-#endif
-#endif
 	return err;
 }
 
@@ -672,12 +742,7 @@ static void __exit recent_mt_exit(void)
 {
 	BUG_ON(!list_empty(&tables));
 	xt_unregister_matches(recent_mt_reg, ARRAY_SIZE(recent_mt_reg));
-#ifdef CONFIG_PROC_FS
-#ifdef CONFIG_NETFILTER_XT_MATCH_RECENT_PROC_COMPAT
-	remove_proc_entry("ipt_recent", init_net.proc_net);
-#endif
-	remove_proc_entry("xt_recent", init_net.proc_net);
-#endif
+	fini_ipt_recent(&ve0);
 }
 
 module_init(recent_mt_init);

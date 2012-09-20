@@ -25,12 +25,14 @@
 #include <net/sock.h>
 
 
+#ifndef CONFIG_VE
+/* Virtualized for all VEs, but is shown only in VE0 */
 u64 uevent_seqnum;
-char uevent_helper[UEVENT_HELPER_PATH_LEN] = CONFIG_UEVENT_HELPER_PATH;
-static DEFINE_SPINLOCK(sequence_lock);
-#if defined(CONFIG_NET)
-static struct sock *uevent_sock;
 #endif
+char uevent_helper[UEVENT_HELPER_PATH_LEN] = CONFIG_UEVENT_HELPER_PATH;
+
+/* This lock protects uevent_seqnum and uevent_sock_list */
+static DEFINE_MUTEX(uevent_sock_mutex);
 
 /* the strings here must match the enum in include/linux/kobject.h */
 static const char *kobject_actions[] = {
@@ -38,6 +40,8 @@ static const char *kobject_actions[] = {
 	[KOBJ_REMOVE] =		"remove",
 	[KOBJ_CHANGE] =		"change",
 	[KOBJ_MOVE] =		"move",
+	[KOBJ_START] =		"start",
+	[KOBJ_STOP] =		"stop",
 	[KOBJ_ONLINE] =		"online",
 	[KOBJ_OFFLINE] =	"offline",
 };
@@ -86,7 +90,7 @@ out:
  * Returns 0 if kobject_uevent() is completed with success or the
  * corresponding error when it fails.
  */
-int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
+int kobject_uevent_env_one(struct kobject *kobj, enum kobject_action action,
 		       char *envp_ext[])
 {
 	struct kobj_uevent_env *env;
@@ -96,7 +100,6 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 	struct kobject *top_kobj;
 	struct kset *kset;
 	struct kset_uevent_ops *uevent_ops;
-	u64 seq;
 	int i = 0;
 	int retval = 0;
 
@@ -200,19 +203,22 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 	else if (action == KOBJ_REMOVE)
 		kobj->state_remove_uevent_sent = 1;
 
+	mutex_lock(&uevent_sock_mutex);
 	/* we will send an event, so request a new sequence number */
-	spin_lock(&sequence_lock);
-	seq = ++uevent_seqnum;
-	spin_unlock(&sequence_lock);
-	retval = add_uevent_var(env, "SEQNUM=%llu", (unsigned long long)seq);
-	if (retval)
+	retval = add_uevent_var(env, "SEQNUM=%llu",
+				(unsigned long long)++ve_uevent_seqnum);
+
+	if (retval) {
+		mutex_unlock(&uevent_sock_mutex);
 		goto exit;
+	}
 
 #if defined(CONFIG_NET)
 	/* send netlink message */
-	if (uevent_sock) {
+	if (get_exec_env()->ve_netns && get_exec_env()->ve_netns->uevent_sock) {
 		struct sk_buff *skb;
 		size_t len;
+		struct sock *uevent_sock = get_exec_env()->ve_netns->uevent_sock;
 
 		/* allocate message with the maximum possible size */
 		len = strlen(action_string) + strlen(devpath) + 2;
@@ -241,6 +247,7 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 			retval = -ENOMEM;
 	}
 #endif
+	mutex_unlock(&uevent_sock_mutex);
 
 	/* call uevent_helper, usually only enabled during early boot */
 	if (uevent_helper[0]) {
@@ -267,6 +274,21 @@ exit:
 	return retval;
 }
 EXPORT_SYMBOL_GPL(kobject_uevent_env);
+
+extern int ve_kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
+			char *envp_ext[]);
+int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
+		       char *envp_ext[])
+{
+	int err, ret = 0;
+
+	ret = kobject_uevent_env_one(kobj, action, envp_ext);
+
+	err = ve_kobject_uevent_env(kobj, action, envp_ext);
+	if (ret && err < 0)
+		ret = err;
+	return ret;
+}
 
 /**
  * kobject_uevent - notify userspace by ending an uevent
@@ -319,15 +341,45 @@ int add_uevent_var(struct kobj_uevent_env *env, const char *format, ...)
 EXPORT_SYMBOL_GPL(add_uevent_var);
 
 #if defined(CONFIG_NET)
-static int __init kobject_uevent_init(void)
+
+static int __net_init kobject_uevent_net_init(struct net *net)
 {
-	uevent_sock = netlink_kernel_create(&init_net, NETLINK_KOBJECT_UEVENT,
+	struct sock *sk;
+
+	sk = netlink_kernel_create(net, NETLINK_KOBJECT_UEVENT,
 					    1, NULL, NULL, THIS_MODULE);
-	if (!uevent_sock) {
+	if (!sk) {
 		printk(KERN_ERR
 		       "kobject_uevent: unable to create netlink socket!\n");
 		return -ENODEV;
 	}
+
+	net->uevent_sock = sk;
+
+	return 0;
+}
+
+static void __net_exit kobject_uevent_net_exit(struct net *net)
+{
+	netlink_kernel_release(net->uevent_sock);
+	net->uevent_sock = NULL;
+}
+
+
+static struct pernet_operations kobject_uevent_net_ops = {
+	.init = kobject_uevent_net_init,
+	.exit = kobject_uevent_net_exit,
+};
+
+
+static int __init kobject_uevent_init(void)
+{
+	int res;
+
+	res = register_pernet_subsys(&kobject_uevent_net_ops);
+	if (res < 0)
+		return res;
+
 	netlink_set_nonroot(NETLINK_KOBJECT_UEVENT, NL_NONROOT_RECV);
 	return 0;
 }

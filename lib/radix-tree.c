@@ -46,6 +46,8 @@
 #define RADIX_TREE_TAG_LONGS	\
 	((RADIX_TREE_MAP_SIZE + BITS_PER_LONG - 1) / BITS_PER_LONG)
 
+#define RADIX_ROOT_TAG_MASK	(((1<<RADIX_TREE_MAX_TAGS)-1) << __GFP_BITS_SHIFT)
+
 struct radix_tree_node {
 	unsigned int	height;		/* Height from the bottom */
 	unsigned int	count;
@@ -116,14 +118,40 @@ static inline void root_tag_clear(struct radix_tree_root *root, unsigned int tag
 	root->gfp_mask &= (__force gfp_t)~(1 << (tag + __GFP_BITS_SHIFT));
 }
 
+static inline void root_tag_move_all_to_prev(struct radix_tree_root *root)
+{
+	root->gfp_mask = (root->gfp_mask & __GFP_BITS_MASK) |
+		(root->gfp_mask & RADIX_ROOT_TAG_MASK) << RADIX_TREE_MAX_TAGS;
+}
+
 static inline void root_tag_clear_all(struct radix_tree_root *root)
 {
-	root->gfp_mask &= __GFP_BITS_MASK;
+	root->gfp_mask &= (__force gfp_t)~RADIX_ROOT_TAG_MASK;
 }
 
 static inline int root_tag_get(struct radix_tree_root *root, unsigned int tag)
 {
 	return (__force unsigned)root->gfp_mask & (1 << (tag + __GFP_BITS_SHIFT));
+}
+
+static inline void prev_tag_set(struct radix_tree_root *root, unsigned int tag)
+{
+	root->gfp_mask |= (1 << (tag + RADIX_TREE_MAX_TAGS + __GFP_BITS_SHIFT));
+}
+
+static inline void prev_tag_clear(struct radix_tree_root *root, unsigned int tag)
+{
+	root->gfp_mask &= ~(1 << (tag + RADIX_TREE_MAX_TAGS + __GFP_BITS_SHIFT));
+}
+
+static inline void prev_tag_clear_all(struct radix_tree_root *root)
+{
+	root->gfp_mask &= __GFP_BITS_MASK | RADIX_ROOT_TAG_MASK;
+}
+
+static inline int prev_tag_get(struct radix_tree_root *root, unsigned int tag)
+{
+	return root->gfp_mask & (1 << (tag + RADIX_TREE_MAX_TAGS + __GFP_BITS_SHIFT));
 }
 
 /*
@@ -175,14 +203,16 @@ static void radix_tree_node_rcu_free(struct rcu_head *head)
 {
 	struct radix_tree_node *node =
 			container_of(head, struct radix_tree_node, rcu_head);
+	int i;
 
 	/*
 	 * must only free zeroed nodes into the slab. radix_tree_shrink
 	 * can leave us with a non-NULL entry in the first slot, so clear
 	 * that here to make sure.
 	 */
-	tag_clear(node, 0, 0);
-	tag_clear(node, 1, 0);
+	for (i = 0; i < RADIX_TREE_MAX_TAGS; i++)
+		tag_clear(node, i, 0);
+
 	node->slots[0] = NULL;
 	node->count = 0;
 
@@ -450,6 +480,8 @@ void *radix_tree_tag_set(struct radix_tree_root *root,
 {
 	unsigned int height, shift;
 	struct radix_tree_node *slot;
+	int prev = 0; /* suppress warning */
+	int right_prev = radix_tree_tag_get(root, index, tag);
 
 	height = root->height;
 	BUG_ON(index > radix_tree_maxindex(height));
@@ -457,17 +489,28 @@ void *radix_tree_tag_set(struct radix_tree_root *root,
 	slot = radix_tree_indirect_to_ptr(root->rnode);
 	shift = (height - 1) * RADIX_TREE_MAP_SHIFT;
 
+	if (!height)
+		prev = root_tag_get(root, tag);
+
 	while (height > 0) {
 		int offset;
 
 		offset = (index >> shift) & RADIX_TREE_MAP_MASK;
-		if (!tag_get(slot, tag, offset))
+		prev = tag_get(slot, tag, offset);
+		if (!prev)
 			tag_set(slot, tag, offset);
 		slot = slot->slots[offset];
 		BUG_ON(slot == NULL);
 		shift -= RADIX_TREE_MAP_SHIFT;
 		height--;
 	}
+
+	if (prev)
+		prev_tag_set(root, tag);
+	else
+		prev_tag_clear(root, tag);
+
+	BUG_ON(!prev != !right_prev);
 
 	/* set the root's tag bit */
 	if (slot && !root_tag_get(root, tag))
@@ -501,6 +544,8 @@ void *radix_tree_tag_clear(struct radix_tree_root *root,
 	struct radix_tree_path path[RADIX_TREE_MAX_PATH + 1], *pathp = path;
 	struct radix_tree_node *slot = NULL;
 	unsigned int height, shift;
+	int prev = 0; /* suppress warning */
+	int right_prev = radix_tree_tag_get(root, index, tag);
 
 	height = root->height;
 	if (index > radix_tree_maxindex(height))
@@ -509,6 +554,13 @@ void *radix_tree_tag_clear(struct radix_tree_root *root,
 	shift = (height - 1) * RADIX_TREE_MAP_SHIFT;
 	pathp->node = NULL;
 	slot = radix_tree_indirect_to_ptr(root->rnode);
+
+	if (!height) {
+		prev = root_tag_get(root, tag);
+		if (prev)
+			root_tag_clear(root, tag);
+		goto out;
+	}
 
 	while (height > 0) {
 		int offset;
@@ -529,7 +581,8 @@ void *radix_tree_tag_clear(struct radix_tree_root *root,
 		goto out;
 
 	while (pathp->node) {
-		if (!tag_get(pathp->node, tag, pathp->offset))
+		prev = tag_get(pathp->node, tag, pathp->offset);
+		if (!prev)
 			goto out;
 		tag_clear(pathp->node, tag, pathp->offset);
 		if (any_tag_set(pathp->node, tag))
@@ -542,6 +595,13 @@ void *radix_tree_tag_clear(struct radix_tree_root *root,
 		root_tag_clear(root, tag);
 
 out:
+	if (prev)
+		prev_tag_set(root, tag);
+	else
+		prev_tag_clear(root, tag);
+
+	BUG_ON(!prev != !right_prev);
+
 	return slot;
 }
 EXPORT_SYMBOL(radix_tree_tag_clear);
@@ -608,6 +668,135 @@ int radix_tree_tag_get(struct radix_tree_root *root,
 	}
 }
 EXPORT_SYMBOL(radix_tree_tag_get);
+
+/**
+ * radix_tree_range_tag_if_tagged - for each item in given range set given
+ *				   tag if item has another tag set
+ * @root:		radix tree root
+ * @first_indexp:	pointer to a starting index of a range to scan
+ * @last_index:		last index of a range to scan
+ * @nr_to_tag:		maximum number items to tag
+ * @iftag:		tag index to test
+ * @settag:		tag index to set if tested tag is set
+ *
+ * This function scans range of radix tree from first_index to last_index
+ * (inclusive).  For each item in the range if iftag is set, the function sets
+ * also settag. The function stops either after tagging nr_to_tag items or
+ * after reaching last_index.
+ *
+ * The tags must be set from the leaf level only and propagated back up the
+ * path to the root. We must do this so that we resolve the full path before
+ * setting any tags on intermediate nodes. If we set tags as we descend, then
+ * we can get to the leaf node and find that the index that has the iftag
+ * set is outside the range we are scanning. This reults in dangling tags and
+ * can lead to problems with later tag operations (e.g. livelocks on lookups).
+ *
+ * The function returns number of leaves where the tag was set and sets
+ * *first_indexp to the first unscanned index.
+ * WARNING! *first_indexp can wrap if last_index is ULONG_MAX. Caller must
+ * be prepared to handle that.
+ */
+unsigned long radix_tree_range_tag_if_tagged(struct radix_tree_root *root,
+		unsigned long *first_indexp, unsigned long last_index,
+		unsigned long nr_to_tag,
+		unsigned int iftag, unsigned int settag)
+{
+	unsigned int height = root->height;
+	struct radix_tree_path path[height];
+	struct radix_tree_path *pathp = path;
+	struct radix_tree_node *slot;
+	unsigned int shift;
+	unsigned long tagged = 0;
+	unsigned long index = *first_indexp;
+
+	last_index = min(last_index, radix_tree_maxindex(height));
+	if (index > last_index)
+		return 0;
+	if (!nr_to_tag)
+		return 0;
+	if (!root_tag_get(root, iftag)) {
+		*first_indexp = last_index + 1;
+		return 0;
+	}
+	if (height == 0) {
+		*first_indexp = last_index + 1;
+		root_tag_set(root, settag);
+		return 1;
+	}
+
+	shift = (height - 1) * RADIX_TREE_MAP_SHIFT;
+	slot = radix_tree_indirect_to_ptr(root->rnode);
+
+	/*
+	 * we fill the path from (root->height - 2) to 0, leaving the index at
+	 * (root->height - 1) as a terminator. Zero the node in the terminator
+	 * so that we can use this to end walk loops back up the path.
+	 */
+	path[height - 1].node = NULL;
+
+	for (;;) {
+		int offset;
+
+		offset = (index >> shift) & RADIX_TREE_MAP_MASK;
+		if (!slot->slots[offset])
+			goto next;
+		if (!tag_get(slot, iftag, offset))
+			goto next;
+		if (height > 1) {
+			/* Go down one level */
+			height--;
+			shift -= RADIX_TREE_MAP_SHIFT;
+			path[height - 1].node = slot;
+			path[height - 1].offset = offset;
+			slot = slot->slots[offset];
+			continue;
+		}
+
+		/* tag the leaf */
+		tagged++;
+		tag_set(slot, settag, offset);
+
+		/* walk back up the path tagging interior nodes */
+		pathp = &path[0];
+		while (pathp->node) {
+			/* stop if we find a node with the tag already set */
+			if (tag_get(pathp->node, settag, pathp->offset))
+				break;
+			tag_set(pathp->node, settag, pathp->offset);
+			pathp++;
+		}
+
+next:
+		/* Go to next item at level determined by 'shift' */
+		index = ((index >> shift) + 1) << shift;
+		/* Overflow can happen when last_index is ~0UL... */
+		if (index > last_index || !index)
+			break;
+		if (tagged >= nr_to_tag)
+			break;
+		while (((index >> shift) & RADIX_TREE_MAP_MASK) == 0) {
+			/*
+			 * We've fully scanned this node. Go up. Because
+			 * last_index is guaranteed to be in the tree, what
+			 * we do below cannot wander astray.
+			 */
+			slot = path[height - 1].node;
+			height++;
+			shift += RADIX_TREE_MAP_SHIFT;
+		}
+	}
+	/*
+	 * We need not to tag the root tag if there is no tag which is set with
+	 * settag within the range from *first_indexp to last_index.
+	 */
+	if (tagged > 0)
+		root_tag_set(root, settag);
+	*first_indexp = index;
+
+	return tagged;
+}
+EXPORT_SYMBOL(radix_tree_range_tag_if_tagged);
+
 
 /**
  *	radix_tree_next_hole    -    find the next hole (not-present entry)
@@ -1114,14 +1303,18 @@ void *radix_tree_delete(struct radix_tree_root *root, unsigned long index)
 	unsigned int height, shift;
 	int tag;
 	int offset;
+	int right_prev[RADIX_TREE_MAX_TAGS] = {0,};
 
 	height = root->height;
 	if (index > radix_tree_maxindex(height))
-		goto out;
+		goto out_none;
+
+	for (tag = 0; tag < RADIX_TREE_MAX_TAGS; tag++)
+		right_prev[tag] = radix_tree_tag_get(root, index, tag);
 
 	slot = root->rnode;
 	if (height == 0) {
-		root_tag_clear_all(root);
+		root_tag_move_all_to_prev(root);
 		root->rnode = NULL;
 		goto out;
 	}
@@ -1132,7 +1325,7 @@ void *radix_tree_delete(struct radix_tree_root *root, unsigned long index)
 
 	do {
 		if (slot == NULL)
-			goto out;
+			goto out_none;
 
 		pathp++;
 		offset = (index >> shift) & RADIX_TREE_MAP_MASK;
@@ -1144,7 +1337,7 @@ void *radix_tree_delete(struct radix_tree_root *root, unsigned long index)
 	} while (height > 0);
 
 	if (slot == NULL)
-		goto out;
+		goto out_none;
 
 	/*
 	 * Clear all tags associated with the just-deleted item
@@ -1152,6 +1345,8 @@ void *radix_tree_delete(struct radix_tree_root *root, unsigned long index)
 	for (tag = 0; tag < RADIX_TREE_MAX_TAGS; tag++) {
 		if (tag_get(pathp->node, tag, pathp->offset))
 			radix_tree_tag_clear(root, index, tag);
+		else
+			prev_tag_clear(root, tag);
 	}
 
 	to_free = NULL;
@@ -1185,7 +1380,12 @@ void *radix_tree_delete(struct radix_tree_root *root, unsigned long index)
 		radix_tree_node_free(to_free);
 
 out:
+	for (tag = 0; tag < RADIX_TREE_MAX_TAGS; tag++)
+		BUG_ON(!right_prev[tag] != !prev_tag_get(root, tag));
 	return slot;
+out_none:
+	prev_tag_clear_all(root);
+	goto out;
 }
 EXPORT_SYMBOL(radix_tree_delete);
 
@@ -1199,6 +1399,19 @@ int radix_tree_tagged(struct radix_tree_root *root, unsigned int tag)
 	return root_tag_get(root, tag);
 }
 EXPORT_SYMBOL(radix_tree_tagged);
+
+/**
+ *	radix_tree_prev_tag_get - get previous tag status for last changed item
+ *			call is valid right after radix_tree_tag_set/clear for
+ *			changed tag and after radix_tree_delete for all tags
+ *	@root:		radix tree root
+ *	@tag:		tag to test
+ */
+int radix_tree_prev_tag_get(struct radix_tree_root *root, unsigned int tag)
+{
+	return prev_tag_get(root, tag);
+}
+EXPORT_SYMBOL(radix_tree_prev_tag_get);
 
 static void
 radix_tree_node_ctor(void *node)

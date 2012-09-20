@@ -30,6 +30,7 @@
 #include <linux/syscalls.h>
 #include <linux/uio.h>
 #include <linux/security.h>
+#include <linux/virtinfo.h>
 
 /*
  * Attempt to steal a page from a pipe buffer. This should perhaps go into
@@ -100,6 +101,7 @@ static int page_cache_pipe_buf_confirm(struct pipe_inode_info *pipe,
 	int err;
 
 	if (!PageUptodate(page)) {
+		virtinfo_notifier_call(VITYPE_IO, VIRTINFO_IO_PREPARE, NULL);
 		lock_page(page);
 
 		/*
@@ -290,11 +292,22 @@ __generic_file_splice_read(struct file *in, loff_t *ppos,
 	req_pages = (len + loff + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
 	nr_pages = min(req_pages, (unsigned)PIPE_BUFFERS);
 
+	check_pagecache_limits(mapping, mapping_gfp_mask(mapping));
+
 	/*
 	 * Lookup the (hopefully) full range of pages we need.
 	 */
 	spd.nr_pages = find_get_pages_contig(mapping, index, nr_pages, pages);
 	index += spd.nr_pages;
+
+	while (spd.nr_pages < nr_pages && mapping->host->i_peer_file) {
+		page = pick_peer_page(mapping->host, &in->f_ra, index,
+				      req_pages - spd.nr_pages);
+		if (!page)
+			break;
+		pages[spd.nr_pages++] = page;
+		index++;
+	}
 
 	/*
 	 * If find_get_pages_contig() returned fewer pages than we needed,
@@ -370,12 +383,17 @@ __generic_file_splice_read(struct file *in, loff_t *ppos,
 			 * for an in-flight io page
 			 */
 			if (flags & SPLICE_F_NONBLOCK) {
-				if (!trylock_page(page)) {
+				if ((virtinfo_notifier_call(VITYPE_IO,
+						VIRTINFO_IO_CONGESTION, NULL) &
+							NOTIFY_FAIL) ||
+						!trylock_page(page)) {
 					error = -EAGAIN;
 					break;
 				}
-			} else
+			} else {
+				virtinfo_notifier_call(VITYPE_IO, VIRTINFO_IO_PREPARE, NULL);
 				lock_page(page);
+			}
 
 			/*
 			 * Page was truncated, or invalidated by the
@@ -648,9 +666,11 @@ static int pipe_to_sendpage(struct pipe_inode_info *pipe,
 	ret = buf->ops->confirm(pipe, buf);
 	if (!ret) {
 		more = (sd->flags & SPLICE_F_MORE) || sd->len < sd->total_len;
-
-		ret = file->f_op->sendpage(file, buf->page, buf->offset,
-					   sd->len, &pos, more);
+		if (file->f_op && file->f_op->sendpage)
+			ret = file->f_op->sendpage(file, buf->page, buf->offset,
+						   sd->len, &pos, more);
+		else
+			ret = -EINVAL;
 	}
 
 	return ret;
@@ -963,7 +983,7 @@ generic_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
 		if (ret <= 0)
 			break;
 
-		mutex_lock_nested(&inode->i_mutex, I_MUTEX_CHILD);
+		mutex_lock(&inode->i_mutex);
 		ret = file_remove_suid(out);
 		if (!ret) {
 			file_update_time(out);
@@ -1068,8 +1088,9 @@ static long do_splice_from(struct pipe_inode_info *pipe, struct file *out,
 	if (unlikely(ret < 0))
 		return ret;
 
-	splice_write = out->f_op->splice_write;
-	if (!splice_write)
+	if (out->f_op && out->f_op->splice_write)
+		splice_write = out->f_op->splice_write;
+	else
 		splice_write = default_file_splice_write;
 
 	return splice_write(pipe, out, ppos, len, flags);
@@ -1093,8 +1114,9 @@ static long do_splice_to(struct file *in, loff_t *ppos,
 	if (unlikely(ret < 0))
 		return ret;
 
-	splice_read = in->f_op->splice_read;
-	if (!splice_read)
+	if (in->f_op && in->f_op->splice_read)
+		splice_read = in->f_op->splice_read;
+	else
 		splice_read = default_file_splice_read;
 
 	return splice_read(in, ppos, pipe, len, flags);
@@ -1227,7 +1249,8 @@ static int direct_splice_actor(struct pipe_inode_info *pipe,
 {
 	struct file *file = sd->u.file;
 
-	return do_splice_from(pipe, file, &sd->pos, sd->total_len, sd->flags);
+	return do_splice_from(pipe, file, &file->f_pos, sd->total_len,
+			      sd->flags);
 }
 
 /**
@@ -1263,6 +1286,7 @@ long do_splice_direct(struct file *in, loff_t *ppos, struct file *out,
 
 	return ret;
 }
+EXPORT_SYMBOL(do_splice_direct);
 
 static int splice_pipe_to_pipe(struct pipe_inode_info *ipipe,
 			       struct pipe_inode_info *opipe,
@@ -1316,7 +1340,8 @@ static long do_splice(struct file *in, loff_t __user *off_in,
 		if (off_in)
 			return -ESPIPE;
 		if (off_out) {
-			if (out->f_op->llseek == no_llseek)
+			if (!out->f_op || !out->f_op->llseek ||
+			    out->f_op->llseek == no_llseek)
 				return -EINVAL;
 			if (copy_from_user(&offset, off_out, sizeof(loff_t)))
 				return -EFAULT;
@@ -1336,7 +1361,8 @@ static long do_splice(struct file *in, loff_t __user *off_in,
 		if (off_out)
 			return -ESPIPE;
 		if (off_in) {
-			if (in->f_op->llseek == no_llseek)
+			if (!in->f_op || !in->f_op->llseek ||
+			    in->f_op->llseek == no_llseek)
 				return -EINVAL;
 			if (copy_from_user(&offset, off_in, sizeof(loff_t)))
 				return -EFAULT;

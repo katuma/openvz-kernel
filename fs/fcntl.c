@@ -126,6 +126,7 @@ SYSCALL_DEFINE2(dup2, unsigned int, oldfd, unsigned int, newfd)
 	}
 	return sys_dup3(oldfd, newfd, 0);
 }
+EXPORT_SYMBOL(sys_dup2);
 
 SYSCALL_DEFINE1(dup, unsigned int, fildes)
 {
@@ -143,11 +144,49 @@ SYSCALL_DEFINE1(dup, unsigned int, fildes)
 }
 
 #define SETFL_MASK (O_APPEND | O_NONBLOCK | O_NDELAY | O_DIRECT | O_NOATIME)
+void generic_set_file_flags_unlocked(struct file *filp, unsigned int arg)
+{
+	filp->f_flags = (arg & SETFL_MASK) |
+		(filp->f_flags & ~SETFL_MASK);
+
+}
+EXPORT_SYMBOL(generic_set_file_flags_unlocked);
+int generic_set_file_flags(struct file *filp, unsigned int arg)
+{
+	spin_lock(&filp->f_lock);
+	generic_set_file_flags_unlocked(filp, arg);
+	spin_unlock(&filp->f_lock);
+	return 0;
+
+}
+EXPORT_SYMBOL(generic_set_file_flags);
+
+int may_use_odirect(void)
+{
+	int may;
+
+	if (ve_is_super(get_exec_env()))
+		return 1;
+
+	may = capable(CAP_SYS_RAWIO);
+	if (!may) {
+		may = get_exec_env()->odirect_enable;
+		if (may == 2)
+			may = get_ve0()->odirect_enable;
+	}
+
+	return may;
+}
 
 static int setfl(int fd, struct file * filp, unsigned long arg)
 {
 	struct inode * inode = filp->f_path.dentry->d_inode;
 	int error = 0;
+
+	if (!may_use_odirect())
+		arg &= ~O_DIRECT;
+	if (ve_fsync_behavior() == FSYNC_NEVER)
+		arg &= ~O_SYNC;
 
 	/*
 	 * O_APPEND cannot be cleared if the file is marked as append-only
@@ -172,10 +211,6 @@ static int setfl(int fd, struct file * filp, unsigned long arg)
 				return -EINVAL;
 	}
 
-	if (filp->f_op && filp->f_op->check_flags)
-		error = filp->f_op->check_flags(arg);
-	if (error)
-		return error;
 
 	/*
 	 * ->fasync() is responsible for setting the FASYNC bit.
@@ -188,10 +223,11 @@ static int setfl(int fd, struct file * filp, unsigned long arg)
 		if (error > 0)
 			error = 0;
 	}
-	spin_lock(&filp->f_lock);
-	filp->f_flags = (arg & SETFL_MASK) | (filp->f_flags & ~SETFL_MASK);
-	spin_unlock(&filp->f_lock);
 
+	if (filp->f_op && filp->f_op->set_flags)
+		error = filp->f_op->set_flags(filp, arg);
+	else
+		error = generic_set_file_flags(filp, arg);
  out:
 	return error;
 }
@@ -618,58 +654,88 @@ static DEFINE_RWLOCK(fasync_lock);
 static struct kmem_cache *fasync_cache __read_mostly;
 
 /*
- * fasync_helper() is used by almost all character device drivers
- * to set up the fasync queue. It returns negative on error, 0 if it did
- * no changes and positive if it added/deleted the entry.
+ * Remove a fasync entry. If successfully removed, return
+ * positive and clear the FASYNC flag. If no entry exists,
+ * do nothing and return 0.
+ *
+ * NOTE! It is very important that the FASYNC flag always
+ * match the state "is the filp on a fasync list".
+ *
+ * We always take the 'filp->f_lock', in since fasync_lock
+ * needs to be irq-safe.
  */
-int fasync_helper(int fd, struct file * filp, int on, struct fasync_struct **fapp)
+static int fasync_remove_entry(struct file *filp, struct fasync_struct **fapp)
 {
 	struct fasync_struct *fa, **fp;
-	struct fasync_struct *new = NULL;
 	int result = 0;
 
-	if (on) {
-		new = kmem_cache_alloc(fasync_cache, GFP_KERNEL);
-		if (!new)
-			return -ENOMEM;
-	}
-
-	/*
-	 * We need to take f_lock first since it's not an IRQ-safe
-	 * lock.
-	 */
 	spin_lock(&filp->f_lock);
 	write_lock_irq(&fasync_lock);
 	for (fp = fapp; (fa = *fp) != NULL; fp = &fa->fa_next) {
-		if (fa->fa_file == filp) {
-			if(on) {
-				fa->fa_fd = fd;
-				kmem_cache_free(fasync_cache, new);
-			} else {
-				*fp = fa->fa_next;
-				kmem_cache_free(fasync_cache, fa);
-				result = 1;
-			}
-			goto out;
-		}
-	}
-
-	if (on) {
-		new->magic = FASYNC_MAGIC;
-		new->fa_file = filp;
-		new->fa_fd = fd;
-		new->fa_next = *fapp;
-		*fapp = new;
-		result = 1;
-	}
-out:
-	if (on)
-		filp->f_flags |= FASYNC;
-	else
+		if (fa->fa_file != filp)
+			continue;
+		*fp = fa->fa_next;
+		kmem_cache_free(fasync_cache, fa);
 		filp->f_flags &= ~FASYNC;
+		result = 1;
+		break;
+	}
 	write_unlock_irq(&fasync_lock);
 	spin_unlock(&filp->f_lock);
 	return result;
+}
+
+/*
+ * Add a fasync entry. Return negative on error, positive if
+ * added, and zero if did nothing but change an existing one.
+ *
+ * NOTE! It is very important that the FASYNC flag always
+ * match the state "is the filp on a fasync list".
+ */
+static int fasync_add_entry(int fd, struct file *filp, struct fasync_struct **fapp)
+{
+	struct fasync_struct *new, *fa, **fp;
+	int result = 0;
+
+	new = kmem_cache_alloc(fasync_cache, GFP_KERNEL);
+	if (!new)
+		return -ENOMEM;
+
+	spin_lock(&filp->f_lock);
+	write_lock_irq(&fasync_lock);
+	for (fp = fapp; (fa = *fp) != NULL; fp = &fa->fa_next) {
+		if (fa->fa_file != filp)
+			continue;
+		fa->fa_fd = fd;
+		kmem_cache_free(fasync_cache, new);
+		goto out;
+	}
+
+	new->magic = FASYNC_MAGIC;
+	new->fa_file = filp;
+	new->fa_fd = fd;
+	new->fa_next = *fapp;
+	*fapp = new;
+	result = 1;
+	filp->f_flags |= FASYNC;
+
+out:
+	write_unlock_irq(&fasync_lock);
+	spin_unlock(&filp->f_lock);
+	return result;
+}
+
+/*
+ * fasync_helper() is used by almost all character device drivers
+ * to set up the fasync queue, and for regular files by the file
+ * lease code. It returns negative on error, 0 if it did no changes
+ * and positive if it added/deleted the entry.
+ */
+int fasync_helper(int fd, struct file * filp, int on, struct fasync_struct **fapp)
+{
+	if (!on)
+		return fasync_remove_entry(filp, fapp);
+	return fasync_add_entry(fd, filp, fapp);
 }
 
 EXPORT_SYMBOL(fasync_helper);
@@ -712,7 +778,7 @@ EXPORT_SYMBOL(kill_fasync);
 static int __init fasync_init(void)
 {
 	fasync_cache = kmem_cache_create("fasync_cache",
-		sizeof(struct fasync_struct), 0, SLAB_PANIC, NULL);
+		sizeof(struct fasync_struct), 0, SLAB_PANIC|SLAB_UBC, NULL);
 	return 0;
 }
 

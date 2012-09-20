@@ -172,6 +172,13 @@ __mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
 		struct thread_info *owner;
 
 		/*
+		 * If we own the BKL, then don't spin. The owner of the mutex
+		 * might be waiting on us to release the BKL.
+		 */
+		if (current->lock_depth >= 0)
+			break;
+
+		/*
 		 * If there's an owner, wait for it to either
 		 * release the lock or go to sleep.
 		 */
@@ -201,7 +208,7 @@ __mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
 		 * memory barriers as we'll eventually observe the right
 		 * values at the cost of a few extra spins.
 		 */
-		cpu_relax();
+		arch_mutex_cpu_relax();
 	}
 #endif
 	spin_lock_mutex(&lock->wait_lock, flags);
@@ -281,7 +288,7 @@ mutex_lock_nested(struct mutex *lock, unsigned int subclass)
 	__mutex_lock_common(lock, TASK_UNINTERRUPTIBLE, subclass, _RET_IP_);
 }
 
-EXPORT_SYMBOL_GPL(mutex_lock_nested);
+EXPORT_SYMBOL(mutex_lock_nested);
 
 int __sched
 mutex_lock_killable_nested(struct mutex *lock, unsigned int subclass)

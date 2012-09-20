@@ -779,7 +779,7 @@ static struct rt6_info *ip6_pol_route_input(struct net *net, struct fib6_table *
 	return ip6_pol_route(net, table, fl->iif, fl, flags);
 }
 
-void ip6_route_input(struct sk_buff *skb)
+void __ip6_route_input(struct sk_buff *skb, struct in6_addr *daddr)
 {
 	struct ipv6hdr *iph = ipv6_hdr(skb);
 	struct net *net = dev_net(skb->dev);
@@ -788,7 +788,7 @@ void ip6_route_input(struct sk_buff *skb)
 		.iif = skb->dev->ifindex,
 		.nl_u = {
 			.ip6_u = {
-				.daddr = iph->daddr,
+				.daddr = *daddr,
 				.saddr = iph->saddr,
 				.flowlabel = (* (__be32 *) iph)&IPV6_FLOWINFO_MASK,
 			},
@@ -797,10 +797,16 @@ void ip6_route_input(struct sk_buff *skb)
 		.proto = iph->nexthdr,
 	};
 
-	if (rt6_need_strict(&iph->daddr) && skb->dev->type != ARPHRD_PIMREG)
+	if (rt6_need_strict(daddr) && skb->dev->type != ARPHRD_PIMREG)
 		flags |= RT6_LOOKUP_F_IFACE;
 
 	skb_dst_set(skb, fib6_rule_lookup(net, &fl, flags, ip6_pol_route_input));
+}
+EXPORT_SYMBOL(__ip6_route_input);
+
+void ip6_route_input(struct sk_buff *skb)
+{
+	__ip6_route_input(skb, &ipv6_hdr(skb)->daddr);
 }
 
 static struct rt6_info *ip6_pol_route_output(struct net *net, struct fib6_table *table,
@@ -814,7 +820,7 @@ struct dst_entry * ip6_route_output(struct net *net, struct sock *sk,
 {
 	int flags = 0;
 
-	if (rt6_need_strict(&fl->fl6_dst))
+	if ((sk && sk->sk_bound_dev_if) || rt6_need_strict(&fl->fl6_dst))
 		flags |= RT6_LOOKUP_F_IFACE;
 
 	if (!ipv6_addr_any(&fl->fl6_src))
@@ -1174,6 +1180,8 @@ int ip6_route_add(struct fib6_config *cfg)
 
 	if (addr_type & IPV6_ADDR_MULTICAST)
 		rt->u.dst.input = ip6_mc_input;
+	else if (cfg->fc_flags & RTF_LOCAL)
+		rt->u.dst.input = ip6_input;
 	else
 		rt->u.dst.input = ip6_forward;
 
@@ -1195,7 +1203,8 @@ int ip6_route_add(struct fib6_config *cfg)
 	   they would result in kernel looping; promote them to reject routes
 	 */
 	if ((cfg->fc_flags & RTF_REJECT) ||
-	    (dev && (dev->flags&IFF_LOOPBACK) && !(addr_type&IPV6_ADDR_LOOPBACK))) {
+	    (dev && (dev->flags&IFF_LOOPBACK) && !(addr_type&IPV6_ADDR_LOOPBACK)
+					      && !(cfg->fc_flags&RTF_LOCAL))) {
 		/* hold loopback dev/idev if we haven't done so. */
 		if (dev != net->loopback_dev) {
 			if (dev) {
@@ -1567,10 +1576,14 @@ void rt6_pmtu_discovery(struct in6_addr *daddr, struct in6_addr *saddr,
 	struct rt6_info *rt, *nrt;
 	struct net *net = dev_net(dev);
 	int allfrag = 0;
-
+again:
 	rt = rt6_lookup(net, daddr, saddr, dev->ifindex, 0);
 	if (rt == NULL)
 		return;
+	if (rt6_check_expired(rt)) {
+		ip6_del_rt(rt);
+		goto again;
+	}
 
 	if (pmtu >= dst_mtu(&rt->u.dst))
 		goto out;
@@ -1833,7 +1846,7 @@ int ipv6_route_ioctl(struct net *net, unsigned int cmd, void __user *arg)
 	switch(cmd) {
 	case SIOCADDRT:		/* Add a route */
 	case SIOCDELRT:		/* Delete a route */
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_VE_NET_ADMIN))
 			return -EPERM;
 		err = copy_from_user(&rtmsg, arg,
 				     sizeof(struct in6_rtmsg));
@@ -2087,6 +2100,9 @@ static int rtm_to_fib6_config(struct sk_buff *skb, struct nlmsghdr *nlh,
 	if (rtm->rtm_type == RTN_UNREACHABLE)
 		cfg->fc_flags |= RTF_REJECT;
 
+	if (rtm->rtm_type == RTN_LOCAL)
+		cfg->fc_flags |= RTF_LOCAL;
+
 	cfg->fc_nlinfo.pid = NETLINK_CB(skb).pid;
 	cfg->fc_nlinfo.nlh = nlh;
 	cfg->fc_nlinfo.nl_net = sock_net(skb->sk);
@@ -2207,6 +2223,8 @@ static int rt6_fill_node(struct net *net,
 	NLA_PUT_U32(skb, RTA_TABLE, table);
 	if (rt->rt6i_flags&RTF_REJECT)
 		rtm->rtm_type = RTN_UNREACHABLE;
+	else if (rt->rt6i_flags&RTF_LOCAL)
+		rtm->rtm_type = RTN_LOCAL;
 	else if (rt->rt6i_dev && (rt->rt6i_dev->flags&IFF_LOOPBACK))
 		rtm->rtm_type = RTN_LOCAL;
 	else
@@ -2645,6 +2663,7 @@ struct ctl_table *ipv6_route_sysctl_init(struct net *net)
 		table[6].data = &net->ipv6.sysctl.ip6_rt_gc_elasticity;
 		table[7].data = &net->ipv6.sysctl.ip6_rt_mtu_expires;
 		table[8].data = &net->ipv6.sysctl.ip6_rt_min_advmss;
+		table[9].data = &net->ipv6.sysctl.ip6_rt_gc_min_interval;
 	}
 
 	return table;
@@ -2739,6 +2758,26 @@ static struct notifier_block ip6_route_dev_notifier = {
 	.priority = 0,
 };
 
+static void ip6_rt_dump_dst(void *o)
+{
+	struct rt6_info *r = (struct rt6_info *)o;
+
+	if (r->u.dst.flags & DST_FREE)
+		return;
+
+	printk("=== %p\n", o);
+	dst_dump_one(&r->u.dst);
+	printk("\tidev %p flags %x ref %d prot %d\n",
+			r->rt6i_dev, r->rt6i_flags, atomic_read(&r->rt6i_ref),
+			(int)r->rt6i_protocol);
+}
+
+static void _ip6_rt_dump_dsts(void)
+{
+	printk("IPv6 dst cache:\n");
+	slab_obj_walk(ip6_dst_ops_template.kmem_cachep, ip6_rt_dump_dst);
+}
+
 int __init ip6_route_init(void)
 {
 	int ret;
@@ -2789,6 +2828,7 @@ int __init ip6_route_init(void)
 	if (ret)
 		goto fib6_rules_init;
 
+	ip6_rt_dump_dsts = _ip6_rt_dump_dsts;
 out:
 	return ret;
 

@@ -39,6 +39,7 @@ struct route_info {
 
 
 extern void			ip6_route_input(struct sk_buff *skb);
+extern void			__ip6_route_input(struct sk_buff *skb, struct in6_addr *daddr);
 
 extern struct dst_entry *	ip6_route_output(struct net *net,
 						 struct sock *sk,
@@ -145,6 +146,16 @@ static inline int ipv6_unicast_destination(struct sk_buff *skb)
 	struct rt6_info *rt = (struct rt6_info *) skb_dst(skb);
 
 	return rt->rt6i_flags & RTF_LOCAL;
+}
+
+int ip6_fragment(struct sk_buff *skb, int (*output)(struct sk_buff *));
+
+static inline int ip6_skb_dst_mtu(struct sk_buff *skb)
+{
+	struct ipv6_pinfo *np = skb->sk ? inet6_sk(skb->sk) : NULL;
+
+	return (np && np->pmtudisc == IPV6_PMTUDISC_PROBE) ?
+	       skb_dst(skb)->dev->mtu : dst_mtu(skb_dst(skb));
 }
 
 #endif

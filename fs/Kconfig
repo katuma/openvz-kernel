@@ -63,6 +63,14 @@ source "fs/autofs/Kconfig"
 source "fs/autofs4/Kconfig"
 source "fs/fuse/Kconfig"
 
+config SIM_FS
+	tristate "VPS filesystem"
+	default m
+	help
+	  This file system is a part of Virtuozzo. It intoduces a fake
+	  superblock and blockdev to VE to hide real device and show
+	  statfs results taken from quota.
+
 config CUSE
 	tristate "Character device in Userpace support"
 	depends on FUSE_FS
@@ -81,6 +89,10 @@ menu "Caches"
 
 source "fs/fscache/Kconfig"
 source "fs/cachefiles/Kconfig"
+
+config PRAMCACHE
+	bool "Persistent FS cache"
+	depends on PRAM
 
 endmenu
 
@@ -120,6 +132,10 @@ config TMPFS
 
 	  See <file:Documentation/filesystems/tmpfs.txt> for details.
 
+config PRAMFS
+	bool "Persistent in-memory file system"
+	depends on PRAM
+
 config TMPFS_POSIX_ACL
 	bool "Tmpfs POSIX Access Control Lists"
 	depends on TMPFS
@@ -145,7 +161,7 @@ config HUGETLBFS
 	  If unsure, say N.
 
 config HUGETLB_PAGE
-	def_bool HUGETLBFS
+	def_bool HUGETLBFS || TRANSPARENT_HUGEPAGE
 
 source "fs/configfs/Kconfig"
 
@@ -185,6 +201,7 @@ source "fs/omfs/Kconfig"
 source "fs/hpfs/Kconfig"
 source "fs/qnx4/Kconfig"
 source "fs/romfs/Kconfig"
+source "fs/pstore/Kconfig"
 source "fs/sysv/Kconfig"
 source "fs/ufs/Kconfig"
 source "fs/exofs/Kconfig"
@@ -221,7 +238,7 @@ config LOCKD_V4
 	default y
 
 config EXPORTFS
-	tristate
+	bool
 
 config NFS_ACL_SUPPORT
 	tristate

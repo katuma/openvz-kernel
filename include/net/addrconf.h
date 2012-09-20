@@ -121,6 +121,7 @@ static inline int addrconf_finite_timeout(unsigned long timeout)
  *	IPv6 Address Label subsystem (addrlabel.c)
  */
 extern int			ipv6_addr_label_init(void);
+extern void			ipv6_addr_label_cleanup(void);
 extern void			ipv6_addr_label_rtnl_register(void);
 extern u32			ipv6_addr_label(struct net *net,
 						const struct in6_addr *addr,
@@ -261,6 +262,10 @@ static inline int ipv6_addr_is_isatap(const struct in6_addr *addr)
 extern int if6_proc_init(void);
 extern void if6_proc_exit(void);
 #endif
+
+int inet6_addr_add(struct net *net, int ifindex, struct in6_addr *pfx,
+		unsigned int plen, __u8 ifa_flags, __u32 prefered_lft,
+		__u32 valid_lft);
 
 #endif
 #endif

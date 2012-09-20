@@ -68,6 +68,17 @@ struct tty_buffer {
 	unsigned long data[0];
 };
 
+/*
+ * We default to dicing tty buffer allocations to this many characters
+ * in order to avoid multiple page allocations. We know the size of
+ * tty_buffer itself but it must also be taken into account that the
+ * the buffer is 256 byte aligned. See tty_buffer_find for the allocation
+ * logic this must match
+ */
+
+#define TTY_BUFFER_PAGE	(((PAGE_SIZE - sizeof(struct tty_buffer)) / 2) & ~0xFF)
+
+
 struct tty_bufhead {
 	struct delayed_work work;
 	spinlock_t lock;
@@ -302,6 +313,14 @@ struct tty_struct {
 	/* If the tty has a pending do_SAK, queue it here - akpm */
 	struct work_struct SAK_work;
 	struct tty_port *port;
+	struct ve_struct *owner_env;
+};
+
+/* Each of a tty's open files has private_data pointing to tty_file_private */
+struct tty_file_private {
+	struct tty_struct *tty;
+	struct file *file;
+	struct list_head list;
 };
 
 /* tty magic number */
@@ -333,6 +352,9 @@ struct tty_struct {
 #define TTY_HUPPED 		18	/* Post driver->hangup() */
 #define TTY_FLUSHING		19	/* Flushing to ldisc in progress */
 #define TTY_FLUSHPENDING	20	/* Queued buffer flush pending */
+#define TTY_CHARGED		21	/* Charged as ub resource */
+#define TTY_EXTRA_REFERENCE	22	/* plus one to ->count */
+#define TTY_HUPPING		23	/* ->hangup() in progress */
 
 #define TTY_WRITE_FLUSH(tty) tty_write_flush((tty))
 
@@ -434,11 +456,12 @@ extern void proc_clear_tty(struct task_struct *p);
 extern struct tty_struct *get_current_tty(void);
 extern void tty_default_fops(struct file_operations *fops);
 extern struct tty_struct *alloc_tty_struct(void);
+extern void tty_add_file(struct tty_struct *tty, struct file *file);
 extern void free_tty_struct(struct tty_struct *tty);
 extern void initialize_tty_struct(struct tty_struct *tty,
 		struct tty_driver *driver, int idx);
 extern struct tty_struct *tty_init_dev(struct tty_driver *driver, int idx,
-								int first_ok);
+		struct tty_struct *i_tty, int first_ok);
 extern void tty_release_dev(struct file *filp);
 extern int tty_init_termios(struct tty_struct *tty);
 
@@ -446,6 +469,7 @@ extern struct tty_struct *tty_pair_get_tty(struct tty_struct *tty);
 extern struct tty_struct *tty_pair_get_pty(struct tty_struct *tty);
 
 extern struct mutex tty_mutex;
+extern spinlock_t tty_files_lock;
 
 extern void tty_write_unlock(struct tty_struct *tty);
 extern int tty_write_lock(struct tty_struct *tty, int ndelay);
@@ -538,6 +562,11 @@ extern int vt_ioctl(struct tty_struct *tty, struct file *file,
 
 extern long vt_compat_ioctl(struct tty_struct *tty, struct file * file,
 		     unsigned int cmd, unsigned long arg);
+
+static inline struct tty_struct *file_tty(struct file *file)
+{
+	return ((struct tty_file_private *)file->private_data)->tty;
+}
 
 #endif /* __KERNEL__ */
 #endif

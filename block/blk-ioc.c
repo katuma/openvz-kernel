@@ -43,7 +43,9 @@ int put_io_context(struct io_context *ioc)
 			ioc->aic->dtor(ioc->aic);
 		cfq_dtor(ioc);
 		rcu_read_unlock();
-
+#ifdef CONFIG_BEANCOUNTERS
+		put_beancounter(ioc->ioc_ub);
+#endif
 		kmem_cache_free(iocontext_cachep, ioc);
 		return 1;
 	}
@@ -66,23 +68,29 @@ static void cfq_exit(struct io_context *ioc)
 }
 
 /* Called by the exitting task */
-void exit_io_context(void)
+void exit_io_context(struct task_struct *task)
 {
 	struct io_context *ioc;
 
-	task_lock(current);
-	ioc = current->io_context;
-	current->io_context = NULL;
-	task_unlock(current);
+	task_lock(task);
+	ioc = task->io_context;
+	task->io_context = NULL;
+	task_unlock(task);
 
+	ioc_task_unlink(ioc);
+}
+
+void ioc_task_unlink(struct io_context *ioc)
+{
 	if (atomic_dec_and_test(&ioc->nr_tasks)) {
 		if (ioc->aic && ioc->aic->exit)
 			ioc->aic->exit(ioc->aic);
 		cfq_exit(ioc);
 
-		put_io_context(ioc);
 	}
+	put_io_context(ioc);
 }
+EXPORT_SYMBOL(ioc_task_unlink);
 
 struct io_context *alloc_io_context(gfp_t gfp_flags, int node)
 {
@@ -101,6 +109,12 @@ struct io_context *alloc_io_context(gfp_t gfp_flags, int node)
 		INIT_RADIX_TREE(&ret->radix_root, GFP_ATOMIC | __GFP_HIGH);
 		INIT_HLIST_HEAD(&ret->cic_list);
 		ret->ioc_data = NULL;
+#if defined(CONFIG_BLK_CGROUP) || defined(CONFIG_BLK_CGROUP_MODULE)
+		ret->cgroup_changed = 0;
+#endif
+#ifdef CONFIG_BEANCOUNTERS
+		ret->ioc_ub = get_beancounter(get_exec_ub());
+#endif
 	}
 
 	return ret;
@@ -132,6 +146,7 @@ struct io_context *current_io_context(gfp_t gfp_flags, int node)
 
 	return ret;
 }
+EXPORT_SYMBOL(current_io_context);
 
 /*
  * If the current task has no IO context then create one and initialise it.

@@ -154,6 +154,9 @@ static inline void exit_sem(struct task_struct *tsk)
 }
 #endif
 
+int sysvipc_walk_sem(int (*func)(int, struct sem_array*, void *), void *arg);
+int sysvipc_setup_sem(key_t key, int semid, size_t size, int semflg);
+
 #endif /* __KERNEL__ */
 
 #endif /* _LINUX_SEM_H */

@@ -19,6 +19,7 @@
 #include <linux/rtc.h>
 #include <linux/ioport.h>
 #include <linux/pfn.h>
+#include <linux/pstore.h>
 
 #include <asm/page.h>
 #include <asm/system.h>
@@ -168,7 +169,7 @@ typedef efi_status_t efi_get_variable_t (efi_char16_t *name, efi_guid_t *vendor,
 typedef efi_status_t efi_get_next_variable_t (unsigned long *name_size, efi_char16_t *name,
 					      efi_guid_t *vendor);
 typedef efi_status_t efi_set_variable_t (efi_char16_t *name, efi_guid_t *vendor, 
-					 unsigned long attr, unsigned long data_size, 
+					 u32 attr, unsigned long data_size,
 					 void *data);
 typedef efi_status_t efi_get_next_high_mono_count_t (u32 *count);
 typedef void efi_reset_system_t (int reset_type, efi_status_t status,
@@ -210,6 +211,9 @@ typedef efi_status_t efi_set_virtual_address_map_t (unsigned long memory_map_siz
 
 #define UV_SYSTEM_TABLE_GUID \
     EFI_GUID(  0x3b13a7d4, 0x633e, 0x11dd, 0x93, 0xec, 0xda, 0x25, 0x56, 0xd8, 0x95, 0x93 )
+
+#define LINUX_EFI_CRASH_GUID \
+    EFI_GUID(  0xcfc8fc79, 0xbe2e, 0x4ddc, 0x97, 0xf0, 0x9f, 0x98, 0xbf, 0xe2, 0x98, 0xa0 )
 
 typedef struct {
 	efi_guid_t guid;
@@ -294,6 +298,7 @@ extern void efi_map_pal_code (void);
 extern void efi_memmap_walk (efi_freemem_callback_t callback, void *arg);
 extern void efi_gettimeofday (struct timespec *ts);
 extern void efi_enter_virtual_mode (void);	/* switch EFI to virtual mode, if possible */
+extern void efi_setup_physical_mode(void);
 extern u64 efi_get_iobase (void);
 extern u32 efi_mem_type (unsigned long phys_addr);
 extern u64 efi_mem_attributes (unsigned long phys_addr);
@@ -303,6 +308,7 @@ extern void efi_initialize_iomem_resources(struct resource *code_resource,
 		struct resource *data_resource, struct resource *bss_resource);
 extern unsigned long efi_get_time(void);
 extern int efi_set_rtc_mmss(unsigned long nowtime);
+extern void efi_reserve_boot_services(void);
 extern struct efi_memory_map memmap;
 
 /**
@@ -400,5 +406,44 @@ static inline void memrange_efi_to_native(u64 *addr, u64 *npages)
 	*npages = PFN_UP(*addr + (*npages<<EFI_PAGE_SHIFT)) - PFN_DOWN(*addr);
 	*addr &= PAGE_MASK;
 }
+
+#if defined(CONFIG_EFI_VARS) || defined(CONFIG_EFI_VARS_MODULE)
+/*
+ * EFI Variable support.
+ *
+ * Different firmware drivers can expose their EFI-like variables using
+ * the following.
+ */
+
+struct efivar_operations {
+	efi_get_variable_t *get_variable;
+	efi_get_next_variable_t *get_next_variable;
+	efi_set_variable_t *set_variable;
+};
+
+struct efivars {
+	/*
+	 * ->lock protects two things:
+	 * 1) ->list - adds, removals, reads, writes
+	 * 2) ops.[gs]et_variable() calls.
+	 * It must not be held when creating sysfs entries or calling kmalloc.
+	 * ops.get_next_variable() is only called from register_efivars(),
+	 * which is protected by the BKL, so that path is safe.
+	 */
+	spinlock_t lock;
+	struct list_head list;
+	struct kset *kset;
+	struct bin_attribute *new_var, *del_var;
+	const struct efivar_operations *ops;
+	struct efivar_entry *walk_entry;
+	struct pstore_info efi_pstore_info;
+};
+
+int register_efivars(struct efivars *efivars,
+		     const struct efivar_operations *ops,
+		     struct kobject *parent_kobj);
+void unregister_efivars(struct efivars *efivars);
+
+#endif /* CONFIG_EFI_VARS */
 
 #endif /* _LINUX_EFI_H */

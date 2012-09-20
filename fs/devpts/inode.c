@@ -38,7 +38,11 @@
 extern int pty_limit;			/* Config limit on Unix98 ptys */
 static DEFINE_MUTEX(allocated_ptys_lock);
 
+#ifndef CONFIG_VE
 static struct vfsmount *devpts_mnt;
+#else
+# define devpts_mnt	(get_exec_env()->devpts_mnt)
+#endif
 
 struct pts_mount_opts {
 	int setuid;
@@ -421,11 +425,13 @@ static void devpts_kill_sb(struct super_block *sb)
 	kill_litter_super(sb);
 }
 
-static struct file_system_type devpts_fs_type = {
+struct file_system_type devpts_fs_type = {
 	.name		= "devpts",
 	.get_sb		= devpts_get_sb,
 	.kill_sb	= devpts_kill_sb,
+	.fs_flags	= FS_VIRTUALIZED,
 };
+EXPORT_SYMBOL(devpts_fs_type);
 
 /*
  * The normal naming convention is simply /dev/pts/<number>; this conforms
@@ -517,11 +523,23 @@ int devpts_pty_new(struct inode *ptmx_inode, struct tty_struct *tty)
 
 struct tty_struct *devpts_get_tty(struct inode *pts_inode, int number)
 {
+	struct dentry *dentry;
+	struct tty_struct *tty;
+
 	BUG_ON(pts_inode->i_rdev == MKDEV(TTYAUX_MAJOR, PTMX_MINOR));
 
+	/* Ensure dentry has not been deleted by devpts_pty_kill() */
+	dentry = d_find_alias(pts_inode);
+	if (!dentry)
+		return NULL;
+
+	tty = NULL;
 	if (pts_inode->i_sb->s_magic == DEVPTS_SUPER_MAGIC)
-		return (struct tty_struct *)pts_inode->i_private;
-	return NULL;
+		tty = (struct tty_struct *)pts_inode->i_private;
+
+	dput(dentry);
+
+	return tty;
 }
 
 void devpts_pty_kill(struct tty_struct *tty)

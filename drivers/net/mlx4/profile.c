@@ -83,7 +83,7 @@ u64 mlx4_make_profile(struct mlx4_dev *dev,
 	struct mlx4_resource tmp;
 	int i, j;
 
-	profile = kzalloc(MLX4_RES_NUM * sizeof *profile, GFP_KERNEL);
+	profile = kcalloc(MLX4_RES_NUM, sizeof(*profile), GFP_KERNEL);
 	if (!profile)
 		return -ENOMEM;
 
@@ -96,8 +96,8 @@ u64 mlx4_make_profile(struct mlx4_dev *dev,
 	profile[MLX4_RES_EQ].size     = dev_cap->eqc_entry_sz;
 	profile[MLX4_RES_DMPT].size   = dev_cap->dmpt_entry_sz;
 	profile[MLX4_RES_CMPT].size   = dev_cap->cmpt_entry_sz;
-	profile[MLX4_RES_MTT].size    = dev->caps.mtts_per_seg * dev_cap->mtt_entry_sz;
-	profile[MLX4_RES_MCG].size    = MLX4_MGM_ENTRY_SIZE;
+	profile[MLX4_RES_MTT].size    = dev_cap->mtt_entry_sz;
+	profile[MLX4_RES_MCG].size    = mlx4_get_mgm_entry_size(dev);
 
 	profile[MLX4_RES_QP].num      = request->num_qp;
 	profile[MLX4_RES_RDMARC].num  = request->num_qp * request->rdmarc_per_qp;
@@ -105,12 +105,10 @@ u64 mlx4_make_profile(struct mlx4_dev *dev,
 	profile[MLX4_RES_AUXC].num    = request->num_qp;
 	profile[MLX4_RES_SRQ].num     = request->num_srq;
 	profile[MLX4_RES_CQ].num      = request->num_cq;
-	profile[MLX4_RES_EQ].num      = min_t(unsigned, dev_cap->max_eqs,
-					      dev_cap->reserved_eqs +
-					      num_possible_cpus() + 1);
+	profile[MLX4_RES_EQ].num      = min_t(unsigned, dev_cap->max_eqs, MAX_MSIX);
 	profile[MLX4_RES_DMPT].num    = request->num_mpt;
 	profile[MLX4_RES_CMPT].num    = MLX4_NUM_CMPTS;
-	profile[MLX4_RES_MTT].num     = request->num_mtt;
+	profile[MLX4_RES_MTT].num     = request->num_mtt * (1 << log_mtts_per_seg);
 	profile[MLX4_RES_MCG].num     = request->num_mcg;
 
 	for (i = 0; i < MLX4_RES_NUM; ++i) {
@@ -210,7 +208,7 @@ u64 mlx4_make_profile(struct mlx4_dev *dev,
 			init_hca->cmpt_base	 = profile[i].start;
 			break;
 		case MLX4_RES_MTT:
-			dev->caps.num_mtt_segs	 = profile[i].num;
+			dev->caps.num_mtts	 = profile[i].num;
 			priv->mr_table.mtt_base	 = profile[i].start;
 			init_hca->mtt_base	 = profile[i].start;
 			break;
@@ -218,7 +216,8 @@ u64 mlx4_make_profile(struct mlx4_dev *dev,
 			dev->caps.num_mgms	  = profile[i].num >> 1;
 			dev->caps.num_amgms	  = profile[i].num >> 1;
 			init_hca->mc_base	  = profile[i].start;
-			init_hca->log_mc_entry_sz = ilog2(MLX4_MGM_ENTRY_SIZE);
+			init_hca->log_mc_entry_sz =
+					ilog2(mlx4_get_mgm_entry_size(dev));
 			init_hca->log_mc_table_sz = profile[i].log_num;
 			init_hca->log_mc_hash_sz  = profile[i].log_num - 1;
 			break;

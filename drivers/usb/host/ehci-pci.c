@@ -103,6 +103,19 @@ static int ehci_pci_setup(struct usb_hcd *hcd)
 	if (retval)
 		return retval;
 
+	if ((pdev->vendor == PCI_VENDOR_ID_AMD && pdev->device == 0x7808) ||
+	    (pdev->vendor == PCI_VENDOR_ID_ATI && pdev->device == 0x4396)) {
+		/* EHCI controller on AMD SB700/SB800/Hudson-2/3 platforms may
+		 * read/write memory space which does not belong to it when
+		 * there is NULL pointer with T-bit set to 1 in the frame list
+		 * table. To avoid the issue, the frame list link pointer
+		 * should always contain a valid pointer to a inactive qh.
+		 */
+		ehci->use_dummy_qh = 1;
+		ehci_info(ehci, "applying AMD SB700/SB800/Hudson-2/3 EHCI "
+				"dummy qh workaround\n");
+	}
+
 	/* data structure init */
 	retval = ehci_init(hcd);
 	if (retval)
@@ -115,6 +128,11 @@ static int ehci_pci_setup(struct usb_hcd *hcd)
 			ehci->broken_periodic = 1;
 			ehci_info(ehci, "using broken periodic workaround\n");
 		}
+		if (pdev->device == 0x0806 || pdev->device == 0x0811
+				|| pdev->device == 0x0829) {
+			ehci_info(ehci, "disable lpm for langwell/penwell\n");
+			ehci->has_lpm = 0;
+		}
 		break;
 	case PCI_VENDOR_ID_TDI:
 		if (pdev->device == PCI_DEVICE_ID_TDI_EHCI) {
@@ -123,6 +141,9 @@ static int ehci_pci_setup(struct usb_hcd *hcd)
 		}
 		break;
 	case PCI_VENDOR_ID_AMD:
+		/* AMD PLL quirk */
+		if (usb_amd_find_chipset_info())
+			ehci->amd_pll_fix = 1;
 		/* AMD8111 EHCI doesn't work, according to AMD errata */
 		if (pdev->device == 0x7463) {
 			ehci_info(ehci, "ignoring AMD8111 (errata)\n");
@@ -138,6 +159,18 @@ static int ehci_pci_setup(struct usb_hcd *hcd)
 		case 0x0068:
 			if (pdev->revision < 0xa4)
 				ehci->no_selective_suspend = 1;
+			break;
+
+		/* MCP89 chips on the MacBookAir3,1 give EPROTO when
+		 * fetching device descriptors unless LPM is disabled.
+		 * There are also intermittent problems enumerating
+		 * devices with PPCD enabled.
+		 */
+		case 0x0d9d:
+			ehci_info(ehci, "disable lpm/ppcd for nvidia mcp89");
+			ehci->has_lpm = 0;
+			ehci->has_ppcd = 0;
+			ehci->command &= ~CMD_PPCEE;
 			break;
 		}
 		break;
@@ -156,6 +189,9 @@ static int ehci_pci_setup(struct usb_hcd *hcd)
 		}
 		break;
 	case PCI_VENDOR_ID_ATI:
+		/* AMD PLL quirk */
+		if (usb_amd_find_chipset_info())
+			ehci->amd_pll_fix = 1;
 		/* SB600 and old version of SB700 have a bug in EHCI controller,
 		 * which causes usb devices lose response in some cases.
 		 */
@@ -309,10 +345,49 @@ static int ehci_pci_suspend(struct usb_hcd *hcd)
 	return rc;
 }
 
+static bool usb_is_intel_switchable_ehci(struct pci_dev *pdev)
+{
+	return pdev->class == PCI_CLASS_SERIAL_USB_EHCI &&
+		pdev->vendor == PCI_VENDOR_ID_INTEL &&
+		pdev->device == 0x1E26;
+}
+
+static void ehci_enable_xhci_companion(void)
+{
+	struct pci_dev		*companion = NULL;
+
+	/* The xHCI and EHCI controllers are not on the same PCI slot */
+	for_each_pci_dev(companion) {
+		if (!usb_is_intel_switchable_xhci(companion))
+			continue;
+		usb_enable_xhci_ports(companion);
+		return;
+	}
+}
+
 static int ehci_pci_resume(struct usb_hcd *hcd, bool hibernated)
 {
 	struct ehci_hcd		*ehci = hcd_to_ehci(hcd);
 	struct pci_dev		*pdev = to_pci_dev(hcd->self.controller);
+
+	/* The BIOS on systems with the Intel Panther Point chipset may or may
+	 * not support xHCI natively.  That means that during system resume, it
+	 * may switch the ports back to EHCI so that users can use their
+	 * keyboard to select a kernel from GRUB after resume from hibernate.
+	 *
+	 * The BIOS is supposed to remember whether the OS had xHCI ports
+	 * enabled before resume, and switch the ports back to xHCI when the
+	 * BIOS/OS semaphore is written, but we all know we can't trust BIOS
+	 * writers.
+	 *
+	 * Unconditionally switch the ports back to xHCI after a system resume.
+	 * We can't tell whether the EHCI or xHCI controller will be resumed
+	 * first, so we have to do the port switchover in both drivers.  Writing
+	 * a '1' to the port switchover registers should have no effect if the
+	 * port was already switched over.
+	 */
+	if (usb_is_intel_switchable_ehci(pdev))
+		ehci_enable_xhci_companion();
 
 	// maybe restore FLADJ
 
@@ -365,6 +440,22 @@ static int ehci_pci_resume(struct usb_hcd *hcd, bool hibernated)
 }
 #endif
 
+static int ehci_update_device(struct usb_hcd *hcd, struct usb_device *udev)
+{
+	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
+	int rc = 0;
+
+	if (!udev->parent) /* udev is root hub itself, impossible */
+		rc = -1;
+	/* we only support lpm device connected to root hub yet */
+	if (ehci->has_lpm && !udev->parent->parent) {
+		rc = ehci_lpm_set_da(ehci, udev->devnum, udev->portnum);
+		if (!rc)
+			rc = ehci_lpm_check(ehci, udev->portnum);
+	}
+	return rc;
+}
+
 static const struct hc_driver ehci_pci_hc_driver = {
 	.description =		hcd_name,
 	.product_desc =		"EHCI Host Controller",
@@ -410,6 +501,11 @@ static const struct hc_driver ehci_pci_hc_driver = {
 	.bus_resume =		ehci_bus_resume,
 	.relinquish_port =	ehci_relinquish_port,
 	.port_handed_over =	ehci_port_handed_over,
+
+	/*
+	 * call back when device connected and addressed
+	 */
+	.update_device =	ehci_update_device,
 
 	.clear_tt_buffer_complete	= ehci_clear_tt_buffer_complete,
 };

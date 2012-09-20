@@ -45,6 +45,7 @@ static void send_reset(struct net *net, struct sk_buff *oldskb)
 	struct ipv6hdr *ip6h;
 	struct dst_entry *dst = NULL;
 	u8 proto;
+	__be16 frag_off;
 	struct flowi fl;
 
 	if ((!(ipv6_addr_type(&oip6h->saddr) & IPV6_ADDR_UNICAST)) ||
@@ -54,7 +55,7 @@ static void send_reset(struct net *net, struct sk_buff *oldskb)
 	}
 
 	proto = oip6h->nexthdr;
-	tcphoff = ipv6_skip_exthdr(oldskb, ((u8*)(oip6h+1) - oldskb->data), &proto);
+	tcphoff = __ipv6_skip_exthdr(oldskb, ((u8*)(oip6h+1) - oldskb->data), &proto, &frag_off);
 
 	if ((tcphoff < 0) || (tcphoff > oldskb->len)) {
 		pr_debug("ip6t_REJECT: Can't get TCP header.\n");

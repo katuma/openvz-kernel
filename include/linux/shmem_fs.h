@@ -3,6 +3,7 @@
 
 #include <linux/swap.h>
 #include <linux/mempolicy.h>
+#include <linux/percpu_counter.h>
 
 /* inode in-kernel data */
 
@@ -19,11 +20,14 @@ struct shmem_inode_info {
 	swp_entry_t		i_direct[SHMEM_NR_DIRECT]; /* first blocks */
 	struct list_head	swaplist;	/* chain of maybes on swap */
 	struct inode		vfs_inode;
+#ifdef CONFIG_BEANCOUNTERS
+	struct user_beancounter	*shmi_ub;
+#endif
 };
 
 struct shmem_sb_info {
 	unsigned long max_blocks;   /* How many blocks are allowed */
-	unsigned long free_blocks;  /* How many are left for allocation */
+	struct percpu_counter used_blocks;  /* How many are allocated */
 	unsigned long max_inodes;   /* How many inodes are allowed */
 	unsigned long free_inodes;  /* How many are left for allocation */
 	spinlock_t stat_lock;	    /* Serialize shmem_sb_info changes */
@@ -56,5 +60,11 @@ static inline int shmem_acl_init(struct inode *inode, struct inode *dir)
 	return 0;
 }
 #endif  /* CONFIG_TMPFS_POSIX_ACL */
+
+int shmem_insertpage(struct inode * inode, unsigned long index,
+		     swp_entry_t swap);
+int install_shmem_page(struct vm_area_struct *vma,
+		       unsigned long addr, struct page *page);
+int is_shmem_vma(struct vm_area_struct *vma);
 
 #endif

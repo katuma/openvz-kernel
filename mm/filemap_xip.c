@@ -19,6 +19,7 @@
 #include <linux/mutex.h>
 #include <asm/tlbflush.h>
 #include <asm/io.h>
+#include <bc/vmpages.h>
 
 /*
  * We do use our own empty page to avoid interference with other users
@@ -262,7 +263,10 @@ found:
 							xip_pfn);
 		if (err == -ENOMEM)
 			return VM_FAULT_OOM;
-		BUG_ON(err);
+		/* err == -EBUSY is fine, we've raced against another thread
+		   that faulted-in the same page */
+		if (err != -EBUSY)
+			BUG_ON(err);
 		return VM_FAULT_NOPAGE;
 	} else {
 		int err, ret = VM_FAULT_OOM;

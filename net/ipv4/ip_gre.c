@@ -50,6 +50,9 @@
 #include <net/ip6_route.h>
 #endif
 
+#include <linux/cpt_image.h>
+#include <linux/cpt_export.h>
+
 /*
    Problems & solutions
    --------------------
@@ -979,7 +982,7 @@ ipgre_tunnel_ioctl (struct net_device *dev, struct ifreq *ifr, int cmd)
 	case SIOCADDTUNNEL:
 	case SIOCCHGTUNNEL:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 			goto done;
 
 		err = -EFAULT;
@@ -1053,7 +1056,7 @@ ipgre_tunnel_ioctl (struct net_device *dev, struct ifreq *ifr, int cmd)
 
 	case SIOCDELTUNNEL:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 			goto done;
 
 		if (dev == ign->fb_tunnel_dev) {
@@ -1202,6 +1205,8 @@ static int ipgre_close(struct net_device *dev)
 
 #endif
 
+static void ipgre_cpt(struct net_device *dev,
+		struct cpt_ops *ops, struct cpt_context *ctx);
 static const struct net_device_ops ipgre_netdev_ops = {
 	.ndo_init		= ipgre_tunnel_init,
 	.ndo_uninit		= ipgre_tunnel_uninit,
@@ -1212,6 +1217,7 @@ static const struct net_device_ops ipgre_netdev_ops = {
 	.ndo_start_xmit		= ipgre_tunnel_xmit,
 	.ndo_do_ioctl		= ipgre_tunnel_ioctl,
 	.ndo_change_mtu		= ipgre_tunnel_change_mtu,
+	.ndo_cpt		= ipgre_cpt,
 };
 
 static void ipgre_tunnel_setup(struct net_device *dev)
@@ -1283,33 +1289,133 @@ static const struct net_protocol ipgre_protocol = {
 	.netns_ok	=	1,
 };
 
-static void ipgre_destroy_tunnels(struct ipgre_net *ign)
+static void ipgre_destroy_tunnels(struct ipgre_net *ign, struct list_head *head)
 {
 	int prio;
 
 	for (prio = 0; prio < 4; prio++) {
 		int h;
 		for (h = 0; h < HASH_SIZE; h++) {
-			struct ip_tunnel *t;
-			while ((t = ign->tunnels[prio][h]) != NULL)
-				unregister_netdevice(t->dev);
+			struct ip_tunnel *t = ign->tunnels[prio][h];
+
+			while (t != NULL) {
+				unregister_netdevice_queue(t->dev, head);
+				t = t->next;
+			}
 		}
 	}
 }
 
-static int ipgre_init_net(struct net *net)
+static void ipgre_cpt(struct net_device *dev,
+		struct cpt_ops *ops, struct cpt_context *ctx)
 {
-	int err;
+	struct cpt_tunnel_image v;
+	struct ip_tunnel *t;
 	struct ipgre_net *ign;
 
-	err = -ENOMEM;
-	ign = kzalloc(sizeof(struct ipgre_net), GFP_KERNEL);
-	if (ign == NULL)
-		goto err_alloc;
+	t = netdev_priv(dev);
+	ign = net_generic(get_exec_env()->ve_netns, ipgre_net_id);
+	BUG_ON(ign == NULL);
 
-	err = net_assign_generic(net, ipgre_net_id, ign);
-	if (err < 0)
-		goto err_assign;
+	v.cpt_next = CPT_NULL;
+	v.cpt_object = CPT_OBJ_NET_IPIP_TUNNEL;
+	v.cpt_hdrlen = sizeof(v);
+	v.cpt_content = CPT_CONTENT_VOID;
+
+	/* mark fb dev */
+	v.cpt_tnl_flags = CPT_TUNNEL_GRE;
+	if (dev == ign->fb_tunnel_dev)
+		v.cpt_tnl_flags |= CPT_TUNNEL_FBDEV;
+
+	v.cpt_i_flags = t->parms.i_flags;
+	v.cpt_o_flags = t->parms.o_flags;
+	v.cpt_i_key = t->parms.i_key;
+	v.cpt_o_key = t->parms.o_key;
+	v.cpt_i_seqno = t->i_seqno;
+	v.cpt_o_seqno = t->o_seqno;
+
+	BUILD_BUG_ON(sizeof(v.cpt_iphdr) != sizeof(t->parms.iph));
+	memcpy(&v.cpt_iphdr, &t->parms.iph, sizeof(t->parms.iph));
+
+	ops->write(&v, sizeof(v), ctx);
+}
+
+static int ipgre_rst(loff_t start, struct cpt_netdev_image *di,
+		struct rst_ops *ops, struct cpt_context *ctx)
+{
+	int err = -ENODEV;
+	struct cpt_tunnel_image v;
+	struct net_device *dev;
+	struct ip_tunnel *t;
+	loff_t pos;
+	int fbdev;
+	struct ipgre_net *ign;
+
+	ign = net_generic(get_exec_env()->ve_netns, ipgre_net_id);
+	if (ign == NULL)
+		return -EOPNOTSUPP;
+
+	pos = start + di->cpt_hdrlen;
+	err = ops->get_object(CPT_OBJ_NET_IPIP_TUNNEL,
+			pos, &v, sizeof(v), ctx);
+	if (err)
+		return err;
+
+	/* some sanity */
+	if (v.cpt_content != CPT_CONTENT_VOID)
+		return -EINVAL;
+
+	if (!(v.cpt_tnl_flags & CPT_TUNNEL_GRE))
+		return 1;
+
+	if (v.cpt_tnl_flags & CPT_TUNNEL_FBDEV) {
+		fbdev = 1;
+		err = 0;
+		dev = ign->fb_tunnel_dev;
+	} else {
+		fbdev = 0;
+		err = -ENOMEM;
+		dev = alloc_netdev(sizeof(struct ip_tunnel), di->cpt_name,
+				ipgre_tunnel_setup);
+		if (!dev)
+			goto out;
+	}
+
+	t = netdev_priv(dev);
+	t->parms.i_flags = v.cpt_i_flags;
+	t->parms.o_flags = v.cpt_o_flags;
+	t->parms.i_key = v.cpt_i_key;
+	t->parms.o_key = v.cpt_o_key;
+	t->i_seqno = v.cpt_i_seqno;
+	t->o_seqno = v.cpt_o_seqno;
+
+	BUILD_BUG_ON(sizeof(v.cpt_iphdr) != sizeof(t->parms.iph));
+	memcpy(&t->parms.iph, &v.cpt_iphdr, sizeof(t->parms.iph));
+
+	if (!fbdev) {
+		ipgre_tunnel_init(dev);
+		err = register_netdevice(dev);
+		if (err) {
+			free_netdev(dev);
+			goto out;
+		}
+
+		dev_hold(dev);
+		ipgre_tunnel_link(ign, t);
+	}
+out:
+	return err;
+}
+
+static struct netdev_rst ipgre_netdev_rst = {
+	.cpt_object = CPT_OBJ_NET_IPIP_TUNNEL,
+	.ndo_rst = ipgre_rst,
+};
+
+static int ipgre_init_net(struct net *net)
+{
+	struct ipgre_net *ign = net_generic(net, ipgre_net_id);
+	int err;
 
 	ign->fb_tunnel_dev = alloc_netdev(sizeof(struct ip_tunnel), "gre0",
 					   ipgre_tunnel_setup);
@@ -1330,27 +1436,26 @@ static int ipgre_init_net(struct net *net)
 err_reg_dev:
 	free_netdev(ign->fb_tunnel_dev);
 err_alloc_dev:
-	/* nothing */
-err_assign:
-	kfree(ign);
-err_alloc:
 	return err;
 }
 
 static void ipgre_exit_net(struct net *net)
 {
 	struct ipgre_net *ign;
+	LIST_HEAD(list);
 
 	ign = net_generic(net, ipgre_net_id);
 	rtnl_lock();
-	ipgre_destroy_tunnels(ign);
+	ipgre_destroy_tunnels(ign, &list);
+	unregister_netdevice_many(&list);
 	rtnl_unlock();
-	kfree(ign);
 }
 
 static struct pernet_operations ipgre_net_ops = {
 	.init = ipgre_init_net,
 	.exit = ipgre_exit_net,
+	.id   = &ipgre_net_id,
+	.size = sizeof(struct ipgre_net),
 };
 
 static int ipgre_tunnel_validate(struct nlattr *tb[], struct nlattr *data[])
@@ -1665,14 +1770,16 @@ static int __init ipgre_init(void)
 
 	printk(KERN_INFO "GRE over IPv4 tunneling driver\n");
 
-	if (inet_add_protocol(&ipgre_protocol, IPPROTO_GRE) < 0) {
-		printk(KERN_INFO "ipgre init: can't add protocol\n");
-		return -EAGAIN;
-	}
-
-	err = register_pernet_gen_device(&ipgre_net_id, &ipgre_net_ops);
+	err = register_pernet_device(&ipgre_net_ops);
 	if (err < 0)
+		goto out;
+
+	err = inet_add_protocol(&ipgre_protocol, IPPROTO_GRE);
+	if (err < 0) {
+		printk(KERN_INFO "ipgre init: can't add protocol\n");
+		err = -EAGAIN;
 		goto gen_device_failed;
+	}
 
 	err = rtnl_link_register(&ipgre_link_ops);
 	if (err < 0)
@@ -1682,25 +1789,28 @@ static int __init ipgre_init(void)
 	if (err < 0)
 		goto tap_ops_failed;
 
+	register_netdev_rst(&ipgre_netdev_rst);
 out:
 	return err;
 
 tap_ops_failed:
 	rtnl_link_unregister(&ipgre_link_ops);
 rtnl_link_failed:
-	unregister_pernet_gen_device(ipgre_net_id, &ipgre_net_ops);
-gen_device_failed:
 	inet_del_protocol(&ipgre_protocol, IPPROTO_GRE);
+gen_device_failed:
+	unregister_pernet_device(&ipgre_net_ops);
 	goto out;
 }
 
 static void __exit ipgre_fini(void)
 {
+	unregister_netdev_rst(&ipgre_netdev_rst);
 	rtnl_link_unregister(&ipgre_tap_ops);
 	rtnl_link_unregister(&ipgre_link_ops);
-	unregister_pernet_gen_device(ipgre_net_id, &ipgre_net_ops);
 	if (inet_del_protocol(&ipgre_protocol, IPPROTO_GRE) < 0)
 		printk(KERN_INFO "ipgre close: can't remove protocol\n");
+	
+	unregister_pernet_device(&ipgre_net_ops);
 }
 
 module_init(ipgre_init);
@@ -1708,3 +1818,4 @@ module_exit(ipgre_fini);
 MODULE_LICENSE("GPL");
 MODULE_ALIAS_RTNL_LINK("gre");
 MODULE_ALIAS_RTNL_LINK("gretap");
+MODULE_ALIAS_NETDEV("gre0");

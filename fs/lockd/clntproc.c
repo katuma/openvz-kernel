@@ -17,6 +17,7 @@
 #include <linux/sunrpc/clnt.h>
 #include <linux/sunrpc/svc.h>
 #include <linux/lockd/lockd.h>
+#include <linux/nfs_mount.h>
 
 #define NLMDBG_FACILITY		NLMDBG_CLIENT
 #define NLMCLNT_GRACE_WAIT	(5*HZ)
@@ -62,6 +63,68 @@ static void nlm_put_lockowner(struct nlm_lockowner *lockowner)
 	kfree(lockowner);
 }
 
+static int nlm_walk_reserved(uint32_t pid, int del)
+{
+	struct hlist_head *rsv_list;
+
+	rsv_list = &nlm_reserved_pids;
+	if (!hlist_empty(rsv_list)) {
+		struct nlm_reserved_pid *rp;
+		struct hlist_node *n;
+
+		spin_lock(&nlm_reserved_lock);
+		hlist_for_each_entry(rp, n, rsv_list, list)
+			if (rp->pid == pid)
+				break;
+
+		if (del && n) {
+			hlist_del(&rp->list);
+			kfree(rp);
+		}
+
+		spin_unlock(&nlm_reserved_lock);
+
+		if (n != NULL)
+			return -EBUSY;
+	}
+
+	return 0;
+}
+
+static inline int nlm_pid_reserved(uint32_t pid)
+{
+	return nlm_walk_reserved(pid, 0);
+}
+
+static inline void nlm_release_reserved(int pid)
+{
+	if (nlm_walk_reserved(pid, 1) == 0)
+		printk("%s: Recreated lockowner wasn't reserved! pid %d\n",
+				__func__, pid);
+}
+
+int nlmclnt_reserve_pid(int pid)
+{
+	struct nlm_reserved_pid *n, *rp;
+	struct hlist_node *tmp;
+
+	n = kmalloc(sizeof(*n), GFP_KERNEL);
+	if (n == NULL)
+		return -ENOMEM;
+
+	n->pid = pid;
+	spin_lock(&nlm_reserved_lock);
+
+	hlist_for_each_entry(rp, tmp, &nlm_reserved_pids, list)
+		BUG_ON(rp->pid == pid);
+
+	hlist_add_head(&n->list, &nlm_reserved_pids);
+	spin_unlock(&nlm_reserved_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL(nlmclnt_reserve_pid);
+
 static inline int nlm_pidbusy(struct nlm_host *host, uint32_t pid)
 {
 	struct nlm_lockowner *lockowner;
@@ -69,7 +132,7 @@ static inline int nlm_pidbusy(struct nlm_host *host, uint32_t pid)
 		if (lockowner->pid == pid)
 			return -EBUSY;
 	}
-	return 0;
+	return nlm_pid_reserved(pid);
 }
 
 static inline uint32_t __nlm_alloc_pid(struct nlm_host *host)
@@ -118,6 +181,61 @@ static struct nlm_lockowner *nlm_find_lockowner(struct nlm_host *host, fl_owner_
 	return res;
 }
 
+int nlmclnt_set_lockowner(struct inode *inode,
+		struct file_lock *fl, fl_owner_t owner, int svid)
+{
+	struct nlm_host *host;
+	struct nlm_lockowner *new, *res;
+	struct nfs_server *server = NFS_SERVER(inode);
+	struct nfs_client *clp = server->nfs_client;
+	const char *hostname = clp->cl_hostname;
+	const struct sockaddr *address = (struct sockaddr *)&clp->cl_addr;
+	size_t addrlen = clp->cl_addrlen;
+	unsigned short protocol = (clp->cl_proto == XPRT_TRANSPORT_UDP) 
+								? IPPROTO_UDP 
+								: IPPROTO_TCP;
+	u32 nfs_version = clp->rpc_ops->version;
+	int noresvport = server->flags & NFS_MOUNT_NORESVPORT ?	1 : 0;
+	u32 nlm_version = (nfs_version == 2) ? 1 : 4;
+
+	if (nfs_version > 3)
+		return 0;
+	if (server->flags & NFS_MOUNT_NONLM)
+		return 0;
+
+	host = nlmclnt_lookup_host(address, addrlen, protocol,
+				   nlm_version, hostname, noresvport);
+	if (host == NULL)
+		return -ENOLCK;
+
+	new = (struct nlm_lockowner *)kmalloc(sizeof(*new), GFP_KERNEL);
+
+	spin_lock(&host->h_lock);
+	res = __nlm_find_lockowner(host, owner);
+	if (res != NULL) {
+		spin_unlock(&host->h_lock);
+		nlm_put_lockowner(res);
+		nlm_release_host(host);
+		kfree(new);
+		return -EBUSY;
+	}
+
+	atomic_set(&new->count, 1);
+	new->owner = owner;
+	new->pid = svid;
+	new->host = host; /* get-ed by nlmclnt_lookup_host */
+	list_add(&new->list, &host->h_lockowners);
+	spin_unlock(&host->h_lock);
+
+	nlmclnt_locks_init_private(fl, host);
+
+	nlm_put_lockowner(new);
+	nlm_release_reserved(svid);
+
+	return 0;
+}
+EXPORT_SYMBOL(nlmclnt_set_lockowner);
+
 /*
  * Initialize arguments for TEST/LOCK/UNLOCK/CANCEL calls
  */
@@ -155,11 +273,14 @@ int nlmclnt_proc(struct nlm_host *host, int cmd, struct file_lock *fl)
 {
 	struct nlm_rqst		*call;
 	int			status;
+	struct ve_struct *ve;
 
 	nlm_get_host(host);
 	call = nlm_alloc_call(host);
 	if (call == NULL)
 		return -ENOMEM;
+
+	ve = set_exec_env(host->owner_env);
 
 	nlmclnt_locks_init_private(fl, host);
 	/* Set up the argument struct */
@@ -182,6 +303,7 @@ int nlmclnt_proc(struct nlm_host *host, int cmd, struct file_lock *fl)
 	unlock_kernel();
 
 	dprintk("lockd: clnt proc returns %d\n", status);
+	(void)set_exec_env(ve);
 	return status;
 }
 EXPORT_SYMBOL_GPL(nlmclnt_proc);
@@ -458,9 +580,15 @@ static void nlmclnt_locks_release_private(struct file_lock *fl)
 	nlm_put_lockowner(fl->fl_u.nfs_fl.owner);
 }
 
+static int nlm_get_lockid(struct file_lock *fl)
+{
+	return fl->fl_u.nfs_fl.owner->pid;
+}
+
 static const struct file_lock_operations nlmclnt_lock_ops = {
 	.fl_copy_lock = nlmclnt_locks_copy_lock,
 	.fl_release_private = nlmclnt_locks_release_private,
+	.fl_owner_id = nlm_get_lockid,
 };
 
 static void nlmclnt_locks_init_private(struct file_lock *fl, struct nlm_host *host)
@@ -709,7 +837,13 @@ static void nlmclnt_unlock_callback(struct rpc_task *task, void *data)
 
 	if (task->tk_status < 0) {
 		dprintk("lockd: unlock failed (err = %d)\n", -task->tk_status);
-		goto retry_rebind;
+		switch (task->tk_status) {
+		case -EACCES:
+		case -EIO:
+			goto die;
+		default:
+			goto retry_rebind;
+		}
 	}
 	if (status == NLM_LCK_DENIED_GRACE_PERIOD) {
 		rpc_delay(task, NLMCLNT_GRACE_WAIT);

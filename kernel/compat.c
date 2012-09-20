@@ -25,6 +25,7 @@
 #include <linux/posix-timers.h>
 #include <linux/times.h>
 #include <linux/ptrace.h>
+#include <linux/module.h>
 
 #include <asm/uaccess.h>
 
@@ -100,7 +101,7 @@ int put_compat_timespec(const struct timespec *ts, struct compat_timespec __user
 			__put_user(ts->tv_nsec, &cts->tv_nsec)) ? -EFAULT : 0;
 }
 
-static long compat_nanosleep_restart(struct restart_block *restart)
+long compat_nanosleep_restart(struct restart_block *restart)
 {
 	struct compat_timespec __user *rmtp;
 	struct timespec rmt;
@@ -122,6 +123,7 @@ static long compat_nanosleep_restart(struct restart_block *restart)
 
 	return ret;
 }
+EXPORT_SYMBOL(compat_nanosleep_restart);
 
 asmlinkage long compat_sys_nanosleep(struct compat_timespec __user *rqtp,
 				     struct compat_timespec __user *rmtp)
@@ -494,29 +496,26 @@ asmlinkage long compat_sys_sched_getaffinity(compat_pid_t pid, unsigned int len,
 {
 	int ret;
 	cpumask_var_t mask;
-	unsigned long *k;
-	unsigned int min_length = cpumask_size();
 
-	if (nr_cpu_ids <= BITS_PER_COMPAT_LONG)
-		min_length = sizeof(compat_ulong_t);
-
-	if (len < min_length)
+	if ((len * BITS_PER_BYTE) < nr_cpu_ids)
+		return -EINVAL;
+	if (len & (sizeof(compat_ulong_t)-1))
 		return -EINVAL;
 
 	if (!alloc_cpumask_var(&mask, GFP_KERNEL))
 		return -ENOMEM;
 
 	ret = sched_getaffinity(pid, mask);
-	if (ret < 0)
-		goto out;
+	if (ret == 0) {
+		size_t retlen = min_t(size_t, len, cpumask_size());
 
-	k = cpumask_bits(mask);
-	ret = compat_put_bitmap(user_mask_ptr, k, min_length * 8);
-	if (ret == 0)
-		ret = min_length;
-
-out:
+		if (compat_put_bitmap(user_mask_ptr, cpumask_bits(mask), retlen * 8))
+			ret = -EFAULT;
+		else
+			ret = retlen;
+	}
 	free_cpumask_var(mask);
+
 	return ret;
 }
 
@@ -1139,3 +1138,24 @@ compat_sys_sysinfo(struct compat_sysinfo __user *info)
 
 	return 0;
 }
+
+/*
+ * Allocate user-space memory for the duration of a single system call,
+ * in order to marshall parameters inside a compat thunk.
+ */
+void __user *compat_alloc_user_space(unsigned long len)
+{
+	void __user *ptr;
+
+	/* If len would occupy more than half of the entire compat space... */
+	if (unlikely(len > (((compat_uptr_t)~0) >> 1)))
+		return NULL;
+
+	ptr = arch_compat_alloc_user_space(len);
+
+	if (unlikely(!access_ok(VERIFY_WRITE, ptr, len)))
+		return NULL;
+
+	return ptr;
+}
+EXPORT_SYMBOL(compat_alloc_user_space);

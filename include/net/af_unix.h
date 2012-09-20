@@ -10,6 +10,8 @@ extern void unix_inflight(struct file *fp);
 extern void unix_notinflight(struct file *fp);
 extern void unix_gc(void);
 extern void wait_for_unix_gc(void);
+extern struct sock *unix_get_socket(struct file *filp);
+extern void unix_destruct_fds(struct sk_buff *skb);
 
 #define UNIX_HASH_SIZE	256
 
@@ -21,6 +23,9 @@ struct unix_address {
 	unsigned	hash;
 	struct sockaddr_un name[0];
 };
+
+int unix_bind_path(struct sock *, struct dentry *, struct vfsmount *);
+int unix_attach_addr(struct sock *, struct sockaddr_un *, int);
 
 struct unix_skb_parms {
 	struct ucred		creds;		/* Skb credentials	*/
@@ -56,6 +61,7 @@ struct unix_sock {
         spinlock_t		lock;
 	unsigned int		gc_candidate : 1;
 	unsigned int		gc_maybe_cycle : 1;
+	unsigned char		recursion_level;
         wait_queue_head_t       peer_wait;
 };
 #define unix_sk(__sk) ((struct unix_sock *)__sk)

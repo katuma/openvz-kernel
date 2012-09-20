@@ -113,6 +113,7 @@ parameter is applicable:
 			More X86-64 boot options can be found in
 			Documentation/x86/x86_64/boot-options.txt .
 	X86	Either 32bit or 64bit x86 (same as X86-32+X86-64)
+	XEN	Xen support is enabled
 
 In addition, the following text indicates that the option:
 
@@ -153,6 +154,11 @@ and is between 256 and 4096 characters. It is defined in the file
 			rsdt -- prefer RSDT over (default) XSDT
 
 			See also Documentation/power/pm.txt, pci=noacpi
+
+	acpi_rsdp=	[ACPI,EFI,KEXEC]
+			Pass the RSDP address to the kernel, mostly used
+			on machines running EFI runtime service to boot the
+			second kernel for kdump.
 
 	acpi_apic_instance=	[ACPI, IOAPIC]
 			Format: <int>
@@ -309,18 +315,36 @@ and is between 256 and 4096 characters. It is defined in the file
 	aic79xx=	[HW,SCSI]
 			See Documentation/scsi/aic79xx.txt.
 
+	align_va_addr=	[X86-64]
+			Align virtual addresses by clearing slice [14:12] when
+			allocating a VMA at process creation time. This option
+			gives you up to 3% performance improvement on AMD F15h
+			machines (where it is enabled by default) for a
+			CPU-intensive style benchmark, and it can vary highly in
+			a microbenchmark depending on workload and compiler.
+
+			32: only for 32-bit processes
+			64: only for 64-bit processes
+			on: enable for both 32- and 64-bit processes
+			off: disable for both 32- and 64-bit processes
+
 	amd_iommu=	[HW,X86-84]
 			Pass parameters to the AMD IOMMU driver in the system.
+			Format: <a>,<b>,...
 			Possible values are:
+			on - enable AMD IOMMU (disabled by default)
 			isolate - enable device isolation (each device, as far
 			          as possible, will get its own protection
-			          domain) [default]
+			          domain). This parameter also forces the
+				  AMD IOMMU driver out of passthrough mode.
 			share - put every device behind one IOMMU into the
-				same protection domain
+				same protection domain. This parameter also
+				forces the AMD IOMMU driver to not use
+				passthrough mode.
 			fullflush - enable flushing of IO/TLB entries when
 				    they are unmapped. Otherwise they are
 				    flushed before they will be reused, which
-				    is a lot of faster
+				    is a lot faster.
 
 	amijoy.map=	[HW,JOY] Amiga joystick support
 			Map of devices attached to JOY0DAT and JOY1DAT
@@ -472,6 +496,9 @@ and is between 256 and 4096 characters. It is defined in the file
 			[SPARC64] tick
 			[X86-64] hpet,tsc
 
+	clocksource_failover [GENERIC_TIME] Switch the clocksource if the
+			     current clocksource is found to be unstable.
+
 	clearcpuid=BITNUM [X86]
 			Disable CPUID feature X for the kernel. See
 			arch/x86/include/asm/cpufeature.h for the valid bit
@@ -618,6 +645,10 @@ and is between 256 and 4096 characters. It is defined in the file
 			See drivers/char/README.epca and
 			Documentation/serial/digiepca.txt.
 
+	disable_ddw     [PPC]
+			Disable Dynamic DMA Window support. Use this if
+			to workaround buggy firmware.
+
 	disable_mtrr_cleanup [X86]
 			The kernel tries to adjust MTRR layout from continuous
 			to discrete, to make X server driver able to add WB
@@ -704,10 +735,10 @@ and is between 256 and 4096 characters. It is defined in the file
 			See Documentation/block/as-iosched.txt and
 			Documentation/block/deadline-iosched.txt for details.
 
-	elfcorehdr=	[IA64,PPC,SH,X86]
+	elfcorehdr=[size[KMG]@]offset[KMG] [IA64,PPC,SH,X86,S390]
 			Specifies physical address of start of kernel core
-			image elf header. Generally kexec loader will
-			pass this option to capture kernel.
+			image elf header and optionally the size. Generally
+			kexec loader will pass this option to capture kernel.
 			See Documentation/kdump/kdump.txt for details.
 
 	enable_mtrr_cleanup [X86]
@@ -728,6 +759,10 @@ and is between 256 and 4096 characters. It is defined in the file
 			1 -- enforcing (deny and log).
 			Default value is 0.
 			Value can be changed at runtime via /selinux/enforce.
+
+	erst_disable	[ACPI]
+			Disable Error Record Serialization Table (ERST)
+			support.
 
 	ether=		[HW,NET] Ethernet cards parameters
 			This option is obsoleted by the "netdev=" option, which
@@ -815,6 +850,11 @@ and is between 256 and 4096 characters. It is defined in the file
 	hd=		[EIDE] (E)IDE hard drive subsystem geometry
 			Format: <cyl>,<head>,<sect>
 
+	hest_disable	[ACPI]
+			Disable Hardware Error Source Table (HEST) support;
+			corresponding firmware-first mode error processing
+			logic will be disabled.
+
 	highmem=nn[KMG]	[KNL,BOOT] forces the highmem zone to have an exact
 			size of <nn>. This works even on boxes that have no
 			highmem otherwise. This also works to reduce highmem
@@ -836,6 +876,10 @@ and is between 256 and 4096 characters. It is defined in the file
 			force: allow force enabled of undocumented chips (ICH4,
 				VIA, nVidia)
 			verbose: show contents of HPET registers during setup
+
+	hpet_mmap	[HW, X86_64] Enable userspace mapping of HPET
+			registers for faster HPET access by userspace
+			processes.
 
 	hugepages=	[HW,X86-32,IA-64] HugeTLB pages to allocate at boot.
 	hugepagesz=	[HW,IA-64,PPC,X86-64] The size of the HugeTLB pages.
@@ -971,17 +1015,30 @@ and is between 256 and 4096 characters. It is defined in the file
 			bypassed by not enabling DMAR with this option. In
 			this case, gfx device will use physical address for
 			DMA.
+		pt64 [Default Off]
+			Enable 64 bit pass through mode if the kernel has the
+			capability.  Also disables forcedac, unless that option
+			follows this option.
 		forcedac [x86_64]
 			With this option iommu will not optimize to look
 			for io virtual address below 32 bit forcing dual
 			address cycle on pci bus for cards supporting greater
 			than 32 bit addressing. The default is to look
 			for translation below 32 bit and if not available
-			then look in the higher range.
+			then look in the higher range.  Note that pt64 disables
+			this option, so this must follow that option to be
+			effective.
 		strict [Default Off]
 			With this option on every unmap_single operation will
 			result in a hardware IOTLB flush operation as opposed
 			to batching them for performance.
+
+	intremap=	[X86-64, Intel-IOMMU]
+			on	enable Interrupt Remapping (default)
+			off	disable Interrupt Remapping
+			nosid	disable Source ID checking
+			no_x2apic_optout
+				BIOS x2APIC opt-out request will be ignored
 
 	inttest=	[IA64]
 
@@ -1017,7 +1074,7 @@ and is between 256 and 4096 characters. It is defined in the file
 			No delay
 
 	ip=		[IP_PNP]
-			See Documentation/filesystems/nfsroot.txt.
+			See Documentation/filesystems/nfs/nfsroot.txt.
 
 	ip2=		[HW] Set IO/IRQ pairs for up to 4 IntelliPort boards
 			See comment before ip2_setup() in
@@ -1198,6 +1255,9 @@ and is between 256 and 4096 characters. It is defined in the file
 
 			* nohrst, nosrst, norst: suppress hard, soft
                           and both resets.
+
+			* rstonce: only attempt one reset during
+			  hot-unplug link recovery
 
 			If there are multiple matching configurations changing
 			the same attribute, the last one is used.
@@ -1534,14 +1594,16 @@ and is between 256 and 4096 characters. It is defined in the file
 			[NETFILTER] Enable connection tracking flow accounting
 			0 to disable accounting
 			1 to enable accounting
-			Default value depends on CONFIG_NF_CT_ACCT that is
-			going to be removed in 2.6.29.
+			Default value is 0.
 
-	nfsaddrs=	[NFS]
-			See Documentation/filesystems/nfsroot.txt.
+	nfsaddrs=	[NFS] Deprecated.  Use ip= instead.
+			See Documentation/filesystems/nfs/nfsroot.txt.
 
 	nfsroot=	[NFS] nfs root filesystem for disk-less boxes.
-			See Documentation/filesystems/nfsroot.txt.
+			See Documentation/filesystems/nfs/nfsroot.txt.
+
+	nfsrootdebug	[NFS] enable nfsroot debugging messages.
+			See Documentation/filesystems/nfs/nfsroot.txt.
 
 	nfs.callback_tcpport=
 			[NFS] set the TCP port on which the NFSv4 callback
@@ -1566,26 +1628,32 @@ and is between 256 and 4096 characters. It is defined in the file
 			of returning the full 64-bit number.
 			The default is to return 64-bit inode numbers.
 
+	nfs.nfs4_disable_idmapping=
+			[NFSv4] When set to the default of '1', this option
+			ensures that both the RPC level authentication
+			scheme and the NFS level operations agree to use
+			numeric uids/gids if the mount is using the
+			'sec=sys' security flavour. In effect it is
+			disabling idmapping, which can make migration from
+			legacy NFSv2/v3 systems to NFSv4 easier.
+			Servers that do not support this mode of operation
+			will be autodetected by the client, and it will fall
+			back to using the idmapper.
+			To turn off this behaviour, set the value to '0'.
+
 	nmi_debug=	[KNL,AVR32,SH] Specify one or more actions to take
 			when a NMI is triggered.
 			Format: [state][,regs][,debounce][,die]
 
 	nmi_watchdog=	[KNL,BUGS=X86] Debugging features for SMP kernels
-			Format: [panic,][num]
-			Valid num: 0,1,2
+			Format: [panic,][nopanic,][num]
+			Valid num: 0
 			0 - turn nmi_watchdog off
-			1 - use the IO-APIC timer for the NMI watchdog
-			2 - use the local APIC for the NMI watchdog using
-			a performance counter. Note: This will use one
-			performance counter and the local APIC's performance
-			vector.
 			When panic is specified, panic when an NMI watchdog
-			timeout occurs.
+			timeout occurs (or 'nopanic' to override the opposite
+			default).
 			This is useful when you use a panic=... timeout and
 			need the box quickly up again.
-			Instead of 1 and 2 it is possible to use the following
-			symbolic names: lapic and ioapic
-			Example: nmi_watchdog=2 or nmi_watchdog=panic,lapic
 
 	netpoll.carrier_timeout=
 			[NET] Specifies amount of time (in seconds) that
@@ -1615,6 +1683,8 @@ and is between 256 and 4096 characters. It is defined in the file
 	noapic		[SMP,APIC] Tells the kernel to not make use of any
 			IOAPICs that may be present in the system.
 
+	autogroup	Enable scheduler automatic task group creation.
+
 	nobats		[PPC] Do not use BATs for mapping kernel lowmem
 			on "Classic" PPC cores.
 
@@ -1636,6 +1706,10 @@ and is between 256 and 4096 characters. It is defined in the file
 			On X86-32 available only on PAE configured kernels.
 			noexec=on: enable non-executable mappings (default)
 			noexec=off: disable non-executable mappings
+
+	nosmep		[X86]
+			Disable SMEP (Supervisor Mode Execution Protection)
+			even if it is supported by processor.
 
 	noexec32	[X86-64]
 			This affects only 32-bit executables.
@@ -1692,6 +1766,7 @@ and is between 256 and 4096 characters. It is defined in the file
 
 	nointremap	[X86-64, Intel-IOMMU] Do not enable interrupt
 			remapping.
+			[Deprecated - use intremap=off]
 
 	nointroute	[IA-64]
 
@@ -1721,6 +1796,11 @@ and is between 256 and 4096 characters. It is defined in the file
 
 	noresidual	[PPC] Don't use residual data on PReP machines.
 
+	nordrand	[X86] Disable the direct use of the RDRAND
+			instruction even if it is supported by the
+			processor.  RDRAND is still available to user
+			space applications.
+
 	noresume	[SWSUSP] Disables resume and restores original swap
 			space.
 
@@ -1746,6 +1826,8 @@ and is between 256 and 4096 characters. It is defined in the file
 
 	nousb		[USB] Disable the USB subsystem
 
+	nowatchdog	[KNL] Disable the lockup detector (NMI watchdog).
+
 	nowb		[ARM]
 
 	nox2apic	[X86-64,APIC] Do not enable x2APIC mode.
@@ -1753,6 +1835,12 @@ and is between 256 and 4096 characters. It is defined in the file
 	nptcg=		[IA64] Override max number of concurrent global TLB
 			purges which is reported from either PAL_VM_SUMMARY or
 			SAL PALO.
+
+	nr_cpus=	[SMP] Maximum number of processors that	an SMP kernel
+			could support.  nr_cpus=n : n >= 1 limits the kernel to
+			supporting 'n' processors. Later in runtime you can not
+			use hotplug cpu feature to put more cpu back to online.
+			just like you compile the kernel NR_CPUS=n
 
 	nr_uarts=	[SERIAL] maximum number of UARTs to be registered.
 
@@ -1771,6 +1859,8 @@ and is between 256 and 4096 characters. It is defined in the file
 			of the timeout.  We have interrupts disabled while
 			waiting for the ACK, so if this is set too high
 			interrupts *may* be lost!
+
+	OMGZOMBIES	BRRRAAAAAAIIIIINNNNNSSSSSSSS
 
 	opl3=		[HW,OSS]
 			Format: <io>
@@ -1864,6 +1954,9 @@ and is between 256 and 4096 characters. It is defined in the file
 		check_enable_amd_mmconf [X86] check for and enable
 				properly configured MMIO access to PCI
 				config space on AMD family 10h CPU
+		msi		[MSI] If the PCI_MSI kernel config parameter is
+				enabled, this kernel boot option can be used to
+				enable the use of MSI interrupts system-wide.
 		nomsi		[MSI] If the PCI_MSI kernel config parameter is
 				enabled, this kernel boot option can be used to
 				disable the use of MSI interrupts system-wide.
@@ -1916,8 +2009,12 @@ and is between 256 and 4096 characters. It is defined in the file
 				IRQ routing is enabled.
 		noacpi		[X86] Do not use ACPI for IRQ routing
 				or for PCI scanning.
-		use_crs		[X86] Use _CRS for PCI resource
-				allocation.
+		use_crs		[X86] Use PCI host bridge window information
+				from ACPI.  On BIOSes from 2008 or later, this
+				is enabled by default.  If you need to use this,
+				please report a bug.
+		nocrs		[X86] Ignore PCI host bridge windows from ACPI.
+			        If you need to use this, please report a bug.
 		routeirq	Do IRQ routing for all PCI devices.
 				This is normally done in pci_enable_device(),
 				so this option is a temporary workaround
@@ -1959,12 +2056,27 @@ and is between 256 and 4096 characters. It is defined in the file
 				the default.
 				off: Turn ECRC off
 				on: Turn ECRC on.
+		realloc		reallocate PCI resources if allocations done by BIOS
+				are erroneous.
+		nosriov		[HW]
+				Disable SRIOV support in kernel.
+				Please report a bug if you use this parameter.
+		sriov		[HW]
+				Enable SRIOV support in kernel.
 
 	pcie_aspm=	[PCIE] Forcibly enable or disable PCIe Active State Power
 			Management.
 		off	Disable ASPM.
 		force	Enable ASPM even on devices that claim not to support it.
 			WARNING: Forcing ASPM on may cause system lockups.
+
+	pcie_hp=	[PCIE] PCI Express Hotplug driver options:
+		nomsi	Do not use MSI for PCI Express Native Hotplug (this
+			makes all PCIe ports use INTx for hotplug services).
+
+	pcie_ports=	[PCIE] PCIe ports handling:
+		compat	Treat PCIe ports as PCI-to-PCI bridges, disable the PCIe
+			ports driver.
 
 	pcmv=		[HW,PCMCIA] BadgePAD 4
 
@@ -1988,6 +2100,9 @@ and is between 256 and 4096 characters. It is defined in the file
 
 	pg.		[PARIDE]
 			See Documentation/blockdev/paride.txt.
+
+	physefi		[X86] Run EFI in physical mode rather than virtual
+			mode.
 
 	pirq=		[SMP,APIC] Manual mp-table setup
 			See Documentation/x86/i386/IO-APIC.txt.
@@ -2036,6 +2151,12 @@ and is between 256 and 4096 characters. It is defined in the file
 			the kernel console.
 			default: off.
 
+	printk.always_kmsg_dump=
+			Trigger kmsg_dump for cases other than kernel oops or
+			panics
+			Format: <bool>  (1/Y/y=enable, 0/N/n=disable)
+			default: disabled
+
 	printk.time=	Show timing data prefixed to each printk message line
 			Format: <bool>  (1/Y/y=enable, 0/N/n=disable)
 
@@ -2077,6 +2198,8 @@ and is between 256 and 4096 characters. It is defined in the file
 			Format:
 			<io>,<mss_io>,<mss_irq>,<mss_dma>,<mpu_io>,<mpu_irq>
 
+	pstore.backend=	Specify the name of the pstore backend to use
+
 	pt.		[PARIDE]
 			See Documentation/blockdev/paride.txt.
 
@@ -2085,6 +2208,13 @@ and is between 256 and 4096 characters. It is defined in the file
 			default number.
 
 	quiet		[KNL] Disable most log messages
+
+	quirk_i82576_sriov
+			[RHEL6: HW, PCI]
+			Quirk for defaulting to old Flash Memory Space for
+			pre-production SRIOV NIC hardware.  If you require this
+			on production hardware, please contact your hardware
+			vendor for a BIOS update.
 
 	r128=		[HW,DRM]
 
@@ -2181,6 +2311,8 @@ and is between 256 and 4096 characters. It is defined in the file
 			See drivers/net/irda/sa1100_ir.c.
 
 	sbni=		[NET] Granch SBNI12 leased line adapter
+
+	sched_debug	[KNL] Enables verbose scheduler debug messages.
 
 	sc1200wdt=	[HW,WDT] SC1200 WDT (watchdog) driver
 			Format: <io>[,<timeout>[,<isapnp>]]
@@ -2552,7 +2684,7 @@ and is between 256 and 4096 characters. It is defined in the file
 			topology informations if the hardware supports these.
 			The scheduler will make use of these informations and
 			e.g. base its process migration decisions on it.
-			Default is off.
+			Default is on.
 
 	tp720=		[HW,PS2]
 
@@ -2568,12 +2700,13 @@ and is between 256 and 4096 characters. It is defined in the file
 			Format:
 			<io>,<irq>,<dma>,<dma2>,<sb_io>,<sb_irq>,<sb_dma>,<mpu_io>,<mpu_irq>
 
-	tsc=		Disable clocksource-must-verify flag for TSC.
+	tsc=		Disable clocksource stability checks for TSC.
 			Format: <string>
 			[x86] reliable: mark tsc clocksource as reliable, this
-			disables clocksource verification at runtime.
-			Used to enable high-resolution timer mode on older
-			hardware, and in virtualized environment.
+			disables clocksource verification at runtime, as well
+			as the stability checks done at bootup.	Used to enable
+			high-resolution timer mode on older hardware, and in
+			virtualized environment.
 
 	turbografx.map[2|3]=	[HW,JOY]
 			TurboGraFX parallel port interface
@@ -2645,6 +2778,8 @@ and is between 256 and 4096 characters. It is defined in the file
 			to a common usb-storage quirk flag as follows:
 				a = SANE_SENSE (collect more than 18 bytes
 					of sense data);
+				b = BAD_SENSE (don't collect more than 18
+					bytes of sense data);
 				c = FIX_CAPACITY (decrease the reported
 					device capacity by one sector);
 				h = CAPACITY_HEURISTICS (decrease the
@@ -2665,6 +2800,13 @@ and is between 256 and 4096 characters. It is defined in the file
 				w = NO_WP_DETECT (don't test whether the
 					medium is write-protected).
 			Example: quirks=0419:aaf5:rl,0421:0433:rc
+
+	userpte=
+			[X86] Flags controlling user PTE allocations.
+
+				nohigh = do not allocate PTE pages in
+					HIGHMEM regardless of setting
+					of CONFIG_HIGHPTE.
 
 	vdso=		[X86,SH]
 			vdso=2: enable compat VDSO (default with COMPAT_VDSO)
@@ -2748,10 +2890,21 @@ and is between 256 and 4096 characters. It is defined in the file
 	xd=		[HW,XT] Original XT pre-IDE (RLL encoded) disks.
 	xd_geo=		See header of drivers/block/xd.c.
 
+	xen_emul_unplug=                [HW,X86,XEN]
+			Unplug Xen emulated devices
+			Format: [unplug0,][unplug1]
+			ide-disks -- unplug primary master IDE devices
+			aux-ide-disks -- unplug non-primary-master IDE devices
+			nics -- unplug network devices
+			all -- unplug all emulated devices (NICs and IDE disks)
+			unnecessary -- unplugging emulated devices is
+				unnecessary even if the host did not respond to
+				the unplug protocol
+			never -- do not unplug even if version check succeeds
+
 	xirc2ps_cs=	[NET,PCMCIA]
 			Format:
 			<irq>,<irq_mask>,<io>,<full_duplex>,<do_sound>,<lockup_hack>[,<irq2>[,<irq3>[,<irq4>]]]
-
 ______________________________________________________________________
 
 TODO:

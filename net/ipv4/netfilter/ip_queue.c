@@ -437,7 +437,7 @@ __ipq_rcv_skb(struct sk_buff *skb)
 	if (type <= IPQM_BASE)
 		return;
 
-	if (security_netlink_recv(skb, CAP_NET_ADMIN))
+	if (security_netlink_recv(skb, CAP_VE_NET_ADMIN))
 		RCV_SKB_FAIL(-EPERM);
 
 	write_lock_bh(&queue_lock);
@@ -467,8 +467,12 @@ __ipq_rcv_skb(struct sk_buff *skb)
 static void
 ipq_rcv_skb(struct sk_buff *skb)
 {
+	struct ve_struct *old_ve;
+
 	mutex_lock(&ipqnl_mutex);
+	old_ve = set_exec_env(skb->owner_env);
 	__ipq_rcv_skb(skb);
+	(void)set_exec_env(old_ve);
 	mutex_unlock(&ipqnl_mutex);
 }
 
@@ -477,9 +481,6 @@ ipq_rcv_dev_event(struct notifier_block *this,
 		  unsigned long event, void *ptr)
 {
 	struct net_device *dev = ptr;
-
-	if (!net_eq(dev_net(dev), &init_net))
-		return NOTIFY_DONE;
 
 	/* Drop any packets associated with the downed device */
 	if (event == NETDEV_DOWN)
@@ -500,7 +501,7 @@ ipq_rcv_nl_event(struct notifier_block *this,
 	if (event == NETLINK_URELEASE &&
 	    n->protocol == NETLINK_FIREWALL && n->pid) {
 		write_lock_bh(&queue_lock);
-		if ((n->net == &init_net) && (n->pid == peer_pid))
+		if (n->pid == peer_pid)
 			__ipq_reset();
 		write_unlock_bh(&queue_lock);
 	}

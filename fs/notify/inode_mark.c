@@ -90,6 +90,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/writeback.h> /* for inode_lock */
+#include <linux/mount.h>
 
 #include <asm/atomic.h>
 
@@ -262,6 +263,23 @@ void fsnotify_clear_marks_by_inode(struct inode *inode)
 	}
 }
 
+static void fsnotify_detach_mnt(struct inode *inode)
+{
+	struct fsnotify_mark_entry *entry;
+	struct hlist_node *pos;
+	struct fsnotify_group *group;
+
+	spin_lock(&inode->i_lock);
+	hlist_for_each_entry(entry, pos, &inode->i_fsnotify_mark_entries, i_list) {
+		spin_lock(&entry->lock);
+		group = entry->group;
+		if (group->ops->detach_mnt)
+			group->ops->detach_mnt(entry);
+		spin_unlock(&entry->lock);
+	}
+	spin_unlock(&inode->i_lock);
+}
+
 /*
  * given a group and inode, find the mark associated with that combination.
  * if found take a reference to that mark and return it, else return NULL
@@ -362,7 +380,7 @@ int fsnotify_add_mark(struct fsnotify_mark_entry *entry,
  * of inodes, and with iprune_mutex held, keeping shrink_icache_memory() at bay.
  * We temporarily drop inode_lock, however, and CAN block.
  */
-void fsnotify_unmount_inodes(struct list_head *list)
+static void fsnotify_unmount(struct list_head *list, struct vfsmount *mnt)
 {
 	struct inode *inode, *next_i, *need_iput = NULL;
 
@@ -414,13 +432,29 @@ void fsnotify_unmount_inodes(struct list_head *list)
 		if (need_iput_tmp)
 			iput(need_iput_tmp);
 
-		/* for each watch, send FS_UNMOUNT and then remove it */
-		fsnotify(inode, FS_UNMOUNT, inode, FSNOTIFY_EVENT_INODE, NULL, 0);
+		if (mnt)
+			fsnotify_detach_mnt(inode);
+		else {
+			/* for each watch, send FS_UNMOUNT and then remove it */
+			fsnotify(inode, FS_UNMOUNT, inode, FSNOTIFY_EVENT_INODE, NULL, 0);
 
-		fsnotify_inode_delete(inode);
+			fsnotify_inode_delete(inode);
+		}
 
 		iput(inode);
 
 		spin_lock(&inode_lock);
 	}
+}
+
+void fsnotify_unmount_inodes(struct list_head *list)
+{
+	fsnotify_unmount(list, NULL);
+}
+
+void fsnotify_unmount_mnt(struct vfsmount *mnt)
+{
+	spin_lock(&inode_lock);
+	fsnotify_unmount(&mnt->mnt_sb->s_inodes, mnt);
+	spin_unlock(&inode_lock);
 }

@@ -490,6 +490,9 @@ enum
 	NET_IPV4_CONF_PROMOTE_SECONDARIES=20,
 	NET_IPV4_CONF_ARP_ACCEPT=21,
 	NET_IPV4_CONF_ARP_NOTIFY=22,
+	NET_IPV4_CONF_ACCEPT_LOCAL=23,
+	NET_IPV4_CONF_SRC_VMARK=24,
+	NET_IPV4_CONF_PROXY_ARP_PVLAN=25,
 	__NET_IPV4_CONF_MAX
 };
 
@@ -995,6 +998,8 @@ extern int proc_doulongvec_minmax(struct ctl_table *, int,
 				  void __user *, size_t *, loff_t *);
 extern int proc_doulongvec_ms_jiffies_minmax(struct ctl_table *table, int,
 				      void __user *, size_t *, loff_t *);
+extern int proc_do_large_bitmap(struct ctl_table *, int,
+				void __user *, size_t *, loff_t *);
 
 extern int do_sysctl (int __user *name, int nlen,
 		      void __user *oldval, size_t __user *oldlenp,
@@ -1102,9 +1107,15 @@ struct ctl_table_header *__register_sysctl_paths(
 struct ctl_table_header *register_sysctl_table(struct ctl_table * table);
 struct ctl_table_header *register_sysctl_paths(const struct ctl_path *path,
 						struct ctl_table *table);
+struct ctl_table_header *register_sysctl_glob_table(struct ctl_table *, int);
+struct ctl_table_header *register_sysctl_glob_paths(const struct ctl_path *,
+						struct ctl_table *, int);
+struct ctl_table *sysctl_ve_table(struct ctl_table *, struct ctl_table *, int);
 
 void unregister_sysctl_table(struct ctl_table_header * table);
 int sysctl_check_table(struct nsproxy *namespaces, struct ctl_table *table);
+
+extern int ve_allow_kthreads;
 
 #endif /* __KERNEL__ */
 

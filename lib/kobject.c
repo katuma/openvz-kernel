@@ -147,6 +147,7 @@ static void kobject_init_internal(struct kobject *kobj)
 	if (!kobj)
 		return;
 	kref_init(&kobj->kref);
+	INIT_LIST_HEAD(&kobj->env_head);
 	INIT_LIST_HEAD(&kobj->entry);
 	kobj->state_in_sysfs = 0;
 	kobj->state_add_uevent_sent = 0;
@@ -630,6 +631,7 @@ struct kobject *kobject_create(void)
 	kobject_init(kobj, &dynamic_kobj_ktype);
 	return kobj;
 }
+EXPORT_SYMBOL(kobject_create);
 
 /**
  * kobject_create_and_add - create a struct kobject dynamically and register it with sysfs
@@ -700,7 +702,7 @@ static ssize_t kobj_attr_store(struct kobject *kobj, struct attribute *attr,
 	return ret;
 }
 
-struct sysfs_ops kobj_sysfs_ops = {
+const struct sysfs_ops kobj_sysfs_ops = {
 	.show	= kobj_attr_show,
 	.store	= kobj_attr_store,
 };
@@ -746,17 +748,56 @@ void kset_unregister(struct kset *k)
  */
 struct kobject *kset_find_obj(struct kset *kset, const char *name)
 {
+	return kset_find_obj_hinted(kset, name, NULL);
+}
+
+/**
+ * kset_find_obj_hinted - search for object in kset given a predecessor hint.
+ * @kset: kset we're looking in.
+ * @name: object's name.
+ * @hint: hint to possible object's predecessor.
+ *
+ * Check the hint's next object and if it is a match return it directly,
+ * otherwise, fall back to the behavior of kset_find_obj().  Either way
+ * a reference for the returned object is held and the reference on the
+ * hinted object is released.
+ */
+struct kobject *kset_find_obj_hinted(struct kset *kset, const char *name,
+				     struct kobject *hint)
+{
 	struct kobject *k;
 	struct kobject *ret = NULL;
 
 	spin_lock(&kset->list_lock);
+
+	if (!hint)
+		goto slow_search;
+
+	/* end of list detection */
+	if (hint->entry.next == kset->list.next)
+		goto slow_search;
+
+	k = container_of(hint->entry.next, struct kobject, entry);
+	if (!kobject_name(k) || strcmp(kobject_name(k), name))
+		goto slow_search;
+
+	ret = kobject_get(k);
+	goto unlock_exit;
+
+slow_search:
 	list_for_each_entry(k, &kset->list, entry) {
 		if (kobject_name(k) && !strcmp(kobject_name(k), name)) {
 			ret = kobject_get(k);
 			break;
 		}
 	}
+
+unlock_exit:
 	spin_unlock(&kset->list_lock);
+
+	if (hint)
+		kobject_put(hint);
+
 	return ret;
 }
 

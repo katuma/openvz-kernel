@@ -18,6 +18,7 @@
 #include <linux/bitops.h>
 #include <linux/mount.h>
 #include <linux/pid_namespace.h>
+#include <linux/parser.h>
 
 #include "internal.h"
 
@@ -35,6 +36,63 @@ static int proc_set_super(struct super_block *sb, void *data)
 	return set_anon_super(sb, NULL);
 }
 
+enum {
+	Opt_gid, Opt_hidepid, Opt_err,
+};
+
+static const match_table_t tokens = {
+	{Opt_hidepid, "hidepid=%u"},
+	{Opt_gid, "gid=%u"},
+	{Opt_err, NULL},
+};
+
+static int proc_parse_options(char *options, struct pid_namespace *pid)
+{
+	char *p;
+	substring_t args[MAX_OPT_ARGS];
+	int option;
+
+	if (!options)
+		return 1;
+
+	while ((p = strsep(&options, ",")) != NULL) {
+		int token;
+		if (!*p)
+			continue;
+
+		args[0].to = args[0].from = 0;
+		token = match_token(p, tokens, args);
+		switch (token) {
+		case Opt_gid:
+			if (match_int(&args[0], &option))
+				return 0;
+			pid->pid_gid = option;
+			break;
+		case Opt_hidepid:
+			if (match_int(&args[0], &option))
+				return 0;
+			if (option < 0 || option > 2) {
+				pr_err("proc: hidepid value must be between 0 and 2.\n");
+				return 0;
+			}
+			pid->hide_pid = option;
+			break;
+		default:
+			pr_err("proc: unrecognized mount option \"%s\" "
+			       "or missing value\n", p);
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+int proc_remount(struct super_block *sb, int *flags, char *data)
+{
+	struct pid_namespace *pid = sb->s_fs_info;
+	return !proc_parse_options(data, pid);
+}
+
 static int proc_get_sb(struct file_system_type *fs_type,
 	int flags, const char *dev_name, void *data, struct vfsmount *mnt)
 {
@@ -42,6 +100,10 @@ static int proc_get_sb(struct file_system_type *fs_type,
 	struct super_block *sb;
 	struct pid_namespace *ns;
 	struct proc_inode *ei;
+	char *options;
+#ifdef CONFIG_VE
+	struct vfsmount *proc_mnt = fs_type->owner_env->proc_mnt;
+#endif
 
 	if (proc_mnt) {
 		/* Seed the root directory with a pid so it doesn't need
@@ -54,17 +116,24 @@ static int proc_get_sb(struct file_system_type *fs_type,
 			ei->pid = find_get_pid(1);
 	}
 
-	if (flags & MS_KERNMOUNT)
+	if (flags & MS_KERNMOUNT) {
 		ns = (struct pid_namespace *)data;
-	else
+		options = NULL;
+	} else {
 		ns = current->nsproxy->pid_ns;
+		options = data;
+	}
 
 	sb = sget(fs_type, proc_test_super, proc_set_super, ns);
 	if (IS_ERR(sb))
 		return PTR_ERR(sb);
 
 	if (!sb->s_root) {
-		sb->s_flags = flags;
+		sb->s_flags = (flags & ~MS_RDONLY);
+		if (!proc_parse_options(options, ns)) {
+			deactivate_locked_super(sb);
+			return -EINVAL;
+		}
 		err = proc_fill_super(sb);
 		if (err) {
 			deactivate_locked_super(sb);
@@ -95,11 +164,12 @@ static void proc_kill_sb(struct super_block *sb)
 	put_pid_ns(ns);
 }
 
-static struct file_system_type proc_fs_type = {
+struct file_system_type proc_fs_type = {
 	.name		= "proc",
 	.get_sb		= proc_get_sb,
 	.kill_sb	= proc_kill_sb,
 };
+EXPORT_SYMBOL(proc_fs_type);
 
 void __init proc_root_init(void)
 {
@@ -109,6 +179,11 @@ void __init proc_root_init(void)
 	err = register_filesystem(&proc_fs_type);
 	if (err)
 		return;
+
+#ifdef CONFIG_VE
+	get_ve0()->proc_root = &proc_root;
+#endif
+
 	proc_mnt = kern_mount_data(&proc_fs_type, &init_pid_ns);
 	err = PTR_ERR(proc_mnt);
 	if (IS_ERR(proc_mnt)) {
@@ -116,16 +191,21 @@ void __init proc_root_init(void)
 		return;
 	}
 
-	proc_symlink("mounts", NULL, "self/mounts");
+	proc_symlink("mounts", &glob_proc_root, "self/mounts");
+#ifdef CONFIG_VE
+	get_ve0()->proc_mnt = proc_mnt;
+#endif
 
 	proc_net_init();
 
 #ifdef CONFIG_SYSVIPC
-	proc_mkdir("sysvipc", NULL);
+	proc_mkdir("sysvipc", &glob_proc_root);
 #endif
-	proc_mkdir("fs", NULL);
+	proc_mkdir("fs", &glob_proc_root);
+	proc_mkdir("fs", NULL);	/* care about proc_mkdir("fs/xxx", NULL); */
+
 	proc_mkdir("driver", NULL);
-	proc_mkdir("fs/nfsd", NULL); /* somewhere for the nfsd filesystem to be mounted */
+	proc_mkdir("fs/nfsd", &glob_proc_root); /* somewhere for the nfsd filesystem to be mounted */
 #if defined(CONFIG_SUN_OPENPROMFS) || defined(CONFIG_SUN_OPENPROMFS_MODULE)
 	/* just give it a mountpoint */
 	proc_mkdir("openprom", NULL);
@@ -141,8 +221,19 @@ void __init proc_root_init(void)
 static int proc_root_getattr(struct vfsmount *mnt, struct dentry *dentry, struct kstat *stat
 )
 {
+	struct ve_struct *ve = get_exec_env();
+
 	generic_fillattr(dentry->d_inode, stat);
-	stat->nlink = proc_root.nlink + nr_processes();
+	stat->nlink = glob_proc_root.nlink;
+	if (ve_is_super(ve))
+		stat->nlink += nr_processes();
+#ifdef CONFIG_VE
+	else
+		/* thread count. not really processes count */
+		stat->nlink += ve->pcounter;
+	/* the same logic as in the proc_getattr */
+	stat->nlink += ve->proc_root->nlink - 2;
+#endif
 	return 0;
 }
 
@@ -204,6 +295,22 @@ struct proc_dir_entry proc_root = {
 	.proc_fops	= &proc_root_operations,
 	.parent		= &proc_root,
 };
+
+#ifdef CONFIG_VE
+struct proc_dir_entry glob_proc_root = {
+	.low_ino	= PROC_ROOT_INO, 
+	.namelen	= 5, 
+	.name		= "/proc",
+	.mode		= S_IFDIR | S_IRUGO | S_IXUGO, 
+	.nlink		= 2, 
+	.count		= ATOMIC_INIT(1),
+	.proc_iops	= &proc_root_inode_operations, 
+	.proc_fops	= &proc_root_operations,
+	.parent		= &glob_proc_root,
+};
+
+EXPORT_SYMBOL(glob_proc_root);
+#endif
 
 int pid_ns_prepare_proc(struct pid_namespace *ns)
 {

@@ -23,7 +23,6 @@
 #include <linux/vmalloc.h>
 #include <linux/user.h>
 #include <linux/interrupt.h>
-#include <linux/utsname.h>
 #include <linux/delay.h>
 #include <linux/reboot.h>
 #include <linux/init.h>
@@ -35,11 +34,11 @@
 #include <linux/tick.h>
 #include <linux/percpu.h>
 #include <linux/prctl.h>
-#include <linux/dmi.h>
 #include <linux/ftrace.h>
 #include <linux/uaccess.h>
 #include <linux/io.h>
 #include <linux/kdebug.h>
+#include <linux/sysctl.h>
 
 #include <asm/pgtable.h>
 #include <asm/system.h>
@@ -57,9 +56,11 @@
 #include <asm/cpu.h>
 #include <asm/idle.h>
 #include <asm/syscalls.h>
-#include <asm/ds.h>
 
 asmlinkage void ret_from_fork(void) __asm__("ret_from_fork");
+EXPORT_SYMBOL(ret_from_fork);
+asmlinkage void i386_ret_from_resume(void) __asm__("i386_ret_from_resume");
+EXPORT_SYMBOL_GPL(i386_ret_from_resume);
 
 /*
  * Return saved PC of a blocked thread.
@@ -127,7 +128,6 @@ void __show_regs(struct pt_regs *regs, int all)
 	unsigned long d0, d1, d2, d3, d6, d7;
 	unsigned long sp;
 	unsigned short ss, gs;
-	const char *board;
 
 	if (user_mode_vm(regs)) {
 		sp = regs->sp;
@@ -139,27 +139,19 @@ void __show_regs(struct pt_regs *regs, int all)
 		savesegment(gs, gs);
 	}
 
-	printk("\n");
+	show_regs_common();
 
-	board = dmi_get_system_info(DMI_PRODUCT_NAME);
-	if (!board)
-		board = "";
-	printk("Pid: %d, comm: %s %s (%s %.*s) %s\n",
-			task_pid_nr(current), current->comm,
-			print_tainted(), init_utsname()->release,
-			(int)strcspn(init_utsname()->version, " "),
-			init_utsname()->version, board);
-
-	printk("EIP: %04x:[<%08lx>] EFLAGS: %08lx CPU: %d\n",
+	printk(KERN_DEFAULT "EIP: %04x:[<%08lx>] EFLAGS: %08lx CPU: %d\n",
 			(u16)regs->cs, regs->ip, regs->flags,
 			smp_processor_id());
-	print_symbol("EIP is at %s\n", regs->ip);
+	if (decode_call_traces)
+		print_symbol("EIP is at %s\n", regs->ip);
 
-	printk("EAX: %08lx EBX: %08lx ECX: %08lx EDX: %08lx\n",
+	printk(KERN_DEFAULT "EAX: %08lx EBX: %08lx ECX: %08lx EDX: %08lx\n",
 		regs->ax, regs->bx, regs->cx, regs->dx);
-	printk("ESI: %08lx EDI: %08lx EBP: %08lx ESP: %08lx\n",
+	printk(KERN_DEFAULT "ESI: %08lx EDI: %08lx EBP: %08lx ESP: %08lx\n",
 		regs->si, regs->di, regs->bp, sp);
-	printk(" DS: %04x ES: %04x FS: %04x GS: %04x SS: %04x\n",
+	printk(KERN_DEFAULT " DS: %04x ES: %04x FS: %04x GS: %04x SS: %04x\n",
 	       (u16)regs->ds, (u16)regs->es, (u16)regs->fs, gs, ss);
 
 	if (!all)
@@ -169,26 +161,28 @@ void __show_regs(struct pt_regs *regs, int all)
 	cr2 = read_cr2();
 	cr3 = read_cr3();
 	cr4 = read_cr4_safe();
-	printk("CR0: %08lx CR2: %08lx CR3: %08lx CR4: %08lx\n",
+	printk(KERN_DEFAULT "CR0: %08lx CR2: %08lx CR3: %08lx CR4: %08lx\n",
 			cr0, cr2, cr3, cr4);
 
 	get_debugreg(d0, 0);
 	get_debugreg(d1, 1);
 	get_debugreg(d2, 2);
 	get_debugreg(d3, 3);
-	printk("DR0: %08lx DR1: %08lx DR2: %08lx DR3: %08lx\n",
+	printk(KERN_DEFAULT "DR0: %08lx DR1: %08lx DR2: %08lx DR3: %08lx\n",
 			d0, d1, d2, d3);
 
 	get_debugreg(d6, 6);
 	get_debugreg(d7, 7);
-	printk("DR6: %08lx DR7: %08lx\n",
+	printk(KERN_DEFAULT "DR6: %08lx DR7: %08lx\n",
 			d6, d7);
 }
 
 void show_regs(struct pt_regs *regs)
 {
-	__show_regs(regs, 1);
-	show_trace(NULL, regs, &regs->sp, regs->bp);
+	show_registers(regs);
+	show_trace(NULL, regs, &regs->sp);
+	if (!decode_call_traces)
+		printk(" EIP: [<%08lx>]\n", regs->ip);
 }
 
 /*
@@ -197,6 +191,7 @@ void show_regs(struct pt_regs *regs)
  * the "args".
  */
 extern void kernel_thread_helper(void);
+EXPORT_SYMBOL_GPL(kernel_thread_helper);
 
 /*
  * Create a kernel thread
@@ -204,6 +199,13 @@ extern void kernel_thread_helper(void);
 int kernel_thread(int (*fn)(void *), void *arg, unsigned long flags)
 {
 	struct pt_regs regs;
+
+	/* Don't allow kernel_thread() inside VE */
+	if (!ve_allow_kthreads && !ve_is_super(get_exec_env())) {
+		printk("kernel_thread call inside container\n");
+		dump_stack();
+		return -EPERM;
+	}
 
 	memset(&regs, 0, sizeof(regs));
 
@@ -283,20 +285,16 @@ int copy_thread(unsigned long clone_flags, unsigned long sp,
 		kfree(p->thread.io_bitmap_ptr);
 		p->thread.io_bitmap_max = 0;
 	}
-
-	clear_tsk_thread_flag(p, TIF_DS_AREA_MSR);
-	p->thread.ds_ctx = NULL;
-
-	clear_tsk_thread_flag(p, TIF_DEBUGCTLMSR);
-	p->thread.debugctlmsr = 0;
-
 	return err;
 }
 
 void
 start_thread(struct pt_regs *regs, unsigned long new_ip, unsigned long new_sp)
 {
+	int cpu;
+
 	set_user_gs(regs, 0);
+
 	regs->fs		= 0;
 	set_fs(USER_DS);
 	regs->ds		= __USER_DS;
@@ -305,6 +303,11 @@ start_thread(struct pt_regs *regs, unsigned long new_ip, unsigned long new_sp)
 	regs->cs		= __USER_CS;
 	regs->ip		= new_ip;
 	regs->sp		= new_sp;
+
+	cpu = get_cpu();
+	load_user_cs_desc(cpu, current->mm);
+	put_cpu();
+
 	/*
 	 * Free the old FP and other extended state
 	 */
@@ -363,6 +366,9 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	/* we're going to use this soon, after a few expensive things */
 	if (preload_fpu)
 		prefetch(next->xstate);
+
+	if (next_p->mm)
+		load_user_cs_desc(cpu, next_p->mm);
 
 	/*
 	 * Reload esp0.
@@ -497,3 +503,40 @@ unsigned long get_wchan(struct task_struct *p)
 	return 0;
 }
 
+static void modify_cs(struct mm_struct *mm, unsigned long limit)
+{
+	mm->context.exec_limit = limit;
+	set_user_cs(&mm->context.user_cs, limit);
+	if (mm == current->mm) {
+		int cpu;
+
+		cpu = get_cpu();
+		load_user_cs_desc(cpu, mm);
+		put_cpu();
+	}
+}
+
+void arch_add_exec_range(struct mm_struct *mm, unsigned long limit)
+{
+	if (limit > mm->context.exec_limit)
+		modify_cs(mm, limit);
+}
+
+void arch_remove_exec_range(struct mm_struct *mm, unsigned long old_end)
+{
+	struct vm_area_struct *vma;
+	unsigned long limit = PAGE_SIZE;
+
+	if (old_end == mm->context.exec_limit) {
+		for (vma = mm->mmap; vma; vma = vma->vm_next)
+			if ((vma->vm_flags & VM_EXEC) && (vma->vm_end > limit))
+				limit = vma->vm_end;
+		modify_cs(mm, limit);
+	}
+}
+
+void arch_flush_exec_range(struct mm_struct *mm)
+{
+	mm->context.exec_limit = 0;
+	set_user_cs(&mm->context.user_cs, 0);
+}

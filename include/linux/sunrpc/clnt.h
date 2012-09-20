@@ -30,7 +30,7 @@ struct rpc_inode;
  * The high-level client handle
  */
 struct rpc_clnt {
-	struct kref		cl_kref;	/* Number of references */
+	atomic_t		cl_count;	/* Number of references */
 	struct list_head	cl_clients;	/* Global list of clients */
 	struct list_head	cl_tasks;	/* List of tasks */
 	spinlock_t		cl_lock;	/* spinlock */
@@ -102,6 +102,7 @@ struct rpc_procinfo {
 #ifdef __KERNEL__
 
 struct rpc_create_args {
+	struct net		*net;
 	int			protocol;
 	struct sockaddr		*address;
 	size_t			addrsize;
@@ -128,15 +129,18 @@ struct rpc_create_args {
 struct rpc_clnt *rpc_create(struct rpc_create_args *args);
 struct rpc_clnt	*rpc_bind_new_program(struct rpc_clnt *,
 				struct rpc_program *, u32);
+void rpc_task_reset_client(struct rpc_task *task, struct rpc_clnt *clnt);
 struct rpc_clnt *rpc_clone_client(struct rpc_clnt *);
 void		rpc_shutdown_client(struct rpc_clnt *);
 void		rpc_release_client(struct rpc_clnt *);
+void		rpc_task_release_client(struct rpc_task *);
 
+int		rpcb_create_local(void);
+void		rpcb_put_local(void);
 int		rpcb_register(u32, u32, int, unsigned short);
 int		rpcb_v4_register(const u32 program, const u32 version,
 				 const struct sockaddr *address,
 				 const char *netid);
-int		rpcb_getport_sync(struct sockaddr_in *, u32, u32, int);
 void		rpcb_getport_async(struct rpc_task *);
 
 void		rpc_call_start(struct rpc_task *);
@@ -148,8 +152,8 @@ int		rpc_call_sync(struct rpc_clnt *clnt,
 			      const struct rpc_message *msg, int flags);
 struct rpc_task *rpc_call_null(struct rpc_clnt *clnt, struct rpc_cred *cred,
 			       int flags);
-void		rpc_restart_call_prepare(struct rpc_task *);
-void		rpc_restart_call(struct rpc_task *);
+int		rpc_restart_call_prepare(struct rpc_task *);
+int		rpc_restart_call(struct rpc_task *);
 void		rpc_setbufsize(struct rpc_clnt *, unsigned int, unsigned int);
 size_t		rpc_max_payload(struct rpc_clnt *);
 void		rpc_force_rebind(struct rpc_clnt *);
@@ -162,6 +166,9 @@ size_t		rpc_pton(const char *, const size_t,
 char *		rpc_sockaddr2uaddr(const struct sockaddr *);
 size_t		rpc_uaddr2sockaddr(const char *, const size_t,
 				   struct sockaddr *, const size_t);
+
+extern int ve_ip_map_init(void);
+extern void ve_ip_map_exit(void);
 
 static inline unsigned short rpc_get_port(const struct sockaddr *sap)
 {

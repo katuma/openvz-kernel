@@ -24,6 +24,8 @@
  *
  */
 
+#include <linux/module.h>
+
 #include "drm_encoder_slave.h"
 
 /**
@@ -40,6 +42,9 @@
  * driver is transparently loaded) and attach it to the specified
  * &drm_encoder_slave. The @slave_funcs field will be initialized with
  * the hooks provided by the slave driver.
+ *
+ * If @info->platform_data is non-NULL it will be used as the initial
+ * slave config.
  *
  * Returns 0 on success or a negative errno on failure, in particular,
  * -ENODEV is returned when no matching driver is found.
@@ -84,6 +89,10 @@ int drm_i2c_encoder_init(struct drm_device *dev,
 	err = encoder_drv->encoder_init(client, dev, encoder);
 	if (err)
 		goto fail_unregister;
+
+	if (info->platform_data)
+		encoder->slave_funcs->set_config(&encoder->base,
+						 info->platform_data);
 
 	return 0;
 

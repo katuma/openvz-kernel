@@ -24,6 +24,9 @@
 #include <net/tcp_states.h>
 #include <net/xfrm.h>
 
+#include <bc/net.h>
+#include <bc/sock_orphan.h>
+
 #ifdef INET_CSK_DEBUG
 const char inet_csk_timer_bug_msg[] = "inet_csk BUG: unknown timer value\n";
 EXPORT_SYMBOL(inet_csk_timer_bug_msg);
@@ -36,6 +39,9 @@ struct local_ports sysctl_local_ports __read_mostly = {
 	.lock = SEQLOCK_UNLOCKED,
 	.range = { 32768, 61000 },
 };
+
+unsigned long *sysctl_local_reserved_ports;
+EXPORT_SYMBOL(sysctl_local_reserved_ports);
 
 void inet_get_local_port_range(int *low, int *high)
 {
@@ -108,6 +114,8 @@ again:
 
 		smallest_size = -1;
 		do {
+			if (inet_is_reserved_local_port(rover))
+				goto next_nolock;
 			head = &hashinfo->bhash[inet_bhashfn(net, rover,
 					hashinfo->bhash_size)];
 			spin_lock(&head->lock);
@@ -120,16 +128,20 @@ again:
 						smallest_size = tb->num_owners;
 						smallest_rover = rover;
 						if (atomic_read(&hashinfo->bsockets) > (high - low) + 1) {
-							spin_unlock(&head->lock);
 							snum = smallest_rover;
-							goto have_snum;
+							goto tb_found;
 						}
+					}
+					if (!inet_csk(sk)->icsk_af_ops->bind_conflict(sk, tb)) {
+						snum = rover;
+						goto tb_found;
 					}
 					goto next;
 				}
 			break;
 		next:
 			spin_unlock(&head->lock);
+		next_nolock:
 			if (++rover > high)
 				rover = low;
 		} while (--remaining > 0);
@@ -165,6 +177,8 @@ have_snum:
 	goto tb_not_found;
 tb_found:
 	if (!hlist_empty(&tb->owners)) {
+		if (sk->sk_reuse > 1)
+			goto success;
 		if (tb->fastreuse > 0 &&
 		    sk->sk_reuse && sk->sk_state != TCP_LISTEN &&
 		    smallest_size == -1) {
@@ -618,7 +632,7 @@ void inet_csk_destroy_sock(struct sock *sk)
 
 	sk_refcnt_debug_release(sk);
 
-	percpu_counter_dec(sk->sk_prot->orphan_count);
+	ub_dec_orphan_count(sk);
 	sock_put(sk);
 }
 
@@ -698,7 +712,7 @@ void inet_csk_listen_stop(struct sock *sk)
 
 		sock_orphan(child);
 
-		percpu_counter_inc(sk->sk_prot->orphan_count);
+		ub_inc_orphan_count(sk);
 
 		inet_csk_destroy_sock(child);
 

@@ -351,6 +351,9 @@ ip6t_do_table(struct sk_buff *skb,
 	struct xt_match_param mtpar;
 	struct xt_target_param tgpar;
 
+	if (ve_xt_table_forbidden(table))
+		return NF_ACCEPT;
+
 	/* Initialization */
 	indev = in ? in->name : nulldevname;
 	outdev = out ? out->name : nulldevname;
@@ -1164,10 +1167,10 @@ static int get_info(struct net *net, void __user *user, int *len, int compat)
 	if (t && !IS_ERR(t)) {
 		struct ip6t_getinfo info;
 		const struct xt_table_info *private = t->private;
-
 #ifdef CONFIG_COMPAT
+		struct xt_table_info tmp;
+
 		if (compat) {
-			struct xt_table_info tmp;
 			ret = compat_table_info(private, &tmp);
 			xt_compat_flush_offsets(AF_INET6);
 			private = &tmp;
@@ -1323,6 +1326,7 @@ do_replace(struct net *net, void __user *user, unsigned int len)
 	/* overflow check */
 	if (tmp.num_counters >= INT_MAX / sizeof(struct xt_counters))
 		return -ENOMEM;
+	tmp.name[sizeof(tmp.name)-1] = 0;
 
 	newinfo = xt_alloc_table_info(tmp.size);
 	if (!newinfo)
@@ -1647,7 +1651,7 @@ check_compat_entry_size_and_hooks(struct compat_ip6t_entry *e,
 out:
 	module_put(t->u.kernel.target->me);
 release_matches:
-	IP6T_MATCH_ITERATE(e, compat_release_match, &j);
+	COMPAT_IP6T_MATCH_ITERATE(e, compat_release_match, &j);
 	return ret;
 }
 
@@ -1855,6 +1859,7 @@ compat_do_replace(struct net *net, void __user *user, unsigned int len)
 		return -ENOMEM;
 	if (tmp.num_counters >= INT_MAX / sizeof(struct xt_counters))
 		return -ENOMEM;
+	tmp.name[sizeof(tmp.name)-1] = 0;
 
 	newinfo = xt_alloc_table_info(tmp.size);
 	if (!newinfo)
@@ -1896,7 +1901,7 @@ compat_do_ip6t_set_ctl(struct sock *sk, int cmd, void __user *user,
 {
 	int ret;
 
-	if (!capable(CAP_NET_ADMIN))
+	if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 		return -EPERM;
 
 	switch (cmd) {
@@ -2007,7 +2012,7 @@ compat_do_ip6t_get_ctl(struct sock *sk, int cmd, void __user *user, int *len)
 {
 	int ret;
 
-	if (!capable(CAP_NET_ADMIN))
+	if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 		return -EPERM;
 
 	switch (cmd) {
@@ -2029,7 +2034,7 @@ do_ip6t_set_ctl(struct sock *sk, int cmd, void __user *user, unsigned int len)
 {
 	int ret;
 
-	if (!capable(CAP_NET_ADMIN))
+	if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 		return -EPERM;
 
 	switch (cmd) {
@@ -2054,7 +2059,7 @@ do_ip6t_get_ctl(struct sock *sk, int cmd, void __user *user, int *len)
 {
 	int ret;
 
-	if (!capable(CAP_NET_ADMIN))
+	if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 		return -EPERM;
 
 	switch (cmd) {
@@ -2079,6 +2084,7 @@ do_ip6t_get_ctl(struct sock *sk, int cmd, void __user *user, int *len)
 			ret = -EFAULT;
 			break;
 		}
+		rev.name[sizeof(rev.name)-1] = 0;
 
 		if (cmd == IP6T_SO_GET_REVISION_TARGET)
 			target = 1;
@@ -2107,7 +2113,7 @@ struct xt_table *ip6t_register_table(struct net *net,
 	int ret;
 	struct xt_table_info *newinfo;
 	struct xt_table_info bootstrap
-		= { 0, 0, 0, { 0 }, { 0 }, { } };
+		= { 0, 0, 0, 0, { 0 }, { 0 }, { } };
 	void *loc_cpu_entry;
 	struct xt_table *new_table;
 
@@ -2252,12 +2258,25 @@ static struct xt_match icmp6_matchstruct __read_mostly = {
 
 static int __net_init ip6_tables_net_init(struct net *net)
 {
-	return xt_proto_init(net, NFPROTO_IPV6);
+	int res;
+
+	if (!net_ipt_permitted(net, VE_IP_IPTABLES6))
+		return 0;
+
+	res = xt_proto_init(net, NFPROTO_IPV6);
+	if (!res)
+		net_ipt_module_set(net, VE_IP_IPTABLES6);
+	return res;
 }
 
 static void __net_exit ip6_tables_net_exit(struct net *net)
 {
+	if (!net_is_ipt_module_set(net, VE_IP_IPTABLES6))
+		return;
+
 	xt_proto_fini(net, NFPROTO_IPV6);
+
+	net_ipt_module_clear(net, VE_IP_IPTABLES6);
 }
 
 static struct pernet_operations ip6_tables_net_ops = {

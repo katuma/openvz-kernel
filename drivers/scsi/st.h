@@ -35,8 +35,8 @@ struct st_request {
 /* The tape buffer descriptor. */
 struct st_buffer {
 	unsigned char dma;	/* DMA-able buffer */
-	unsigned char do_dio;   /* direct i/o set up? */
 	unsigned char cleared;  /* internal buffer cleared after open? */
+	unsigned short do_dio;   /* direct i/o set up? */
 	int buffer_size;
 	int buffer_blocks;
 	int buffer_bytes;
@@ -46,6 +46,7 @@ struct st_buffer {
 	struct st_request *last_SRpnt;
 	struct st_cmdstatus cmdstat;
 	struct page **reserved_pages;
+	int reserved_page_order;
 	struct page **mapped_pages;
 	struct rq_map_data map_data;
 	unsigned char *b_data;

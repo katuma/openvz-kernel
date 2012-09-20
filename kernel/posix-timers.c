@@ -47,6 +47,8 @@
 #include <linux/workqueue.h>
 #include <linux/module.h>
 
+#include <bc/beancounter.h>
+
 /*
  * Management arrays for POSIX timers.	 Timers are kept in slab memory
  * Timer ids are allocated by an external routine that keeps track of the
@@ -159,6 +161,38 @@ static inline void unlock_timer(struct k_itimer *timr, unsigned long flags)
  	((clock) < 0 ? posix_cpu_##call arglist : \
  	 (posix_clocks[clock].call != NULL \
  	  ? (*posix_clocks[clock].call) arglist : common_##call arglist))
+
+#define clock_is_monotonic(which_clock) \
+	((which_clock) == CLOCK_MONOTONIC || \
+	 (which_clock) == CLOCK_MONOTONIC_RAW || \
+	 (which_clock) == CLOCK_MONOTONIC_COARSE)
+
+#ifdef CONFIG_VE
+static void monotonic_abs_to_ve(clockid_t which_clock, struct timespec *tp)
+{
+	struct ve_struct *ve = get_exec_env();
+
+	if (clock_is_monotonic(which_clock))
+		set_normalized_timespec(tp,
+				tp->tv_sec - ve->start_timespec.tv_sec,
+				tp->tv_nsec - ve->start_timespec.tv_nsec);
+}
+
+static void monotonic_ve_to_abs(clockid_t which_clock, struct timespec *tp)
+{
+	struct ve_struct *ve = get_exec_env();
+
+	if (clock_is_monotonic(which_clock))
+		set_normalized_timespec(tp,
+				tp->tv_sec + ve->start_timespec.tv_sec,
+				tp->tv_nsec + ve->start_timespec.tv_nsec);
+}
+#else
+static inline void monotonic_abs_to_ve(clockid_t which_clock,
+				       struct timespec *tp) { }
+static inline void monotonic_ve_to_abs(clockid_t which_clock,
+				       struct timepsec *tp) { }
+#endif
 
 /*
  * Default clock hook functions when the struct k_clock passed
@@ -303,8 +337,8 @@ static __init int init_posix_timers(void)
 	register_posix_clock(CLOCK_MONOTONIC_COARSE, &clock_monotonic_coarse);
 
 	posix_timers_cache = kmem_cache_create("posix_timers_cache",
-					sizeof (struct k_itimer), 0, SLAB_PANIC,
-					NULL);
+					sizeof (struct k_itimer), 0,
+					SLAB_PANIC|SLAB_UBC, NULL);
 	idr_init(&posix_timers_id);
 	return 0;
 }
@@ -379,8 +413,17 @@ int posix_timer_event(struct k_itimer *timr, int si_private)
 	rcu_read_lock();
 	task = pid_task(timr->it_pid, PIDTYPE_PID);
 	if (task) {
+		struct ve_struct *ve;
+		struct user_beancounter *ub;
+
+		ve = set_exec_env(task->ve_task_info.owner_env);
+		ub = set_exec_ub(task->task_bc.task_ub);
+
 		shared = !(timr->it_sigev_notify & SIGEV_THREAD_ID);
 		ret = send_sigqueue(timr->sigq, task, shared);
+
+		(void)set_exec_ub(ub);
+		(void)set_exec_env(ve);
 	}
 	rcu_read_unlock();
 	/* If we failed to send the signal the timer stops. */
@@ -502,6 +545,13 @@ static struct k_itimer * alloc_posix_timer(void)
 	return tmr;
 }
 
+static void k_itimer_rcu_free(struct rcu_head *head)
+{
+	struct k_itimer *tmr = container_of(head, struct k_itimer, it.rcu);
+
+	kmem_cache_free(posix_timers_cache, tmr);
+}
+
 #define IT_ID_SET	1
 #define IT_ID_NOT_SET	0
 static void release_posix_timer(struct k_itimer *tmr, int it_id_set)
@@ -514,7 +564,7 @@ static void release_posix_timer(struct k_itimer *tmr, int it_id_set)
 	}
 	put_pid(tmr->it_pid);
 	sigqueue_free(tmr->sigq);
-	kmem_cache_free(posix_timers_cache, tmr);
+	call_rcu(&tmr->it.rcu, k_itimer_rcu_free);
 }
 
 /* Create a POSIX.1b interval timer. */
@@ -559,9 +609,6 @@ SYSCALL_DEFINE3(timer_create, const clockid_t, which_clock,
 	new_timer->it_id = (timer_t) new_timer_id;
 	new_timer->it_clock = which_clock;
 	new_timer->it_overrun = -1;
-	error = CLOCK_DISPATCH(which_clock, timer_create, (new_timer));
-	if (error)
-		goto out;
 
 	/*
 	 * return the timer_id now.  The next step is hard to
@@ -597,6 +644,10 @@ SYSCALL_DEFINE3(timer_create, const clockid_t, which_clock,
 	new_timer->sigq->info.si_tid   = new_timer->it_id;
 	new_timer->sigq->info.si_code  = SI_TIMER;
 
+	error = CLOCK_DISPATCH(which_clock, timer_create, (new_timer));
+	if (error)
+		goto out;
+
 	spin_lock_irq(&current->sighand->siglock);
 	new_timer->it_signal = current->signal;
 	list_add(&new_timer->list, &current->signal->posix_timers);
@@ -624,22 +675,18 @@ out:
 static struct k_itimer *lock_timer(timer_t timer_id, unsigned long *flags)
 {
 	struct k_itimer *timr;
-	/*
-	 * Watch out here.  We do a irqsave on the idr_lock and pass the
-	 * flags part over to the timer lock.  Must not let interrupts in
-	 * while we are moving the lock.
-	 */
-	spin_lock_irqsave(&idr_lock, *flags);
+
+	rcu_read_lock();
 	timr = idr_find(&posix_timers_id, (int)timer_id);
 	if (timr) {
-		spin_lock(&timr->it_lock);
+		spin_lock_irqsave(&timr->it_lock, *flags);
 		if (timr->it_signal == current->signal) {
-			spin_unlock(&idr_lock);
+			rcu_read_unlock();
 			return timr;
 		}
-		spin_unlock(&timr->it_lock);
+		spin_unlock_irqrestore(&timr->it_lock, *flags);
 	}
-	spin_unlock_irqrestore(&idr_lock, *flags);
+	rcu_read_unlock();
 
 	return NULL;
 }
@@ -824,6 +871,9 @@ retry:
 	if (!timr)
 		return -EINVAL;
 
+	if ((flags & TIMER_ABSTIME) &&
+	    (new_spec.it_value.tv_sec || new_spec.it_value.tv_nsec))
+		monotonic_ve_to_abs(timr->it_clock, &new_spec.it_value);
 	error = CLOCK_DISPATCH(timr->it_clock, timer_set,
 			       (timr, flags, &new_spec, rtn));
 
@@ -964,6 +1014,7 @@ SYSCALL_DEFINE2(clock_gettime, const clockid_t, which_clock,
 		return -EINVAL;
 	error = CLOCK_DISPATCH(which_clock, clock_get,
 			       (which_clock, &kernel_tp));
+	monotonic_abs_to_ve(which_clock, &kernel_tp);
 	if (!error && copy_to_user(tp, &kernel_tp, sizeof (kernel_tp)))
 		error = -EFAULT;
 
@@ -1015,6 +1066,9 @@ SYSCALL_DEFINE4(clock_nanosleep, const clockid_t, which_clock, int, flags,
 
 	if (!timespec_valid(&t))
 		return -EINVAL;
+
+	if (flags & TIMER_ABSTIME)
+		monotonic_ve_to_abs(which_clock, &t);
 
 	return CLOCK_DISPATCH(which_clock, nsleep,
 			      (which_clock, flags, &t, rmtp));

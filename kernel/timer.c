@@ -37,8 +37,9 @@
 #include <linux/delay.h>
 #include <linux/tick.h>
 #include <linux/kallsyms.h>
-#include <linux/perf_event.h>
+#include <linux/irq_work.h>
 #include <linux/sched.h>
+#include <linux/virtinfo.h>
 
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
@@ -557,6 +558,19 @@ static void __init_timer(struct timer_list *timer,
 	lockdep_init_map(&timer->lockdep_map, name, key, 0);
 }
 
+void setup_deferrable_timer_on_stack_key(struct timer_list *timer,
+					 const char *name,
+					 struct lock_class_key *key,
+					 void (*function)(unsigned long),
+					 unsigned long data)
+{
+	timer->function = function;
+	timer->data = data;
+	init_timer_on_stack_key(timer, name, key);
+	timer_set_deferrable(timer);
+}
+EXPORT_SYMBOL_GPL(setup_deferrable_timer_on_stack_key);
+
 /**
  * init_timer_key - initialize a timer
  * @timer: the timer to be initialized
@@ -661,12 +675,8 @@ __mod_timer(struct timer_list *timer, unsigned long expires,
 	cpu = smp_processor_id();
 
 #if defined(CONFIG_NO_HZ) && defined(CONFIG_SMP)
-	if (!pinned && get_sysctl_timer_migration() && idle_cpu(cpu)) {
-		int preferred_cpu = get_nohz_load_balancer();
-
-		if (preferred_cpu >= 0)
-			cpu = preferred_cpu;
-	}
+	if (!pinned && get_sysctl_timer_migration() && idle_cpu(cpu))
+		cpu = get_nohz_timer_target();
 #endif
 	new_base = per_cpu(tvec_bases, cpu);
 
@@ -1000,6 +1010,7 @@ static inline void __run_timers(struct tvec_base *base)
 			spin_unlock_irq(&base->lock);
 			{
 				int preempt_count = preempt_count();
+				struct ve_struct *ve;
 
 #ifdef CONFIG_LOCKDEP
 				/*
@@ -1023,7 +1034,9 @@ static inline void __run_timers(struct tvec_base *base)
 				lock_map_acquire(&lockdep_map);
 
 				trace_timer_expire_entry(timer);
+				ve = set_exec_env(get_ve0());
 				fn(data);
+				(void)set_exec_env(ve);
 				trace_timer_expire_exit(timer);
 
 				lock_map_release(&lockdep_map);
@@ -1173,6 +1186,12 @@ unsigned long get_next_timer_interrupt(unsigned long now)
 	struct tvec_base *base = __get_cpu_var(tvec_bases);
 	unsigned long expires;
 
+	/*
+	 * Pretend that there is no timer pending if the cpu is offline.
+	 * Possible pending timers will be migrated later to an active cpu.
+	 */
+	if (cpu_is_offline(smp_processor_id()))
+		return now + NEXT_TIMER_MAX_DELTA;
 	spin_lock(&base->lock);
 	if (time_before_eq(base->next_timer, base->timer_jiffies))
 		base->next_timer = __next_timer_interrupt(base);
@@ -1200,6 +1219,10 @@ void update_process_times(int user_tick)
 	run_local_timers();
 	rcu_check_callbacks(cpu, user_tick);
 	printk_tick();
+#ifdef CONFIG_IRQ_WORK
+	if (in_irq())
+		irq_work_run();
+#endif
 	scheduler_tick();
 	run_posix_cpu_timers(p);
 }
@@ -1210,8 +1233,6 @@ void update_process_times(int user_tick)
 static void run_timer_softirq(struct softirq_action *h)
 {
 	struct tvec_base *base = __get_cpu_var(tvec_bases);
-
-	perf_event_do_pending();
 
 	hrtimer_run_pending();
 
@@ -1226,7 +1247,6 @@ void run_local_timers(void)
 {
 	hrtimer_run_queues();
 	raise_softirq(TIMER_SOFTIRQ);
-	softlockup_tick();
 }
 
 /*
@@ -1287,7 +1307,7 @@ SYSCALL_DEFINE0(getppid)
 	int pid;
 
 	rcu_read_lock();
-	pid = task_tgid_vnr(current->real_parent);
+	pid = ve_task_ppid_nr_ns(current, current->nsproxy->pid_ns);
 	rcu_read_unlock();
 
 	return pid;
@@ -1441,19 +1461,34 @@ int do_sysinfo(struct sysinfo *info)
 	unsigned long mem_total, sav_total;
 	unsigned int mem_unit, bitcount;
 	struct timespec tp;
+	struct ve_struct *ve;
 
 	memset(info, 0, sizeof(struct sysinfo));
+	si_meminfo(info);
+	si_swapinfo(info);
+
+#ifdef CONFIG_BEANCOUNTERS
+	if (virtinfo_notifier_call(VITYPE_GENERAL, VIRTINFO_SYSINFO, info)
+			& NOTIFY_FAIL)
+		return -ENOMSG;
+#endif
+	ve = get_exec_env();
 
 	ktime_get_ts(&tp);
 	monotonic_to_bootbased(&tp);
 	info->uptime = tp.tv_sec + (tp.tv_nsec ? 1 : 0);
 
-	get_avenrun(info->loads, 0, SI_LOAD_SHIFT - FSHIFT);
+	if (ve_is_super(ve)) {
+		get_avenrun(info->loads, 0, SI_LOAD_SHIFT - FSHIFT);
 
-	info->procs = nr_threads;
+		info->procs = nr_threads;
+	} else {
+		info->uptime -= ve->real_start_timespec.tv_sec;
 
-	si_meminfo(info);
-	si_swapinfo(info);
+		info->procs = ve->pcounter;
+
+		get_avenrun_ve(info->loads, 0, SI_LOAD_SHIFT - FSHIFT);
+	}
 
 	/*
 	 * If the sum of all the available memory (i.e. ram + swap)
@@ -1684,3 +1719,25 @@ unsigned long msleep_interruptible(unsigned int msecs)
 }
 
 EXPORT_SYMBOL(msleep_interruptible);
+
+static int __sched do_usleep_range(unsigned long min, unsigned long max)
+{
+	ktime_t kmin;
+	unsigned long delta;
+
+	kmin = ktime_set(0, min * NSEC_PER_USEC);
+	delta = (max - min) * NSEC_PER_USEC;
+	return schedule_hrtimeout_range(&kmin, delta, HRTIMER_MODE_REL);
+}
+
+/**
+ * usleep_range - Drop in replacement for udelay where wakeup is flexible
+ * @min: Minimum time in usecs to sleep
+ * @max: Maximum time in usecs to sleep
+ */
+void usleep_range(unsigned long min, unsigned long max)
+{
+	__set_current_state(TASK_UNINTERRUPTIBLE);
+	do_usleep_range(min, max);
+}
+EXPORT_SYMBOL(usleep_range);

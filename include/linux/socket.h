@@ -65,6 +65,12 @@ struct msghdr {
 	unsigned	msg_flags;
 };
 
+/* For recvmmsg/sendmmsg */
+struct mmsghdr {
+	struct msghdr   msg_hdr;
+	unsigned        msg_len;
+};
+
 /*
  *	POSIX 1003.1g - ancillary data object information
  *	Ancillary data consits of a sequence of pairs of
@@ -296,6 +302,16 @@ struct ucred {
 #define IPX_TYPE	1
 
 #ifdef __KERNEL__
+
+#define MAX_SOCK_ADDR	128		/* 108 for Unix domain -
+					   16 for IP, 16 for IPX,
+					   24 for IPv6,
+					   about 80 for AX.25
+					   must be at least one bigger than
+					   the AF_UNIX size (see net/unix/af_unix.c
+					   :unix_mkname()).
+					 */
+
 extern int memcpy_fromiovec(unsigned char *kdata, struct iovec *iov, int len);
 extern int memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
 			       int offset, int len);
@@ -311,7 +327,15 @@ extern int memcpy_toiovecend(const struct iovec *v, unsigned char *kdata,
 extern int move_addr_to_user(struct sockaddr *kaddr, int klen, void __user *uaddr, int __user *ulen);
 extern int move_addr_to_kernel(void __user *uaddr, int ulen, struct sockaddr *kaddr);
 extern int put_cmsg(struct msghdr*, int level, int type, int len, void *data);
+extern int vz_security_family_check(int family);
+extern int vz_security_protocol_check(int protocol);
 
+struct timespec;
+
+extern int __sys_recvmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
+			  unsigned int flags, struct timespec *timeout);
+extern int __sys_sendmmsg(int fd, struct mmsghdr __user *mmsg,
+			  unsigned int vlen, unsigned int flags);
 #endif
 #endif /* not kernel and not glibc */
 #endif /* _LINUX_SOCKET_H */

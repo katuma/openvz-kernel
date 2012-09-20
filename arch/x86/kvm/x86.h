@@ -35,4 +35,9 @@ static inline bool kvm_exception_is_soft(unsigned int nr)
 struct kvm_cpuid_entry2 *kvm_find_cpuid_entry(struct kvm_vcpu *vcpu,
                                              u32 function, u32 index);
 
+void kvm_write_tsc(struct kvm_vcpu *vcpu, u64 data);
+
+void kvm_before_handle_nmi(struct kvm_vcpu *vcpu);
+void kvm_after_handle_nmi(struct kvm_vcpu *vcpu);
+
 #endif

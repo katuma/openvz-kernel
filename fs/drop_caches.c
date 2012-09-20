@@ -58,7 +58,7 @@ static void drop_slab(void)
 	int nr_objects;
 
 	do {
-		nr_objects = shrink_slab(1000, GFP_KERNEL, 1000);
+		nr_objects = shrink_slab(1000, GFP_KERNEL|__GFP_REPEAT, 1000);
 	} while (nr_objects > 10);
 }
 

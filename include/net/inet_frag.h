@@ -15,6 +15,9 @@ struct netns_frags {
 struct inet_frag_queue {
 	struct hlist_node	list;
 	struct netns_frags	*net;
+#ifdef CONFIG_VE
+	struct ve_struct	*owner_ve;
+#endif
 	struct list_head	lru_list;   /* lru list member */
 	spinlock_t		lock;
 	atomic_t		refcnt;

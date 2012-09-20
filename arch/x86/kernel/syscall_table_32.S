@@ -191,7 +191,7 @@ ENTRY(sys_call_table)
 	.long sys_ni_syscall	/* reserved for streams2 */
 	.long ptregs_vfork	/* 190 */
 	.long sys_getrlimit
-	.long sys_mmap2
+	.long sys_mmap_pgoff
 	.long sys_truncate64
 	.long sys_ftruncate64
 	.long sys_stat64	/* 195 */
@@ -336,3 +336,36 @@ ENTRY(sys_call_table)
 	.long sys_pwritev
 	.long sys_rt_tgsigqueueinfo	/* 335 */
 	.long sys_perf_event_open
+	.long sys_recvmmsg
+	.long sys_ni_syscall	/* sys_fanotify_init */
+	.long sys_ni_syscall	/* sys_fanotify_mark */
+	.long sys_ni_syscall	/* sys_prlimit64  340 */
+	.long sys_name_to_handle_at
+	.long sys_open_by_handle_at
+	.long sys_ni_syscall	/* sys_clock_adjtime */
+	.long sys_syncfs
+	.long sys_sendmmsg		/* 345 */
+	.long sys_ni_syscall	/* set_ns */
+	.long sys_process_vm_readv
+	.long sys_process_vm_writev
+	.rept 500-(.-sys_call_table)/4
+		.long sys_ni_syscall
+	.endr
+	.long sys_fairsched_mknod	/* 500 */
+	.long sys_fairsched_rmnod
+	.long sys_fairsched_chwt
+	.long sys_fairsched_mvpr
+	.long sys_fairsched_rate
+	.long sys_fairsched_vcpus	/* 505 */
+	.long sys_fairsched_cpumask
+	.long sys_fairsched_nodemask
+	.long sys_ni_syscall
+	.long sys_ni_syscall
+	.long sys_getluid		/* 510 */
+	.long sys_setluid
+	.long sys_setublimit
+	.long sys_ubstat
+	.long sys_ni_syscall
+	.long sys_ni_syscall		/* 515 */
+	.long sys_lchmod
+	.long sys_lutime

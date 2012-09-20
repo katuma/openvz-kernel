@@ -1,6 +1,8 @@
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/init.h>
+#include <linux/sched.h>
+#include <linux/ve.h>
 #include <asm/processor.h>
 #include <asm/msr.h>
 #include "cpu.h"
@@ -26,7 +28,7 @@ static void __cpuinit init_transmeta(struct cpuinfo_x86 *c)
 
 	early_init_transmeta(c);
 
-	display_cacheinfo(c);
+	cpu_detect_cache_sizes(c);
 
 	/* Print CMS and CPU revision */
 	max = cpuid_eax(0x80860000);

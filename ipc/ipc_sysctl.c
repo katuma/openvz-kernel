@@ -31,10 +31,35 @@ static int proc_ipc_dointvec(ctl_table *table, int write,
 	void __user *buffer, size_t *lenp, loff_t *ppos)
 {
 	struct ctl_table ipc_table;
+
 	memcpy(&ipc_table, table, sizeof(ipc_table));
 	ipc_table.data = get_ipc(table);
 
 	return proc_dointvec(&ipc_table, write, buffer, lenp, ppos);
+}
+
+static int proc_ipc_dointvec_minmax(ctl_table *table, int write,
+	void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct ctl_table ipc_table;
+
+	memcpy(&ipc_table, table, sizeof(ipc_table));
+	ipc_table.data = get_ipc(table);
+
+	return proc_dointvec_minmax(&ipc_table, write, buffer, lenp, ppos);
+}
+
+static int proc_ipc_dointvec_minmax_orphans(ctl_table *table, int write,
+	void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct ipc_namespace *ns = current->nsproxy->ipc_ns;
+	int err = proc_ipc_dointvec_minmax(table, write, buffer, lenp, ppos);
+
+	if (err < 0)
+		return err;
+	if (ns->shm_rmid_forced)
+		shm_destroy_orphaned(ns);
+	return err;
 }
 
 static int proc_ipc_callback_dointvec(ctl_table *table, int write,
@@ -125,6 +150,8 @@ static int proc_ipcauto_dointvec_minmax(ctl_table *table, int write,
 #else
 #define proc_ipc_doulongvec_minmax NULL
 #define proc_ipc_dointvec	   NULL
+#define proc_ipc_dointvec_minmax   NULL
+#define proc_ipc_dointvec_minmax_orphans   NULL
 #define proc_ipc_callback_dointvec NULL
 #define proc_ipcauto_dointvec_minmax NULL
 #endif
@@ -222,6 +249,15 @@ static struct ctl_table ipc_kern_table[] = {
 		.strategy	= sysctl_ipc_data,
 	},
 	{
+		.procname       = "shm_rmid_forced",
+		.data           = &init_ipc_ns.shm_rmid_forced,
+		.maxlen         = sizeof(init_ipc_ns.shm_rmid_forced),
+		.mode           = 0644,
+		.proc_handler   = proc_ipc_dointvec_minmax_orphans,
+		.extra1         = &zero,
+		.extra2         = &one,
+	},
+	{
 		.ctl_name	= KERN_MSGMAX,
 		.procname	= "msgmax",
 		.data		= &init_ipc_ns.msg_ctlmax,
@@ -270,19 +306,14 @@ static struct ctl_table ipc_kern_table[] = {
 	{}
 };
 
-static struct ctl_table ipc_root_table[] = {
-	{
-		.ctl_name	= CTL_KERN,
-		.procname	= "kernel",
-		.mode		= 0555,
-		.child		= ipc_kern_table,
-	},
+static struct ctl_path ipc_path[] = {
+	{ .ctl_name = CTL_KERN, .procname = "kernel", },
 	{}
 };
 
 static int __init ipc_sysctl_init(void)
 {
-	register_sysctl_table(ipc_root_table);
+	register_sysctl_glob_paths(ipc_path, ipc_kern_table, 1);
 	return 0;
 }
 

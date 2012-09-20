@@ -272,6 +272,7 @@ int ip6_mc_input(struct sk_buff *skb)
 			u8 *ptr = skb_network_header(skb) + opt->ra;
 			struct icmp6hdr *icmp6;
 			u8 nexthdr = hdr->nexthdr;
+			__be16 frag_off;
 			int offset;
 
 			/* Check if the value of Router Alert
@@ -284,8 +285,8 @@ int ip6_mc_input(struct sk_buff *skb)
 					/* BUG */
 					goto out;
 				}
-				offset = ipv6_skip_exthdr(skb, sizeof(*hdr),
-							  &nexthdr);
+				offset = __ipv6_skip_exthdr(skb, sizeof(*hdr),
+							    &nexthdr, &frag_off);
 				if (offset < 0)
 					goto out;
 

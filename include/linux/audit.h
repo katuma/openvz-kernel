@@ -26,6 +26,7 @@
 
 #include <linux/types.h>
 #include <linux/elf-em.h>
+#include <linux/ptrace.h>
 
 /* The netlink messages for the audit system is divided into blocks:
  * 1000 - 1099 are for commanding the audit system
@@ -102,6 +103,9 @@
 #define AUDIT_EOE		1320	/* End of multi-record event */
 #define AUDIT_BPRM_FCAPS	1321	/* Information about fcaps increasing perms */
 #define AUDIT_CAPSET		1322	/* Record showing argument to sys_capset */
+#define AUDIT_MMAP		1323	/* Record showing descriptor and flags in mmap */
+#define AUDIT_NETFILTER_PKT	1324	/* Packets traversing netfilter chains */
+#define AUDIT_NETFILTER_CFG	1325	/* Netfilter chain modifications */
 
 #define AUDIT_AVC		1400	/* SE Linux avc denial or grant */
 #define AUDIT_SELINUX_ERR	1401	/* Internal SE Linux Errors */
@@ -178,6 +182,40 @@
  * AUDIT_UNUSED_BITS is updated if need be. */
 #define AUDIT_UNUSED_BITS	0x07FFFC00
 
+/* AUDIT_FIELD_COMPARE rule list */
+#define AUDIT_COMPARE_UID_TO_OBJ_UID	1
+#define AUDIT_COMPARE_GID_TO_OBJ_GID	2
+#define AUDIT_COMPARE_EUID_TO_OBJ_UID	3
+#define AUDIT_COMPARE_EGID_TO_OBJ_GID	4
+#define AUDIT_COMPARE_AUID_TO_OBJ_UID	5
+#define AUDIT_COMPARE_SUID_TO_OBJ_UID	6
+#define AUDIT_COMPARE_SGID_TO_OBJ_GID	7
+#define AUDIT_COMPARE_FSUID_TO_OBJ_UID	8
+#define AUDIT_COMPARE_FSGID_TO_OBJ_GID	9
+
+#define AUDIT_COMPARE_UID_TO_AUID	10
+#define AUDIT_COMPARE_UID_TO_EUID	11
+#define AUDIT_COMPARE_UID_TO_FSUID	12
+#define AUDIT_COMPARE_UID_TO_SUID	13
+
+#define AUDIT_COMPARE_AUID_TO_FSUID	14
+#define AUDIT_COMPARE_AUID_TO_SUID	15
+#define AUDIT_COMPARE_AUID_TO_EUID	16
+
+#define AUDIT_COMPARE_EUID_TO_SUID	17
+#define AUDIT_COMPARE_EUID_TO_FSUID	18
+
+#define AUDIT_COMPARE_SUID_TO_FSUID	19
+
+#define AUDIT_COMPARE_GID_TO_EGID	20
+#define AUDIT_COMPARE_GID_TO_FSGID	21
+#define AUDIT_COMPARE_GID_TO_SGID	22
+
+#define AUDIT_COMPARE_EGID_TO_FSGID	23
+#define AUDIT_COMPARE_EGID_TO_SGID	24
+#define AUDIT_COMPARE_SGID_TO_FSGID	25
+
+#define AUDIT_MAX_FIELD_COMPARE		AUDIT_COMPARE_SGID_TO_FSGID
 
 /* Rule fields */
 				/* These are useful when checking the
@@ -219,6 +257,9 @@
 #define AUDIT_PERM	106
 #define AUDIT_DIR	107
 #define AUDIT_FILETYPE	108
+#define AUDIT_OBJ_UID	109
+#define AUDIT_OBJ_GID	110
+#define AUDIT_FIELD_COMPARE	111
 
 #define AUDIT_ARG0      200
 #define AUDIT_ARG1      (AUDIT_ARG0+1)
@@ -404,10 +445,6 @@ struct audit_field {
 	void				*lsm_rule;
 };
 
-#define AUDITSC_INVALID 0
-#define AUDITSC_SUCCESS 1
-#define AUDITSC_FAILURE 2
-#define AUDITSC_RESULT(x) ( ((long)(x))<0?AUDITSC_FAILURE:AUDITSC_SUCCESS )
 extern int __init audit_register_class(int class, unsigned *list);
 extern int audit_classify_syscall(int abi, unsigned syscall);
 extern int audit_classify_arch(int arch);
@@ -420,7 +457,7 @@ extern void audit_free(struct task_struct *task);
 extern void audit_syscall_entry(int arch,
 				int major, unsigned long a0, unsigned long a1,
 				unsigned long a2, unsigned long a3);
-extern void audit_syscall_exit(int failed, long return_code);
+extern void __audit_syscall_exit(int ret_success, long ret_value);
 extern void __audit_getname(const char *name);
 extern void audit_putname(const char *name);
 extern void __audit_inode(const char *name, const struct dentry *dentry);
@@ -432,6 +469,15 @@ static inline int audit_dummy_context(void)
 {
 	void *p = current->audit_context;
 	return !p || *(int *)p;
+}
+static inline void audit_syscall_exit(void *pt_regs)
+{
+	if (unlikely(current->audit_context)) {
+		int success = is_syscall_success(pt_regs);
+		int return_code = regs_return_value(pt_regs);
+
+		__audit_syscall_exit(success, return_code);
+	}
 }
 static inline void audit_getname(const char *name)
 {
@@ -479,6 +525,7 @@ extern int __audit_log_bprm_fcaps(struct linux_binprm *bprm,
 				  const struct cred *new,
 				  const struct cred *old);
 extern void __audit_log_capset(pid_t pid, const struct cred *new, const struct cred *old);
+extern void __audit_mmap_fd(int fd, int flags);
 
 static inline void audit_ipc_obj(struct kern_ipc_perm *ipcp)
 {
@@ -532,14 +579,20 @@ static inline void audit_log_capset(pid_t pid, const struct cred *new,
 		__audit_log_capset(pid, new, old);
 }
 
+static inline void audit_mmap_fd(int fd, int flags)
+{
+	if (unlikely(!audit_dummy_context()))
+		__audit_mmap_fd(fd, flags);
+}
+
 extern int audit_n_rules;
 extern int audit_signals;
-#else
+#else /* CONFIG_AUDITSYSCALL */
 #define audit_finish_fork(t)
 #define audit_alloc(t) ({ 0; })
 #define audit_free(t) do { ; } while (0)
 #define audit_syscall_entry(ta,a,b,c,d,e) do { ; } while (0)
-#define audit_syscall_exit(f,r) do { ; } while (0)
+#define audit_syscall_exit(r) do { ; } while (0)
 #define audit_dummy_context() 1
 #define audit_getname(n) do { ; } while (0)
 #define audit_putname(n) do { ; } while (0)
@@ -565,10 +618,11 @@ extern int audit_signals;
 #define audit_mq_getsetattr(d,s) ((void)0)
 #define audit_log_bprm_fcaps(b, ncr, ocr) ({ 0; })
 #define audit_log_capset(pid, ncr, ocr) ((void)0)
+#define audit_mmap_fd(fd, flags) ((void)0)
 #define audit_ptrace(t) ((void)0)
 #define audit_n_rules 0
 #define audit_signals 0
-#endif
+#endif /* CONFIG_AUDITSYSCALL */
 
 #ifdef CONFIG_AUDIT
 /* These are defined in audit.c */

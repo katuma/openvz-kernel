@@ -220,6 +220,9 @@ static const struct trans_ctl_table trans_net_ipv4_conf_vars_table[] = {
 	{ NET_IPV4_CONF_PROMOTE_SECONDARIES,	"promote_secondaries" },
 	{ NET_IPV4_CONF_ARP_ACCEPT,		"arp_accept" },
 	{ NET_IPV4_CONF_ARP_NOTIFY,		"arp_notify" },
+	{ NET_IPV4_CONF_ACCEPT_LOCAL,		"accept_local" },
+	{ NET_IPV4_CONF_SRC_VMARK,		"src_valid_mark" },
+	{ NET_IPV4_CONF_PROXY_ARP_PVLAN,	"proxy_arp_pvlan" },
 	{}
 };
 
@@ -1499,19 +1502,11 @@ int sysctl_check_table(struct nsproxy *namespaces, struct ctl_table *table)
 			    (table->proc_handler == proc_dointvec_ms_jiffies) ||
 			    (table->proc_handler == proc_doulongvec_minmax) ||
 			    (table->proc_handler == proc_doulongvec_ms_jiffies_minmax)) {
-				if (!table->data)
+				if (!table->data &&
+				    !((table->mode & S_ISVTX) && table->extra1))
 					set_fail(&fail, table, "No data");
 				if (!table->maxlen)
 					set_fail(&fail, table, "No maxlen");
-			}
-			if ((table->proc_handler == proc_doulongvec_minmax) ||
-			    (table->proc_handler == proc_doulongvec_ms_jiffies_minmax)) {
-				if (table->maxlen > sizeof (unsigned long)) {
-					if (!table->extra1)
-						set_fail(&fail, table, "No min");
-					if (!table->extra2)
-						set_fail(&fail, table, "No max");
-				}
 			}
 #ifdef CONFIG_SYSCTL_SYSCALL
 			if (table->ctl_name && !table->strategy)
@@ -1532,7 +1527,7 @@ int sysctl_check_table(struct nsproxy *namespaces, struct ctl_table *table)
 			sysctl_check_leaf(namespaces, table, &fail);
 		}
 		sysctl_check_bin_path(table, &fail);
-		if (table->mode > 0777)
+		if (table->mode & ~(0777 | S_ISVTX))
 			set_fail(&fail, table, "bogus .mode");
 		if (fail) {
 			set_fail(&fail, table, NULL);

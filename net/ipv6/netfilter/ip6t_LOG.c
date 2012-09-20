@@ -56,15 +56,15 @@ static void dump_packet(const struct nf_loginfo *info,
 
 	ih = skb_header_pointer(skb, ip6hoff, sizeof(_ip6h), &_ip6h);
 	if (ih == NULL) {
-		printk("TRUNCATED");
+		ve_printk(VE_LOG, "TRUNCATED");
 		return;
 	}
 
 	/* Max length: 88 "SRC=0000.0000.0000.0000.0000.0000.0000.0000 DST=0000.0000.0000.0000.0000.0000.0000.0000 " */
-	printk("SRC=%pI6 DST=%pI6 ", &ih->saddr, &ih->daddr);
+	ve_printk(VE_LOG, "SRC=%pI6 DST=%pI6 ", &ih->saddr, &ih->daddr);
 
 	/* Max length: 44 "LEN=65535 TC=255 HOPLIMIT=255 FLOWLBL=FFFFF " */
-	printk("LEN=%Zu TC=%u HOPLIMIT=%u FLOWLBL=%u ",
+	ve_printk(VE_LOG, "LEN=%Zu TC=%u HOPLIMIT=%u FLOWLBL=%u ",
 	       ntohs(ih->payload_len) + sizeof(struct ipv6hdr),
 	       (ntohl(*(__be32 *)ih) & 0x0ff00000) >> 20,
 	       ih->hop_limit,
@@ -79,35 +79,35 @@ static void dump_packet(const struct nf_loginfo *info,
 
 		hp = skb_header_pointer(skb, ptr, sizeof(_hdr), &_hdr);
 		if (hp == NULL) {
-			printk("TRUNCATED");
+			ve_printk(VE_LOG, "TRUNCATED");
 			return;
 		}
 
 		/* Max length: 48 "OPT (...) " */
 		if (logflags & IP6T_LOG_IPOPT)
-			printk("OPT ( ");
+			ve_printk(VE_LOG, "OPT ( ");
 
 		switch (currenthdr) {
 		case IPPROTO_FRAGMENT: {
 			struct frag_hdr _fhdr;
 			const struct frag_hdr *fh;
 
-			printk("FRAG:");
+			ve_printk(VE_LOG, "FRAG:");
 			fh = skb_header_pointer(skb, ptr, sizeof(_fhdr),
 						&_fhdr);
 			if (fh == NULL) {
-				printk("TRUNCATED ");
+				ve_printk(VE_LOG, "TRUNCATED ");
 				return;
 			}
 
 			/* Max length: 6 "65535 " */
-			printk("%u ", ntohs(fh->frag_off) & 0xFFF8);
+			ve_printk(VE_LOG, "%u ", ntohs(fh->frag_off) & 0xFFF8);
 
 			/* Max length: 11 "INCOMPLETE " */
 			if (fh->frag_off & htons(0x0001))
-				printk("INCOMPLETE ");
+				ve_printk(VE_LOG, "INCOMPLETE ");
 
-			printk("ID:%08x ", ntohl(fh->identification));
+			ve_printk(VE_LOG, "ID:%08x ", ntohl(fh->identification));
 
 			if (ntohs(fh->frag_off) & 0xFFF8)
 				fragment = 1;
@@ -121,7 +121,7 @@ static void dump_packet(const struct nf_loginfo *info,
 		case IPPROTO_HOPOPTS:
 			if (fragment) {
 				if (logflags & IP6T_LOG_IPOPT)
-					printk(")");
+					ve_printk(VE_LOG, ")");
 				return;
 			}
 			hdrlen = ipv6_optlen(hp);
@@ -133,10 +133,10 @@ static void dump_packet(const struct nf_loginfo *info,
 				const struct ip_auth_hdr *ah;
 
 				/* Max length: 3 "AH " */
-				printk("AH ");
+				ve_printk(VE_LOG, "AH ");
 
 				if (fragment) {
-					printk(")");
+					ve_printk(VE_LOG, ")");
 					return;
 				}
 
@@ -147,13 +147,13 @@ static void dump_packet(const struct nf_loginfo *info,
 					 * Max length: 26 "INCOMPLETE [65535
 					 *  bytes] )"
 					 */
-					printk("INCOMPLETE [%u bytes] )",
+					ve_printk(VE_LOG, "INCOMPLETE [%u bytes] )",
 					       skb->len - ptr);
 					return;
 				}
 
 				/* Length: 15 "SPI=0xF1234567 */
-				printk("SPI=0x%x ", ntohl(ah->spi));
+				ve_printk(VE_LOG, "SPI=0x%x ", ntohl(ah->spi));
 
 			}
 
@@ -165,10 +165,10 @@ static void dump_packet(const struct nf_loginfo *info,
 				const struct ip_esp_hdr *eh;
 
 				/* Max length: 4 "ESP " */
-				printk("ESP ");
+				ve_printk(VE_LOG, "ESP ");
 
 				if (fragment) {
-					printk(")");
+					ve_printk(VE_LOG, ")");
 					return;
 				}
 
@@ -178,23 +178,23 @@ static void dump_packet(const struct nf_loginfo *info,
 				eh = skb_header_pointer(skb, ptr, sizeof(_esph),
 							&_esph);
 				if (eh == NULL) {
-					printk("INCOMPLETE [%u bytes] )",
+					ve_printk(VE_LOG, "INCOMPLETE [%u bytes] )",
 					       skb->len - ptr);
 					return;
 				}
 
 				/* Length: 16 "SPI=0xF1234567 )" */
-				printk("SPI=0x%x )", ntohl(eh->spi) );
+				ve_printk(VE_LOG, "SPI=0x%x )", ntohl(eh->spi) );
 
 			}
 			return;
 		default:
 			/* Max length: 20 "Unknown Ext Hdr 255" */
-			printk("Unknown Ext Hdr %u", currenthdr);
+			ve_printk(VE_LOG, "Unknown Ext Hdr %u", currenthdr);
 			return;
 		}
 		if (logflags & IP6T_LOG_IPOPT)
-			printk(") ");
+			ve_printk(VE_LOG, ") ");
 
 		currenthdr = hp->nexthdr;
 		ptr += hdrlen;
@@ -206,7 +206,7 @@ static void dump_packet(const struct nf_loginfo *info,
 		const struct tcphdr *th;
 
 		/* Max length: 10 "PROTO=TCP " */
-		printk("PROTO=TCP ");
+		ve_printk(VE_LOG, "PROTO=TCP ");
 
 		if (fragment)
 			break;
@@ -214,40 +214,40 @@ static void dump_packet(const struct nf_loginfo *info,
 		/* Max length: 25 "INCOMPLETE [65535 bytes] " */
 		th = skb_header_pointer(skb, ptr, sizeof(_tcph), &_tcph);
 		if (th == NULL) {
-			printk("INCOMPLETE [%u bytes] ", skb->len - ptr);
+			ve_printk(VE_LOG, "INCOMPLETE [%u bytes] ", skb->len - ptr);
 			return;
 		}
 
 		/* Max length: 20 "SPT=65535 DPT=65535 " */
-		printk("SPT=%u DPT=%u ",
+		ve_printk(VE_LOG, "SPT=%u DPT=%u ",
 		       ntohs(th->source), ntohs(th->dest));
 		/* Max length: 30 "SEQ=4294967295 ACK=4294967295 " */
 		if (logflags & IP6T_LOG_TCPSEQ)
-			printk("SEQ=%u ACK=%u ",
+			ve_printk(VE_LOG, "SEQ=%u ACK=%u ",
 			       ntohl(th->seq), ntohl(th->ack_seq));
 		/* Max length: 13 "WINDOW=65535 " */
-		printk("WINDOW=%u ", ntohs(th->window));
+		ve_printk(VE_LOG, "WINDOW=%u ", ntohs(th->window));
 		/* Max length: 9 "RES=0x3C " */
-		printk("RES=0x%02x ", (u_int8_t)(ntohl(tcp_flag_word(th) & TCP_RESERVED_BITS) >> 22));
+		ve_printk(VE_LOG, "RES=0x%02x ", (u_int8_t)(ntohl(tcp_flag_word(th) & TCP_RESERVED_BITS) >> 22));
 		/* Max length: 32 "CWR ECE URG ACK PSH RST SYN FIN " */
 		if (th->cwr)
-			printk("CWR ");
+			ve_printk(VE_LOG, "CWR ");
 		if (th->ece)
-			printk("ECE ");
+			ve_printk(VE_LOG, "ECE ");
 		if (th->urg)
-			printk("URG ");
+			ve_printk(VE_LOG, "URG ");
 		if (th->ack)
-			printk("ACK ");
+			ve_printk(VE_LOG, "ACK ");
 		if (th->psh)
-			printk("PSH ");
+			ve_printk(VE_LOG, "PSH ");
 		if (th->rst)
-			printk("RST ");
+			ve_printk(VE_LOG, "RST ");
 		if (th->syn)
-			printk("SYN ");
+			ve_printk(VE_LOG, "SYN ");
 		if (th->fin)
-			printk("FIN ");
+			ve_printk(VE_LOG, "FIN ");
 		/* Max length: 11 "URGP=65535 " */
-		printk("URGP=%u ", ntohs(th->urg_ptr));
+		ve_printk(VE_LOG, "URGP=%u ", ntohs(th->urg_ptr));
 
 		if ((logflags & IP6T_LOG_TCPOPT)
 		    && th->doff * 4 > sizeof(struct tcphdr)) {
@@ -261,15 +261,15 @@ static void dump_packet(const struct nf_loginfo *info,
 						ptr + sizeof(struct tcphdr),
 						optsize, _opt);
 			if (op == NULL) {
-				printk("OPT (TRUNCATED)");
+				ve_printk(VE_LOG, "OPT (TRUNCATED)");
 				return;
 			}
 
 			/* Max length: 127 "OPT (" 15*4*2chars ") " */
-			printk("OPT (");
+			ve_printk(VE_LOG, "OPT (");
 			for (i =0; i < optsize; i++)
-				printk("%02X", op[i]);
-			printk(") ");
+				ve_printk(VE_LOG, "%02X", op[i]);
+			ve_printk(VE_LOG, ") ");
 		}
 		break;
 	}
@@ -280,9 +280,9 @@ static void dump_packet(const struct nf_loginfo *info,
 
 		if (currenthdr == IPPROTO_UDP)
 			/* Max length: 10 "PROTO=UDP "     */
-			printk("PROTO=UDP " );
+			ve_printk(VE_LOG, "PROTO=UDP " );
 		else	/* Max length: 14 "PROTO=UDPLITE " */
-			printk("PROTO=UDPLITE ");
+			ve_printk(VE_LOG, "PROTO=UDPLITE ");
 
 		if (fragment)
 			break;
@@ -290,12 +290,12 @@ static void dump_packet(const struct nf_loginfo *info,
 		/* Max length: 25 "INCOMPLETE [65535 bytes] " */
 		uh = skb_header_pointer(skb, ptr, sizeof(_udph), &_udph);
 		if (uh == NULL) {
-			printk("INCOMPLETE [%u bytes] ", skb->len - ptr);
+			ve_printk(VE_LOG, "INCOMPLETE [%u bytes] ", skb->len - ptr);
 			return;
 		}
 
 		/* Max length: 20 "SPT=65535 DPT=65535 " */
-		printk("SPT=%u DPT=%u LEN=%u ",
+		ve_printk(VE_LOG, "SPT=%u DPT=%u LEN=%u ",
 		       ntohs(uh->source), ntohs(uh->dest),
 		       ntohs(uh->len));
 		break;
@@ -305,7 +305,7 @@ static void dump_packet(const struct nf_loginfo *info,
 		const struct icmp6hdr *ic;
 
 		/* Max length: 13 "PROTO=ICMPv6 " */
-		printk("PROTO=ICMPv6 ");
+		ve_printk(VE_LOG, "PROTO=ICMPv6 ");
 
 		if (fragment)
 			break;
@@ -313,18 +313,18 @@ static void dump_packet(const struct nf_loginfo *info,
 		/* Max length: 25 "INCOMPLETE [65535 bytes] " */
 		ic = skb_header_pointer(skb, ptr, sizeof(_icmp6h), &_icmp6h);
 		if (ic == NULL) {
-			printk("INCOMPLETE [%u bytes] ", skb->len - ptr);
+			ve_printk(VE_LOG, "INCOMPLETE [%u bytes] ", skb->len - ptr);
 			return;
 		}
 
 		/* Max length: 18 "TYPE=255 CODE=255 " */
-		printk("TYPE=%u CODE=%u ", ic->icmp6_type, ic->icmp6_code);
+		ve_printk(VE_LOG, "TYPE=%u CODE=%u ", ic->icmp6_type, ic->icmp6_code);
 
 		switch (ic->icmp6_type) {
 		case ICMPV6_ECHO_REQUEST:
 		case ICMPV6_ECHO_REPLY:
 			/* Max length: 19 "ID=65535 SEQ=65535 " */
-			printk("ID=%u SEQ=%u ",
+			ve_printk(VE_LOG, "ID=%u SEQ=%u ",
 				ntohs(ic->icmp6_identifier),
 				ntohs(ic->icmp6_sequence));
 			break;
@@ -335,35 +335,35 @@ static void dump_packet(const struct nf_loginfo *info,
 
 		case ICMPV6_PARAMPROB:
 			/* Max length: 17 "POINTER=ffffffff " */
-			printk("POINTER=%08x ", ntohl(ic->icmp6_pointer));
+			ve_printk(VE_LOG, "POINTER=%08x ", ntohl(ic->icmp6_pointer));
 			/* Fall through */
 		case ICMPV6_DEST_UNREACH:
 		case ICMPV6_PKT_TOOBIG:
 		case ICMPV6_TIME_EXCEED:
 			/* Max length: 3+maxlen */
 			if (recurse) {
-				printk("[");
+				ve_printk(VE_LOG, "[");
 				dump_packet(info, skb, ptr + sizeof(_icmp6h),
 					    0);
-				printk("] ");
+				ve_printk(VE_LOG, "] ");
 			}
 
 			/* Max length: 10 "MTU=65535 " */
 			if (ic->icmp6_type == ICMPV6_PKT_TOOBIG)
-				printk("MTU=%u ", ntohl(ic->icmp6_mtu));
+				ve_printk(VE_LOG, "MTU=%u ", ntohl(ic->icmp6_mtu));
 		}
 		break;
 	}
 	/* Max length: 10 "PROTO=255 " */
 	default:
-		printk("PROTO=%u ", currenthdr);
+		ve_printk(VE_LOG, "PROTO=%u ", currenthdr);
 	}
 
 	/* Max length: 15 "UID=4294967295 " */
 	if ((logflags & IP6T_LOG_UID) && recurse && skb->sk) {
 		read_lock_bh(&skb->sk->sk_callback_lock);
 		if (skb->sk->sk_socket && skb->sk->sk_socket->file)
-			printk("UID=%u GID=%u ",
+			ve_printk(VE_LOG, "UID=%u GID=%u ",
 				skb->sk->sk_socket->file->f_cred->fsuid,
 				skb->sk->sk_socket->file->f_cred->fsgid);
 		read_unlock_bh(&skb->sk->sk_callback_lock);
@@ -397,14 +397,14 @@ ip6t_log_packet(u_int8_t pf,
 		loginfo = &default_loginfo;
 
 	spin_lock_bh(&log_lock);
-	printk("<%d>%sIN=%s OUT=%s ", loginfo->u.log.level,
+	ve_printk(VE_LOG, "<%d>%sIN=%s OUT=%s ", loginfo->u.log.level,
 		prefix,
 		in ? in->name : "",
 		out ? out->name : "");
 	if (in && !out) {
 		unsigned int len;
 		/* MAC logging for input chain only. */
-		printk("MAC=");
+		ve_printk(VE_LOG, "MAC=");
 		if (skb->dev && (len = skb->dev->hard_header_len) &&
 		    skb->mac_header != skb->network_header) {
 			const unsigned char *p = skb_mac_header(skb);
@@ -416,23 +416,23 @@ ip6t_log_packet(u_int8_t pf,
 
 			if (p != NULL) {
 				for (i = 0; i < len; i++)
-					printk("%02x%s", p[i],
+					ve_printk(VE_LOG, "%02x%s", p[i],
 					       i == len - 1 ? "" : ":");
 			}
-			printk(" ");
+			ve_printk(VE_LOG, " ");
 
 			if (skb->dev->type == ARPHRD_SIT) {
 				const struct iphdr *iph =
 					(struct iphdr *)skb_mac_header(skb);
-				printk("TUNNEL=%pI4->%pI4 ",
+				ve_printk(VE_LOG, "TUNNEL=%pI4->%pI4 ",
 				       &iph->saddr, &iph->daddr);
 			}
 		} else
-			printk(" ");
+			ve_printk(VE_LOG, " ");
 	}
 
 	dump_packet(loginfo, skb, skb_network_offset(skb), 1);
-	printk("\n");
+	ve_printk(VE_LOG, "\n");
 	spin_unlock_bh(&log_lock);
 }
 

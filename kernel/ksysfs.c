@@ -29,7 +29,7 @@ static struct kobj_attribute _name##_attr = \
 static ssize_t uevent_seqnum_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%llu\n", (unsigned long long)uevent_seqnum);
+	return sprintf(buf, "%llu\n", (unsigned long long)ve_uevent_seqnum);
 }
 KERNEL_ATTR_RO(uevent_seqnum);
 
@@ -100,6 +100,26 @@ static ssize_t kexec_crash_loaded_show(struct kobject *kobj,
 }
 KERNEL_ATTR_RO(kexec_crash_loaded);
 
+static ssize_t kexec_crash_size_show(struct kobject *kobj,
+				       struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%zu\n", crash_get_memory_size());
+}
+static ssize_t kexec_crash_size_store(struct kobject *kobj,
+				   struct kobj_attribute *attr,
+				   const char *buf, size_t count)
+{
+	unsigned long cnt;
+	int ret;
+
+	if (strict_strtoul(buf, 0, &cnt))
+		return -EINVAL;
+
+	ret = crash_shrink_memory(cnt);
+	return ret < 0 ? ret : count;
+}
+KERNEL_ATTR_RW(kexec_crash_size);
+
 static ssize_t vmcoreinfo_show(struct kobject *kobj,
 			       struct kobj_attribute *attr, char *buf)
 {
@@ -118,7 +138,8 @@ extern const void __start_notes __attribute__((weak));
 extern const void __stop_notes __attribute__((weak));
 #define	notes_size (&__stop_notes - &__start_notes)
 
-static ssize_t notes_read(struct kobject *kobj, struct bin_attribute *bin_attr,
+static ssize_t notes_read(struct file *filp, struct kobject *kobj,
+			  struct bin_attribute *bin_attr,
 			  char *buf, loff_t off, size_t count)
 {
 	memcpy(buf, &__start_notes + off, count);
@@ -147,7 +168,15 @@ static struct attribute * kernel_attrs[] = {
 #ifdef CONFIG_KEXEC
 	&kexec_loaded_attr.attr,
 	&kexec_crash_loaded_attr.attr,
+	&kexec_crash_size_attr.attr,
 	&vmcoreinfo_attr.attr,
+#endif
+	NULL
+};
+
+static struct attribute * kernel_ve_attrs[] = {
+#if defined(CONFIG_HOTPLUG)
+	&uevent_seqnum_attr.attr,
 #endif
 	NULL
 };
@@ -156,18 +185,49 @@ static struct attribute_group kernel_attr_group = {
 	.attrs = kernel_attrs,
 };
 
+static struct attribute_group kernel_ve_attr_group = {
+	.attrs = kernel_ve_attrs,
+};
+
+int ksysfs_init_ve(struct ve_struct *ve, struct kobject **kernel_obj)
+{
+	struct attribute_group *k_grp;
+	int err;
+
+	if (!ve || ve_is_super(ve))
+		k_grp = &kernel_attr_group;
+	else
+		k_grp = &kernel_ve_attr_group;
+
+	*kernel_obj = kobject_create_and_add("kernel", NULL);
+	if (!*kernel_obj)
+		return -ENOMEM;
+
+	err = sysfs_create_group(*kernel_obj, k_grp);
+
+	if (err) {
+		kobject_put(*kernel_obj);
+		*kernel_obj = NULL;
+	}
+
+	return err;
+}
+EXPORT_SYMBOL_GPL(ksysfs_init_ve);
+
+void ksysfs_fini_ve(struct ve_struct *ve, struct kobject **kernel_obj)
+{
+	sysfs_remove_group(*kernel_obj, &kernel_ve_attr_group);
+	kobject_put(*kernel_obj);
+	*kernel_obj = NULL;
+}
+EXPORT_SYMBOL_GPL(ksysfs_fini_ve);
+
 static int __init ksysfs_init(void)
 {
-	int error;
+	int error = ksysfs_init_ve(NULL, &kernel_kobj);
 
-	kernel_kobj = kobject_create_and_add("kernel", NULL);
-	if (!kernel_kobj) {
-		error = -ENOMEM;
-		goto exit;
-	}
-	error = sysfs_create_group(kernel_kobj, &kernel_attr_group);
 	if (error)
-		goto kset_exit;
+		return error;
 
 	if (notes_size > 0) {
 		notes_attr.size = notes_size;
@@ -187,10 +247,7 @@ notes_exit:
 	if (notes_size > 0)
 		sysfs_remove_bin_file(kernel_kobj, &notes_attr);
 group_exit:
-	sysfs_remove_group(kernel_kobj, &kernel_attr_group);
-kset_exit:
-	kobject_put(kernel_kobj);
-exit:
+	ksysfs_fini_ve(NULL, &kernel_kobj);
 	return error;
 }
 

@@ -41,10 +41,13 @@ struct nfsd_stats {
 };
 
 
+#ifndef CONFIG_VE
 extern struct nfsd_stats	nfsdstats;
-extern struct svc_stat		nfsd_svcstats;
+#else
+#define nfsdstats		(get_exec_env()->nfsd_data->stats)
+#endif
 
-void	nfsd_stat_init(void);
+int	nfsd_stat_init(void);
 void	nfsd_stat_shutdown(void);
 
 #endif /* __KERNEL__ */

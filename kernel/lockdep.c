@@ -49,7 +49,7 @@
 #include "lockdep_internals.h"
 
 #define CREATE_TRACE_POINTS
-#include <trace/events/lockdep.h>
+#include <trace/events/lock.h>
 
 #ifdef CONFIG_PROVE_LOCKING
 int prove_locking = 1;
@@ -2705,7 +2705,7 @@ void lockdep_init_map(struct lockdep_map *lock, const char *name,
 	if (subclass)
 		register_lock_class(lock, subclass, 1);
 }
-EXPORT_SYMBOL_GPL(lockdep_init_map);
+EXPORT_SYMBOL(lockdep_init_map);
 
 /*
  * This gets called for every mutex_lock*()/spin_lock*() operation.
@@ -3223,7 +3223,7 @@ void lock_release(struct lockdep_map *lock, int nested,
 {
 	unsigned long flags;
 
-	trace_lock_release(lock, nested, ip);
+	trace_lock_release(lock, ip);
 
 	if (unlikely(current->lockdep_recursion))
 		return;
@@ -3383,7 +3383,7 @@ found_it:
 		hlock->holdtime_stamp = now;
 	}
 
-	trace_lock_acquired(lock, ip, waittime);
+	trace_lock_acquired(lock, ip);
 
 	stats = get_lock_stats(hlock_class(hlock));
 	if (waittime) {
@@ -3742,7 +3742,7 @@ retry:
 			printk(KERN_CONT " locked it.\n");
 	}
 
-	do_each_thread(g, p) {
+	do_each_thread_all(g, p) {
 		/*
 		 * It's not reliable to print a task's held locks
 		 * if it's not sleeping (or if it's not the current
@@ -3755,7 +3755,7 @@ retry:
 		if (!unlock)
 			if (read_trylock(&tasklist_lock))
 				unlock = 1;
-	} while_each_thread(g, p);
+	} while_each_thread_all(g, p);
 
 	printk("\n");
 	printk("=============================================\n\n");

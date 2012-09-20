@@ -7,6 +7,7 @@
  *		Initial version.
  */
 
+#include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/file.h>
 #include <linux/fs.h>
@@ -24,30 +25,15 @@
  * POSIX_FADV_WILLNEED could set PG_Referenced, and POSIX_FADV_NOREUSE could
  * deactivate the pages and clear PG_Referenced.
  */
-SYSCALL_DEFINE(fadvise64_64)(int fd, loff_t offset, loff_t len, int advice)
+int generic_fadvise(struct file* file, loff_t offset, loff_t len, int advice)
 {
-	struct file *file = fget(fd);
-	struct address_space *mapping;
+	struct address_space *mapping = file->f_mapping;
 	struct backing_dev_info *bdi;
 	loff_t endbyte;			/* inclusive */
 	pgoff_t start_index;
 	pgoff_t end_index;
 	unsigned long nrpages;
 	int ret = 0;
-
-	if (!file)
-		return -EBADF;
-
-	if (S_ISFIFO(file->f_path.dentry->d_inode->i_mode)) {
-		ret = -ESPIPE;
-		goto out;
-	}
-
-	mapping = file->f_mapping;
-	if (!mapping || len < 0) {
-		ret = -EINVAL;
-		goto out;
-	}
 
 	if (mapping->a_ops->get_xip_mem) {
 		switch (advice) {
@@ -77,12 +63,20 @@ SYSCALL_DEFINE(fadvise64_64)(int fd, loff_t offset, loff_t len, int advice)
 	switch (advice) {
 	case POSIX_FADV_NORMAL:
 		file->f_ra.ra_pages = bdi->ra_pages;
+		spin_lock(&file->f_lock);
+		file->f_mode &= ~FMODE_RANDOM;
+		spin_unlock(&file->f_lock);
 		break;
 	case POSIX_FADV_RANDOM:
-		file->f_ra.ra_pages = 0;
+		spin_lock(&file->f_lock);
+		file->f_mode |= FMODE_RANDOM;
+		spin_unlock(&file->f_lock);
 		break;
 	case POSIX_FADV_SEQUENTIAL:
 		file->f_ra.ra_pages = bdi->ra_pages * 2;
+		spin_lock(&file->f_lock);
+		file->f_mode &= ~FMODE_RANDOM;
+		spin_unlock(&file->f_lock);
 		break;
 	case POSIX_FADV_WILLNEED:
 		if (!mapping->a_ops->readpage) {
@@ -122,6 +116,33 @@ SYSCALL_DEFINE(fadvise64_64)(int fd, loff_t offset, loff_t len, int advice)
 	default:
 		ret = -EINVAL;
 	}
+out:
+	return ret;
+}
+EXPORT_SYMBOL(generic_fadvise);
+
+SYSCALL_DEFINE(fadvise64_64)(int fd, loff_t offset, loff_t len, int advice)
+{
+	struct file *file = fget(fd);
+	int (*fadvise)(struct file *,loff_t, loff_t, int) = generic_fadvise;
+	int ret = 0;
+
+	if (!file)
+		return -EBADF;
+
+	if (S_ISFIFO(file->f_path.dentry->d_inode->i_mode)) {
+		ret = -ESPIPE;
+		goto out;
+	}
+
+	if (!file->f_mapping || len < 0) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (file->f_op && file->f_op->fadvise)
+		fadvise = file->f_op->fadvise;
+
+	ret = fadvise(file, offset, len, advice);
 out:
 	fput(file);
 	return ret;

@@ -1201,7 +1201,7 @@ void *__alloc_percpu(size_t size, size_t align)
 {
 	return pcpu_alloc(size, align, false);
 }
-EXPORT_SYMBOL_GPL(__alloc_percpu);
+EXPORT_SYMBOL(__alloc_percpu);
 
 /**
  * __alloc_reserved_percpu - allocate reserved percpu area
@@ -1300,7 +1300,7 @@ void free_percpu(void *ptr)
 
 	spin_unlock_irqrestore(&pcpu_lock, flags);
 }
-EXPORT_SYMBOL_GPL(free_percpu);
+EXPORT_SYMBOL(free_percpu);
 
 static inline size_t pcpu_calc_fc_sizes(size_t static_size,
 					size_t reserved_size,

@@ -1,18 +1,19 @@
 #ifndef _RAID10_H
 #define _RAID10_H
 
-typedef struct mirror_info mirror_info_t;
-
 struct mirror_info {
-	mdk_rdev_t	*rdev;
+	struct md_rdev	*rdev;
 	sector_t	head_position;
+	int		recovery_disabled;	/* matches
+						 * mddev->recovery_disabled
+						 * when we shouldn't try
+						 * recovering this device.
+						 */
 };
 
-typedef struct r10bio_s r10bio_t;
-
-struct r10_private_data_s {
-	mddev_t			*mddev;
-	mirror_info_t		*mirrors;
+struct r10conf {
+	struct mddev		*mddev;
+	struct mirror_info	*mirrors;
 	int			raid_disks;
 	spinlock_t		device_lock;
 
@@ -33,13 +34,15 @@ struct r10_private_data_s {
 					       * 1 stripe.
 					       */
 
+	sector_t		dev_sectors;  /* temp copy of mddev->dev_sectors */
+
 	int chunk_shift; /* shift from chunks to sectors */
 	sector_t chunk_mask;
 
 	struct list_head	retry_list;
 	/* queue pending writes and submit them on unplug */
 	struct bio_list		pending_bio_list;
-
+	int			pending_count;
 
 	spinlock_t		resync_lock;
 	int nr_pending;
@@ -57,9 +60,12 @@ struct r10_private_data_s {
 	mempool_t *r10bio_pool;
 	mempool_t *r10buf_pool;
 	struct page		*tmppage;
-};
 
-typedef struct r10_private_data_s conf_t;
+	/* When taking over an array from a different personality, we store
+	 * the new thread here until we fully activate the array.
+	 */
+	struct md_thread	*thread;
+};
 
 /*
  * this is our 'private' RAID10 bio.
@@ -68,14 +74,14 @@ typedef struct r10_private_data_s conf_t;
  * for this RAID10 operation, and about their status:
  */
 
-struct r10bio_s {
+struct r10bio {
 	atomic_t		remaining; /* 'have we finished' count,
 					    * used from IRQ handlers
 					    */
 	sector_t		sector;	/* virtual sector number */
 	int			sectors;
 	unsigned long		state;
-	mddev_t			*mddev;
+	struct mddev		*mddev;
 	/*
 	 * original bio going to /dev/mdx
 	 */
@@ -106,10 +112,26 @@ struct r10bio_s {
  * level, we store IO_BLOCKED in the appropriate 'bios' pointer
  */
 #define IO_BLOCKED ((struct bio*)1)
+/* When we successfully write to a known bad-block, we need to remove the
+ * bad-block marking which must be done from process context.  So we record
+ * the success by setting devs[n].bio to IO_MADE_GOOD
+ */
+#define IO_MADE_GOOD ((struct bio *)2)
+
+#define BIO_SPECIAL(bio) ((unsigned long)bio <= 2)
 
 /* bits for r10bio.state */
 #define	R10BIO_Uptodate	0
 #define	R10BIO_IsSync	1
 #define	R10BIO_IsRecover 2
 #define	R10BIO_Degraded 3
+/* Set ReadError on bios that experience a read error
+ * so that raid10d knows what to do with them.
+ */
+#define	R10BIO_ReadError 4
+/* If a write for this request means we can clear some
+ * known-bad-block records, we set this flag.
+ */
+#define	R10BIO_MadeGood 5
+#define	R10BIO_WriteError 6
 #endif

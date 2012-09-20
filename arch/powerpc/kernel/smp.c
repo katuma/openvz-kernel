@@ -98,6 +98,7 @@ void smp_message_recv(int msg)
 		break;
 	case PPC_MSG_RESCHEDULE:
 		/* we notice need_resched on exit */
+		scheduler_ipi();
 		break;
 	case PPC_MSG_CALL_FUNC_SINGLE:
 		generic_smp_call_function_single_interrupt();
@@ -127,6 +128,7 @@ static irqreturn_t call_function_action(int irq, void *data)
 
 static irqreturn_t reschedule_action(int irq, void *data)
 {
+	scheduler_ipi();
 	/* we just need the return path side effect of checking need_resched */
 	return IRQ_HANDLED;
 }
@@ -501,9 +503,6 @@ int __devinit start_secondary(void *unused)
 	if (smp_ops->take_timebase)
 		smp_ops->take_timebase();
 
-	if (system_state > SYSTEM_BOOTING)
-		snapshot_timebase();
-
 	secondary_cpu_time_init();
 
 	ipi_call_lock();
@@ -564,8 +563,6 @@ void __init smp_cpus_done(unsigned int max_cpus)
 		smp_ops->setup_cpu(boot_cpuid);
 
 	set_cpus_allowed(current, old_mask);
-
-	snapshot_timebases();
 
 	dump_numa_cpu_topology();
 }

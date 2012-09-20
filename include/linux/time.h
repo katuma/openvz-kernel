@@ -143,11 +143,13 @@ extern unsigned int alarm_setitimer(unsigned int seconds);
 extern int do_getitimer(int which, struct itimerval *value);
 extern void getnstimeofday(struct timespec *tv);
 extern void getrawmonotonic(struct timespec *ts);
+extern void getrealboottime(struct timespec *ts);
 extern void getboottime(struct timespec *ts);
 extern void monotonic_to_bootbased(struct timespec *ts);
 
 extern struct timespec timespec_trunc(struct timespec t, unsigned gran);
 extern int timekeeping_valid_for_hres(void);
+extern u64 timekeeping_max_deferment(void);
 extern void update_wall_time(void);
 extern void update_xtime_cache(u64 nsec);
 extern void timekeeping_leap_insert(int leapsecond);

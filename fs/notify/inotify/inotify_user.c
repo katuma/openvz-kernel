@@ -40,6 +40,7 @@
 #include <linux/uaccess.h>
 #include <linux/poll.h>
 #include <linux/wait.h>
+#include <linux/module.h>
 
 #include "inotify.h"
 
@@ -106,8 +107,11 @@ static inline __u32 inotify_arg_to_mask(u32 arg)
 {
 	__u32 mask;
 
-	/* everything should accept their own ignored and cares about children */
-	mask = (FS_IN_IGNORED | FS_EVENT_ON_CHILD);
+	/*
+	 * everything should accept their own ignored, cares about children,
+	 * and should receive events when the inode is unmounted
+	 */
+	mask = (FS_IN_IGNORED | FS_EVENT_ON_CHILD | FS_UNMOUNT);
 
 	/* mask off the flags used to open the fd */
 	mask |= (arg & (IN_ALL_EVENTS | IN_ONESHOT));
@@ -297,14 +301,11 @@ static int inotify_fasync(int fd, struct file *file, int on)
 static int inotify_release(struct inode *ignored, struct file *file)
 {
 	struct fsnotify_group *group = file->private_data;
-	struct user_struct *user = group->inotify_data.user;
 
 	fsnotify_clear_marks_by_group(group);
 
 	/* free this group, matching get was inotify_init->fsnotify_obtain_group */
 	fsnotify_put_group(group);
-
-	atomic_dec(&user->inotify_devs);
 
 	return 0;
 }
@@ -340,7 +341,7 @@ static long inotify_ioctl(struct file *file, unsigned int cmd,
 	return ret;
 }
 
-static const struct file_operations inotify_fops = {
+const struct file_operations inotify_fops = {
 	.poll		= inotify_poll,
 	.read		= inotify_read,
 	.fasync		= inotify_fasync,
@@ -348,6 +349,7 @@ static const struct file_operations inotify_fops = {
 	.unlocked_ioctl	= inotify_ioctl,
 	.compat_ioctl	= inotify_ioctl,
 };
+EXPORT_SYMBOL(inotify_fops);
 
 
 /*
@@ -461,6 +463,12 @@ static void inotify_free_mark(struct fsnotify_mark_entry *entry)
 {
 	struct inotify_inode_mark_entry *ientry = (struct inotify_inode_mark_entry *)entry;
 
+	if (ientry->path.dentry) {
+		dput(ientry->path.dentry);
+		mnt_unpin(ientry->path.mnt);
+		mntput(ientry->path.mnt);
+	}
+
 	kmem_cache_free(inotify_inode_mark_cachep, ientry);
 }
 
@@ -527,16 +535,13 @@ static int inotify_update_existing_watch(struct fsnotify_group *group,
 	return ret;
 }
 
-static int inotify_new_watch(struct fsnotify_group *group,
-			     struct inode *inode,
-			     u32 arg)
+int __inotify_new_watch(struct fsnotify_group *group,
+			     struct path *path, __u32 mask, int wd)
 {
 	struct inotify_inode_mark_entry *tmp_ientry;
-	__u32 mask;
+	u32 start_wd;
 	int ret;
 
-	/* don't allow invalid bits: we don't want flags set */
-	mask = inotify_arg_to_mask(arg);
 	if (unlikely(!mask))
 		return -EINVAL;
 
@@ -547,6 +552,8 @@ static int inotify_new_watch(struct fsnotify_group *group,
 	fsnotify_init_mark(&tmp_ientry->fsn_entry, inotify_free_mark);
 	tmp_ientry->fsn_entry.mask = mask;
 	tmp_ientry->wd = -1;
+	tmp_ientry->path.dentry = NULL;
+	tmp_ientry->path.mnt = NULL;
 
 	ret = -ENOSPC;
 	if (atomic_read(&group->inotify_data.user->inotify_watches) >= inotify_max_user_watches)
@@ -556,23 +563,37 @@ retry:
 	if (unlikely(!idr_pre_get(&group->inotify_data.idr, GFP_KERNEL)))
 		goto out_err;
 
+	/* we are putting the mark on the idr, take a reference */
+	fsnotify_get_mark(&tmp_ientry->fsn_entry);
+
+	if (wd == -1)
+		start_wd = group->inotify_data.last_wd + 1;
+	else
+		start_wd = wd;
+
 	spin_lock(&group->inotify_data.idr_lock);
 	ret = idr_get_new_above(&group->inotify_data.idr, &tmp_ientry->fsn_entry,
-				group->inotify_data.last_wd,
-				&tmp_ientry->wd);
+				start_wd, &tmp_ientry->wd);
 	spin_unlock(&group->inotify_data.idr_lock);
 	if (ret) {
+		/* we didn't get on the idr, drop the idr reference */
+		fsnotify_put_mark(&tmp_ientry->fsn_entry);
+
 		/* idr was out of memory allocate and try again */
 		if (ret == -EAGAIN)
 			goto retry;
 		goto out_err;
 	}
 
-	/* we put the mark on the idr, take a reference */
-	fsnotify_get_mark(&tmp_ientry->fsn_entry);
+	if (wd != -1 && tmp_ientry->wd != wd) {
+		ret = -EBUSY;
+		fsnotify_put_mark(&tmp_ientry->fsn_entry);
+		inotify_remove_from_idr(group, tmp_ientry);
+		goto out_err;
+	}
 
 	/* we are on the idr, now get on the inode */
-	ret = fsnotify_add_mark(&tmp_ientry->fsn_entry, group, inode);
+	ret = fsnotify_add_mark(&tmp_ientry->fsn_entry, group, path->dentry->d_inode);
 	if (ret) {
 		/* we failed to get on the inode, get off the idr */
 		inotify_remove_from_idr(group, tmp_ientry);
@@ -584,6 +605,12 @@ retry:
 
 	/* increment the number of watches the user has */
 	atomic_inc(&group->inotify_data.user->inotify_watches);
+
+	if (!ve_is_super(get_exec_env())) {
+		tmp_ientry->path.dentry = dget(path->dentry);
+		mnt_pin(path->mnt);
+		tmp_ientry->path.mnt = path->mnt;
+	}
 
 	/* return the watch descriptor for this new entry */
 	ret = tmp_ientry->wd;
@@ -601,17 +628,24 @@ out_err:
 
 	return ret;
 }
+EXPORT_SYMBOL(__inotify_new_watch);
 
-static int inotify_update_watch(struct fsnotify_group *group, struct inode *inode, u32 arg)
+static int inotify_new_watch(struct fsnotify_group *group,
+			     struct path *path, u32 arg)
+{
+	return __inotify_new_watch(group, path, inotify_arg_to_mask(arg), -1);
+}
+
+static int inotify_update_watch(struct fsnotify_group *group, struct path *path, u32 arg)
 {
 	int ret = 0;
 
 retry:
 	/* try to update and existing watch with the new arg */
-	ret = inotify_update_existing_watch(group, inode, arg);
+	ret = inotify_update_existing_watch(group, path->dentry->d_inode, arg);
 	/* no mark present, try to add a new one */
 	if (ret == -ENOENT)
-		ret = inotify_new_watch(group, inode, arg);
+		ret = inotify_new_watch(group, path, arg);
 	/*
 	 * inotify_new_watch could race with another thread which did an
 	 * inotify_new_watch between the update_existing and the add watch
@@ -623,7 +657,8 @@ retry:
 	return ret;
 }
 
-static struct fsnotify_group *inotify_new_group(struct user_struct *user, unsigned int max_events)
+static struct fsnotify_group *
+inotify_new_group(unsigned int max_events, int flags)
 {
 	struct fsnotify_group *group;
 	unsigned int grp_num;
@@ -638,21 +673,57 @@ static struct fsnotify_group *inotify_new_group(struct user_struct *user, unsign
 
 	spin_lock_init(&group->inotify_data.idr_lock);
 	idr_init(&group->inotify_data.idr);
-	group->inotify_data.last_wd = 1;
-	group->inotify_data.user = user;
+	group->inotify_data.last_wd = 0;
 	group->inotify_data.fa = NULL;
+	group->inotify_data.user = get_current_user();
+
+	if (atomic_inc_return(&group->inotify_data.user->inotify_devs) >
+	    inotify_max_user_instances && !(flags & O_DIRECT)) {
+		fsnotify_put_group(group);
+		return ERR_PTR(-EMFILE);
+	}
 
 	return group;
 }
 
+struct file *inotify_create(int flags)
+{
+	struct fsnotify_group *group;
+	struct file *filp;
+	struct path path;
+
+	/*
+	 * fsnotify_obtain_group took a reference to group,
+	 * we put this when we kill the file in the end
+	 */
+	group = inotify_new_group(inotify_max_queued_events, flags);
+	if (IS_ERR(group))
+		return ERR_CAST(group);
+
+	path.mnt = inotify_mnt;
+	path.dentry = inotify_mnt->mnt_root;
+	path_get(&path);
+
+	filp = alloc_file(&path, FMODE_READ, &inotify_fops);
+	if (!filp)
+		goto out_file;
+
+	filp->f_flags = O_RDONLY | (flags & O_NONBLOCK);
+	filp->private_data = group;
+	return filp;
+
+out_file:
+	path_put(&path);
+	fsnotify_put_group(group);
+	return ERR_PTR(-ENFILE);
+}
+EXPORT_SYMBOL_GPL(inotify_create);
 
 /* inotify syscalls */
 SYSCALL_DEFINE1(inotify_init1, int, flags)
 {
-	struct fsnotify_group *group;
-	struct user_struct *user;
 	struct file *filp;
-	int fd, ret;
+	int fd;
 
 	/* Check the IN_* constants for consistency.  */
 	BUILD_BUG_ON(IN_CLOEXEC != O_CLOEXEC);
@@ -661,62 +732,29 @@ SYSCALL_DEFINE1(inotify_init1, int, flags)
 	if (flags & ~(IN_CLOEXEC | IN_NONBLOCK))
 		return -EINVAL;
 
+	filp = inotify_create(flags);
+	if (IS_ERR(filp))
+		return PTR_ERR(filp);
+
 	fd = get_unused_fd_flags(flags & O_CLOEXEC);
 	if (fd < 0)
-		return fd;
-
-	filp = get_empty_filp();
-	if (!filp) {
-		ret = -ENFILE;
-		goto out_put_fd;
-	}
-
-	user = get_current_user();
-	if (unlikely(atomic_read(&user->inotify_devs) >=
-			inotify_max_user_instances)) {
-		ret = -EMFILE;
-		goto out_free_uid;
-	}
-
-	/* fsnotify_obtain_group took a reference to group, we put this when we kill the file in the end */
-	group = inotify_new_group(user, inotify_max_queued_events);
-	if (IS_ERR(group)) {
-		ret = PTR_ERR(group);
-		goto out_free_uid;
-	}
-
-	filp->f_op = &inotify_fops;
-	filp->f_path.mnt = mntget(inotify_mnt);
-	filp->f_path.dentry = dget(inotify_mnt->mnt_root);
-	filp->f_mapping = filp->f_path.dentry->d_inode->i_mapping;
-	filp->f_mode = FMODE_READ;
-	filp->f_flags = O_RDONLY | (flags & O_NONBLOCK);
-	filp->private_data = group;
-
-	atomic_inc(&user->inotify_devs);
-
-	fd_install(fd, filp);
+		fput(filp);
+	else
+		fd_install(fd, filp);
 
 	return fd;
-
-out_free_uid:
-	free_uid(user);
-	put_filp(filp);
-out_put_fd:
-	put_unused_fd(fd);
-	return ret;
 }
 
 SYSCALL_DEFINE0(inotify_init)
 {
 	return sys_inotify_init1(0);
 }
+EXPORT_SYMBOL(sys_inotify_init);
 
 SYSCALL_DEFINE3(inotify_add_watch, int, fd, const char __user *, pathname,
 		u32, mask)
 {
 	struct fsnotify_group *group;
-	struct inode *inode;
 	struct path path;
 	struct file *filp;
 	int ret, fput_needed;
@@ -741,12 +779,10 @@ SYSCALL_DEFINE3(inotify_add_watch, int, fd, const char __user *, pathname,
 	if (ret)
 		goto fput_and_out;
 
-	/* inode held in place by reference to path; group by fget on fd */
-	inode = path.dentry->d_inode;
 	group = filp->private_data;
 
 	/* create/update an inode mark */
-	ret = inotify_update_watch(group, inode, mask);
+	ret = inotify_update_watch(group, &path, mask);
 	if (unlikely(ret))
 		goto path_put_and_out;
 

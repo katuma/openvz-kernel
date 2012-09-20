@@ -242,6 +242,8 @@ struct acpi_device_perf {
 struct acpi_device_wakeup_flags {
 	u8 valid:1;		/* Can successfully enable wakeup? */
 	u8 run_wake:1;		/* Run-Wake GPE devices */
+	u8 always_enabled:1;
+	u8 notifier_present:1;
 };
 
 struct acpi_device_wakeup_state {
@@ -256,6 +258,7 @@ struct acpi_device_wakeup {
 	struct acpi_device_wakeup_state state;
 	struct acpi_device_wakeup_flags flags;
 	int prepare_count;
+	int run_wake_count;
 };
 
 /* Device */
@@ -370,7 +373,7 @@ struct acpi_pci_root {
 	struct acpi_pci_id id;
 	struct pci_bus *bus;
 	u16 segment;
-	u8 bus_nr;
+	struct resource secondary;	/* downstream bus range */
 
 	u32 osc_support_set;	/* _OSC state of support bits */
 	u32 osc_control_set;	/* _OSC state of control bits */

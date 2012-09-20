@@ -67,6 +67,7 @@
 #include <asm/uaccess.h>
 #include <asm/system.h>
 #include <trace/events/skb.h>
+#include <bc/net.h>
 
 #include "kmap_skb.h"
 
@@ -184,11 +185,23 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 	if (!skb)
 		goto out;
 
-	size = SKB_DATA_ALIGN(size);
-	data = kmalloc_node_track_caller(size + sizeof(struct skb_shared_info),
-			gfp_mask, node);
+	if (ub_skb_alloc_bc(skb, gfp_mask & ~__GFP_DMA))
+		goto nobc;
+
+	/* We do our best to align skb_shared_info on a separate cache
+	 * line. It usually works because kmalloc(X > SMP_CACHE_BYTES) gives
+	 * aligned memory blocks, unless SLUB/SLAB debug is enabled.
+	 * Both skb->head and skb_shared_info are cache line aligned.
+	 */
+	size += SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+	data = kmalloc_node_track_caller(size, gfp_mask, node);
 	if (!data)
 		goto nodata;
+	/* kmalloc(size) might give us more room than requested.
+	 * Put skb_shared_info exactly at the end of allocated zone,
+	 * to allow max possible filling before reallocation.
+	 */
+	size = SKB_WITH_OVERHEAD(ksize(data));
 
 	/*
 	 * Only clear those fields we need to clear, not those that we will
@@ -196,12 +209,14 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 	 * the tail pointer in struct sk_buff!
 	 */
 	memset(skb, 0, offsetof(struct sk_buff, tail));
-	skb->truesize = size + sizeof(struct sk_buff);
+	/* Account for allocated memory : skb + skb->head */
+	skb->truesize = SKB_TRUESIZE(size);
 	atomic_set(&skb->users, 1);
 	skb->head = data;
 	skb->data = data;
 	skb_reset_tail_pointer(skb);
 	skb->end = skb->tail + size;
+	skb->owner_env = get_exec_env();
 	kmemcheck_annotate_bitfield(skb, flags1);
 	kmemcheck_annotate_bitfield(skb, flags2);
 #ifdef NET_SKBUFF_DATA_USES_OFFSET
@@ -234,11 +249,68 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 out:
 	return skb;
 nodata:
+	ub_skb_free_bc(skb);
+nobc:
 	kmem_cache_free(cache, skb);
 	skb = NULL;
 	goto out;
 }
 EXPORT_SYMBOL(__alloc_skb);
+
+/**
+ * build_skb - build a network buffer
+ * @data: data buffer provided by caller
+ *
+ * Allocate a new &sk_buff. Caller provides space holding head and
+ * skb_shared_info. @data must have been allocated by kmalloc()
+ * The return is the new skb buffer.
+ * On a failure the return is %NULL, and @data is not freed.
+ * Notes :
+ *  Before IO, driver allocates only data buffer where NIC put incoming frame
+ *  Driver should add room at head (NET_SKB_PAD) and
+ *  MUST add room at tail (SKB_DATA_ALIGN(skb_shared_info))
+ *  After IO, driver calls build_skb(), to allocate sk_buff and populate it
+ *  before giving packet to stack.
+ *  RX rings only contains data buffers, not full skbs.
+ */
+struct sk_buff *build_skb(void *data)
+{
+	struct skb_shared_info *shinfo;
+	struct sk_buff *skb;
+	unsigned int size;
+
+	skb = kmem_cache_alloc(skbuff_head_cache, GFP_ATOMIC);
+	if (!skb)
+		return NULL;
+
+	size = ksize(data) - SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+
+	memset(skb, 0, offsetof(struct sk_buff, tail));
+	skb->truesize = SKB_TRUESIZE(size);
+	atomic_set(&skb->users, 1);
+	skb->head = data;
+	skb->data = data;
+	skb_reset_tail_pointer(skb);
+	skb->end = skb->tail + size;
+#ifdef NET_SKBUFF_DATA_USES_OFFSET
+	skb->mac_header = ~0U;
+#endif
+
+	/* make sure we initialize shinfo sequentially */
+	shinfo = skb_shinfo(skb);
+	atomic_set(&shinfo->dataref, 1);
+	shinfo->nr_frags  = 0;
+	shinfo->gso_size = 0;
+	shinfo->gso_segs = 0;
+	shinfo->gso_type = 0;
+	shinfo->ip6_frag_id = 0;
+	shinfo->tx_flags.flags = 0;
+	skb_frag_list_init(skb);
+	memset(&shinfo->hwtstamps, 0, sizeof(shinfo->hwtstamps));
+
+	return skb;
+}
+EXPORT_SYMBOL(build_skb);
 
 /**
  *	__netdev_alloc_skb - allocate an skbuff for rx on a specific device
@@ -347,6 +419,18 @@ static void skb_release_data(struct sk_buff *skb)
 				put_page(skb_shinfo(skb)->frags[i].page);
 		}
 
+		/*
+		 * If skb buf is from userspace, we need to notify the caller
+		 * the lower device DMA has done;
+		 */
+		if (skb_tx(skb)->dev_zerocopy) {
+			struct ubuf_info *uarg;
+
+			uarg = skb_shinfo(skb)->destructor_arg;
+			if (uarg->callback)
+				uarg->callback(uarg);
+		}
+
 		if (skb_has_frags(skb))
 			skb_drop_fraglist(skb);
 
@@ -362,6 +446,7 @@ static void kfree_skbmem(struct sk_buff *skb)
 	struct sk_buff *other;
 	atomic_t *fclone_ref;
 
+	ub_skb_free_bc(skb);
 	switch (skb->fclone) {
 	case SKB_FCLONE_UNAVAILABLE:
 		kmem_cache_free(skbuff_head_cache, skb);
@@ -394,6 +479,7 @@ static void skb_release_head_state(struct sk_buff *skb)
 #ifdef CONFIG_XFRM
 	secpath_put(skb->sp);
 #endif
+	ub_skb_uncharge(skb);
 	if (skb->destructor) {
 		WARN_ON(in_irq());
 		skb->destructor(skb);
@@ -473,6 +559,7 @@ void consume_skb(struct sk_buff *skb)
 		smp_rmb();
 	else if (likely(!atomic_dec_and_test(&skb->users)))
 		return;
+	trace_consume_skb(skb);
 	__kfree_skb(skb);
 }
 EXPORT_SYMBOL(consume_skb);
@@ -492,6 +579,9 @@ EXPORT_SYMBOL(consume_skb);
 int skb_recycle_check(struct sk_buff *skb, int skb_size)
 {
 	struct skb_shared_info *shinfo;
+
+	if (skb_tx(skb)->dev_zerocopy)
+		return 0;
 
 	if (skb_is_nonlinear(skb) || skb->fclone != SKB_FCLONE_UNAVAILABLE)
 		return 0;
@@ -531,6 +621,7 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 	new->network_header	= old->network_header;
 	new->mac_header		= old->mac_header;
 	skb_dst_set(new, dst_clone(skb_dst(old)));
+	new->rxhash		= old->rxhash;
 #ifdef CONFIG_XFRM
 	new->sp			= secpath_get(old->sp);
 #endif
@@ -541,6 +632,7 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 	new->ip_summed		= old->ip_summed;
 	skb_copy_queue_mapping(new, old);
 	new->priority		= old->priority;
+	new->deliver_no_wcard	= old->deliver_no_wcard;
 #if defined(CONFIG_IP_VS) || defined(CONFIG_IP_VS_MODULE)
 	new->ipvs_property	= old->ipvs_property;
 #endif
@@ -560,6 +652,11 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 #endif
 	new->vlan_tci		= old->vlan_tci;
 
+#ifdef CONFIG_VE
+	new->accounted = old->accounted;
+	new->redirected = old->redirected;
+#endif
+	skb_copy_brmark(new, old);
 	skb_copy_secmark(new, old);
 }
 
@@ -578,9 +675,14 @@ static struct sk_buff *__skb_clone(struct sk_buff *n, struct sk_buff *skb)
 	C(len);
 	C(data_len);
 	C(mac_len);
+	C(rxhash);
 	n->hdr_len = skb->nohdr ? skb_headroom(skb) : skb->hdr_len;
 	n->cloned = 1;
 	n->nohdr = 0;
+	C(owner_env);
+#if defined(CONFIG_BRIDGE) || defined(CONFIG_BRIDGE_MODULE)
+	C(brmark);
+#endif
 	n->destructor = NULL;
 	C(tail);
 	C(end);
@@ -588,6 +690,11 @@ static struct sk_buff *__skb_clone(struct sk_buff *n, struct sk_buff *skb)
 	C(data);
 	C(truesize);
 	atomic_set(&n->users, 1);
+
+#ifdef CONFIG_VE
+	C(accounted);
+	C(redirected);
+#endif
 
 	atomic_inc(&(skb_shinfo(skb)->dataref));
 	skb->cloned = 1;
@@ -613,6 +720,51 @@ struct sk_buff *skb_morph(struct sk_buff *dst, struct sk_buff *src)
 }
 EXPORT_SYMBOL_GPL(skb_morph);
 
+/* skb frags copy userspace buffers to kernel */
+static int skb_copy_ubufs(struct sk_buff *skb, gfp_t gfp_mask)
+{
+	int i;
+	int num_frags = skb_shinfo(skb)->nr_frags;
+	struct page *page, *head = NULL;
+	struct ubuf_info *uarg = skb_shinfo(skb)->destructor_arg;
+
+	for (i = 0; i < num_frags; i++) {
+		u8 *vaddr;
+		skb_frag_t *f = &skb_shinfo(skb)->frags[i];
+
+		page = alloc_page(GFP_ATOMIC);
+		if (!page) {
+			while (head) {
+				struct page *next = (struct page *)head->private;
+				put_page(head);
+				head = next;
+			}
+			return -ENOMEM;
+		}
+		vaddr = kmap_skb_frag(&skb_shinfo(skb)->frags[i]);
+		memcpy(page_address(page),
+		       vaddr + f->page_offset, f->size);
+		kunmap_skb_frag(vaddr);
+		page->private = (unsigned long)head;
+		head = page;
+	}
+
+	/* skb frags release userspace buffers */
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++)
+		put_page(skb_shinfo(skb)->frags[i].page);
+
+	uarg->callback(uarg);
+
+	/* skb frags point to kernel buffers */
+	for (i = skb_shinfo(skb)->nr_frags; i > 0; i--) {
+		skb_shinfo(skb)->frags[i - 1].page_offset = 0;
+		skb_shinfo(skb)->frags[i - 1].page = head;
+		head = (struct page *)head->private;
+	}
+	return 0;
+}
+
+
 /**
  *	skb_clone	-	duplicate an sk_buff
  *	@skb: buffer to clone
@@ -631,6 +783,12 @@ struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t gfp_mask)
 {
 	struct sk_buff *n;
 
+	if (skb_tx(skb)->dev_zerocopy) {
+		if (skb_copy_ubufs(skb, gfp_mask))
+			return NULL;
+		skb_tx(skb)->dev_zerocopy = 0;
+	}
+
 	n = skb + 1;
 	if (skb->fclone == SKB_FCLONE_ORIG &&
 	    n->fclone == SKB_FCLONE_UNAVAILABLE) {
@@ -647,6 +805,10 @@ struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t gfp_mask)
 		n->fclone = SKB_FCLONE_UNAVAILABLE;
 	}
 
+	if (ub_skb_alloc_bc(n, gfp_mask)) {
+		kmem_cache_free(skbuff_head_cache, n);
+		return NULL;
+	}
 	return __skb_clone(n, skb);
 }
 EXPORT_SYMBOL(skb_clone);
@@ -760,6 +922,14 @@ struct sk_buff *pskb_copy(struct sk_buff *skb, gfp_t gfp_mask)
 	if (skb_shinfo(skb)->nr_frags) {
 		int i;
 
+		if (skb_tx(skb)->dev_zerocopy) {
+			if (skb_copy_ubufs(skb, gfp_mask)) {
+				kfree_skb(n);
+				n = NULL;
+				goto out;
+			}
+			skb_tx(skb)->dev_zerocopy = 0;
+		}
 		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
 			skb_shinfo(n)->frags[i] = skb_shinfo(skb)->frags[i];
 			get_page(skb_shinfo(n)->frags[i].page);
@@ -805,6 +975,7 @@ int pskb_expand_head(struct sk_buff *skb, int nhead, int ntail,
 	int size = nhead + (skb->end - skb->head) + ntail;
 #endif
 	long off;
+	bool fastpath;
 
 	BUG_ON(nhead < 0);
 
@@ -827,14 +998,33 @@ int pskb_expand_head(struct sk_buff *skb, int nhead, int ntail,
 	memcpy(data + size, skb_end_pointer(skb),
 	       sizeof(struct skb_shared_info));
 
-	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++)
-		get_page(skb_shinfo(skb)->frags[i].page);
+	/* Check if we can avoid taking references on fragments if we own
+	 * the last reference on skb->head. (see skb_release_data())
+	 */
+	if (!skb->cloned)
+		fastpath = true;
+	else {
+		int delta = skb->nohdr ? (1 << SKB_DATAREF_SHIFT) + 1 : 1;
+		fastpath = atomic_read(&skb_shinfo(skb)->dataref) == delta;
+	}
 
-	if (skb_has_frags(skb))
-		skb_clone_fraglist(skb);
+	if (fastpath) {
+		kfree(skb->head);
+	} else {
+		/* copy this zero copy skb frags */
+		if (skb_tx(skb)->dev_zerocopy) {
+			if (skb_copy_ubufs(skb, gfp_mask))
+				goto nofrags;
+			skb_tx(skb)->dev_zerocopy = 0;
+		}
+		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++)
+			get_page(skb_shinfo(skb)->frags[i].page);
 
-	skb_release_data(skb);
+		if (skb_has_frags(skb))
+			skb_clone_fraglist(skb);
 
+		skb_release_data(skb);
+	}
 	off = (data + nhead) - skb->head;
 
 	skb->head     = data;
@@ -858,6 +1048,8 @@ int pskb_expand_head(struct sk_buff *skb, int nhead, int ntail,
 	atomic_set(&skb_shinfo(skb)->dataref, 1);
 	return 0;
 
+nofrags:
+	kfree(data);
 nodata:
 	return -ENOMEM;
 }
@@ -1358,6 +1550,7 @@ int skb_copy_bits(const struct sk_buff *skb, int offset, void *to, int len)
 		}
 		start = end;
 	}
+
 	if (!len)
 		return 0;
 
@@ -2434,8 +2627,6 @@ int skb_append_datato_frags(struct sock *sk, struct sk_buff *skb,
 			return -ENOMEM;
 
 		/* initialize the next frag */
-		sk->sk_sndmsg_page = page;
-		sk->sk_sndmsg_off = 0;
 		skb_fill_page_desc(skb, frg_cnt, page, 0, 0);
 		skb->truesize += PAGE_SIZE;
 		atomic_add(PAGE_SIZE, &sk->sk_wmem_alloc);
@@ -2455,7 +2646,6 @@ int skb_append_datato_frags(struct sock *sk, struct sk_buff *skb,
 			return -EFAULT;
 
 		/* copy was successful so update the size parameters */
-		sk->sk_sndmsg_off += copy;
 		frag->size += copy;
 		skb->len += copy;
 		skb->data_len += copy;
@@ -2726,6 +2916,7 @@ int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb)
 	*NAPI_GRO_CB(nskb) = *NAPI_GRO_CB(p);
 	skb_shinfo(nskb)->frag_list = p;
 	skb_shinfo(nskb)->gso_size = pinfo->gso_size;
+	pinfo->gso_size = 0;
 	skb_header_release(p);
 	nskb->prev = p;
 
@@ -2741,8 +2932,12 @@ int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb)
 
 merge:
 	if (offset > headlen) {
-		skbinfo->frags[0].page_offset += offset - headlen;
-		skbinfo->frags[0].size -= offset - headlen;
+		unsigned int eat = offset - headlen;
+
+		skbinfo->frags[0].page_offset += eat;
+		skbinfo->frags[0].size -= eat;
+		skb->data_len -= eat;
+		skb->len -= eat;
 		offset = headlen;
 	}
 

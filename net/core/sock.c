@@ -123,8 +123,15 @@
 #include <linux/net_tstamp.h>
 #include <net/xfrm.h>
 #include <linux/ipsec.h>
+#include <net/cls_cgroup.h>
+#include <net/netprio_cgroup.h>
+
+#include <bc/net.h>
+#include <bc/beancounter.h>
 
 #include <linux/filter.h>
+
+#include <trace/events/sock.h>
 
 #ifdef CONFIG_INET
 #include <net/tcp.h>
@@ -203,7 +210,7 @@ static struct lock_class_key af_callback_keys[AF_MAX];
  * not depend upon such differences.
  */
 #define _SK_MEM_PACKETS		256
-#define _SK_MEM_OVERHEAD	(sizeof(struct sk_buff) + 256)
+#define _SK_MEM_OVERHEAD	SKB_TRUESIZE(256)
 #define SK_WMEM_MAX		(_SK_MEM_OVERHEAD * _SK_MEM_PACKETS)
 #define SK_RMEM_MAX		(_SK_MEM_OVERHEAD * _SK_MEM_PACKETS)
 
@@ -216,6 +223,17 @@ __u32 sysctl_rmem_default __read_mostly = SK_RMEM_MAX;
 /* Maximal space eaten by iovec or ancilliary data plus some space */
 int sysctl_optmem_max __read_mostly = sizeof(unsigned long)*(2*UIO_MAXIOV+512);
 EXPORT_SYMBOL(sysctl_optmem_max);
+
+#if defined(CONFIG_CGROUPS)
+#if !defined(CONFIG_NET_CLS_CGROUP)
+int net_cls_subsys_id = -1;
+EXPORT_SYMBOL_GPL(net_cls_subsys_id);
+#endif
+#if !defined(CONFIG_NETPRIO_CGROUP)
+int net_prio_subsys_id = -1;
+EXPORT_SYMBOL_GPL(net_prio_subsys_id);
+#endif
+#endif
 
 static int sock_set_timeout(long *timeo_p, char __user *optval, int optlen)
 {
@@ -254,7 +272,7 @@ static void sock_warn_obsolete_bsdism(const char *name)
 	static char warncomm[TASK_COMM_LEN];
 	if (strcmp(warncomm, current->comm) && warned < 5) {
 		strcpy(warncomm,  current->comm);
-		printk(KERN_WARNING "process `%s' is using obsolete "
+		ve_printk(VE_LOG, KERN_WARNING "process `%s' is using obsolete "
 		       "%s SO_BSDCOMPAT\n", warncomm, name);
 		warned++;
 	}
@@ -276,6 +294,8 @@ int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 {
 	int err = 0;
 	int skb_len;
+	unsigned long flags;
+	struct sk_buff_head *list = &sk->sk_receive_queue;
 
 	/* Cast sk->rcvbuf to unsigned... It's pointless, but reduces
 	   number of warnings when compiling with -W --ANK
@@ -283,6 +303,7 @@ int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	if (atomic_read(&sk->sk_rmem_alloc) + skb->truesize >=
 	    (unsigned)sk->sk_rcvbuf) {
 		err = -ENOMEM;
+		trace_sock_rcvqueue_full(sk, skb);
 		goto out;
 	}
 
@@ -290,7 +311,7 @@ int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	if (err)
 		goto out;
 
-	if (!sk_rmem_schedule(sk, skb->truesize)) {
+	if (!sk_rmem_schedule(sk, skb)) {
 		err = -ENOBUFS;
 		goto out;
 	}
@@ -305,7 +326,10 @@ int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	 */
 	skb_len = skb->len;
 
-	skb_queue_tail(&sk->sk_receive_queue, skb);
+	spin_lock_irqsave(&list->lock, flags);
+	skb->dropcount = atomic_read(&sk->sk_drops);
+	__skb_queue_tail(list, skb);
+	spin_unlock_irqrestore(&list->lock, flags);
 
 	if (!sock_flag(sk, SOCK_DEAD))
 		sk->sk_data_ready(sk, skb_len);
@@ -323,6 +347,10 @@ int sk_receive_skb(struct sock *sk, struct sk_buff *skb, const int nested)
 
 	skb->dev = NULL;
 
+	if (sk_rcvqueues_full(sk, skb)) {
+		atomic_inc(&sk->sk_drops);
+		goto discard_and_relse;
+	}
 	if (nested)
 		bh_lock_sock_nested(sk);
 	else
@@ -336,8 +364,12 @@ int sk_receive_skb(struct sock *sk, struct sk_buff *skb, const int nested)
 		rc = sk_backlog_rcv(sk, skb);
 
 		mutex_release(&sk->sk_lock.dep_map, 1, _RET_IP_);
-	} else
-		sk_add_backlog(sk, skb);
+	} else if (sk_add_backlog(sk, skb)) {
+		bh_unlock_sock(sk);
+		atomic_inc(&sk->sk_drops);
+		goto discard_and_relse;
+	}
+
 	bh_unlock_sock(sk);
 out:
 	sock_put(sk);
@@ -353,6 +385,7 @@ struct dst_entry *__sk_dst_check(struct sock *sk, u32 cookie)
 	struct dst_entry *dst = sk->sk_dst_cache;
 
 	if (dst && dst->obsolete && dst->ops->check(dst, cookie) == NULL) {
+		sk_tx_queue_clear(sk);
 		sk->sk_dst_cache = NULL;
 		dst_release(dst);
 		return NULL;
@@ -702,6 +735,12 @@ set_rcvbuf:
 
 		/* We implement the SO_SNDLOWAT etc to
 		   not be settable (1003.1g 5.3) */
+	case SO_RXQ_OVFL:
+		if (valbool)
+			sock_set_flag(sk, SOCK_RXQ_OVFL);
+		else
+			sock_reset_flag(sk, SOCK_RXQ_OVFL);
+		break;
 	default:
 		ret = -ENOPROTOOPT;
 		break;
@@ -901,6 +940,10 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
 		v.val = sk->sk_mark;
 		break;
 
+	case SO_RXQ_OVFL:
+		v.val = !!sock_flag(sk, SOCK_RXQ_OVFL);
+		break;
+
 	default:
 		return -ENOPROTOOPT;
 	}
@@ -941,7 +984,8 @@ static void sock_copy(struct sock *nsk, const struct sock *osk)
 	BUILD_BUG_ON(offsetof(struct sock, sk_copy_start) !=
 		     sizeof(osk->sk_node) + sizeof(osk->sk_refcnt));
 	memcpy(&nsk->sk_copy_start, &osk->sk_copy_start,
-	       osk->sk_prot->obj_size - offsetof(struct sock, sk_copy_start));
+	       sk_alloc_size(osk->sk_prot->obj_size) -
+	       offsetof(struct sock, sk_copy_start));
 #ifdef CONFIG_SECURITY_NETWORK
 	nsk->sk_security = sptr;
 	security_sk_clone(osk, nsk);
@@ -968,12 +1012,13 @@ static struct sock *sk_prot_alloc(struct proto *prot, gfp_t priority,
 			if (offsetof(struct sock, sk_node.next) != 0)
 				memset(sk, 0, offsetof(struct sock, sk_node.next));
 			memset(&sk->sk_node.pprev, 0,
-			       prot->obj_size - offsetof(struct sock,
-							 sk_node.pprev));
+			       sk_alloc_size(prot->obj_size) -
+			       offsetof(struct sock,
+			       sk_node.pprev));
 		}
 	}
 	else
-		sk = kmalloc(prot->obj_size, priority);
+		sk = kmalloc(sk_alloc_size(prot->obj_size), priority);
 
 	if (sk != NULL) {
 		kmemcheck_annotate_bitfield(sk, flags);
@@ -983,6 +1028,12 @@ static struct sock *sk_prot_alloc(struct proto *prot, gfp_t priority,
 
 		if (!try_module_get(prot->owner))
 			goto out_free_sec;
+		/*
+		 * assign sk_prot_creator earlier here. It's needed by
+		 * sk_extended called from sk_tx_queue_clear
+		 */
+		sk->sk_prot_creator = prot;
+		sk_tx_queue_clear(sk);
 	}
 
 	return sk;
@@ -1006,12 +1057,36 @@ static void sk_prot_free(struct proto *prot, struct sock *sk)
 	slab = prot->slab;
 
 	security_sk_free(sk);
+	ub_sock_uncharge(sk);
 	if (slab != NULL)
 		kmem_cache_free(slab, sk);
 	else
 		kfree(sk);
 	module_put(owner);
 }
+
+#ifdef CONFIG_CGROUPS
+void sock_update_classid(struct sock *sk)
+{
+	u32 classid = task_cls_classid(current);
+
+	if (classid && classid != sk->sk_classid)
+		sk->sk_classid = classid;
+}
+EXPORT_SYMBOL(sock_update_classid);
+
+void sock_update_netprioidx(struct sock *sk)
+{
+	struct cgroup_netprio_state *state;
+	if (in_interrupt())
+		return;
+	rcu_read_lock();
+	state = task_netprio_state(current);
+	sk_extended(sk)->__sk_common_extended2.sk_cgrp_prioidx = state ? state->prioidx : 0;
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL_GPL(sock_update_netprioidx);
+#endif
 
 /**
  *	sk_alloc - All socket objects are allocated here
@@ -1034,8 +1109,12 @@ struct sock *sk_alloc(struct net *net, int family, gfp_t priority,
 		 */
 		sk->sk_prot = sk->sk_prot_creator = prot;
 		sock_lock_init(sk);
+		sk->owner_env = get_exec_env();
 		sock_net_set(sk, get_net(net));
 		atomic_set(&sk->sk_wmem_alloc, 1);
+
+		sock_update_classid(sk);
+		sock_update_netprioidx(sk);
 	}
 
 	return sk;
@@ -1114,6 +1193,7 @@ struct sock *sk_clone(const struct sock *sk, const gfp_t priority)
 		sock_lock_init(newsk);
 		bh_lock_sock(newsk);
 		newsk->sk_backlog.head	= newsk->sk_backlog.tail = NULL;
+		sk_extended(newsk)->sk_backlog.len = 0;
 
 		atomic_set(&newsk->sk_rmem_alloc, 0);
 		/*
@@ -1146,14 +1226,11 @@ struct sock *sk_clone(const struct sock *sk, const gfp_t priority)
 		if (filter != NULL)
 			sk_filter_charge(newsk, filter);
 
-		if (unlikely(xfrm_sk_clone_policy(newsk))) {
-			/* It is still raw copy of parent, so invalidate
-			 * destructor and make plain sk_free() */
-			newsk->sk_destruct = NULL;
-			sk_free(newsk);
-			newsk = NULL;
-			goto out;
-		}
+		if (ub_sock_charge(newsk, newsk->sk_family, newsk->sk_type) < 0)
+			goto out_err;
+
+		if (unlikely(xfrm_sk_clone_policy(newsk)))
+			 goto out_err;
 
 		newsk->sk_err	   = 0;
 		newsk->sk_priority = 0;
@@ -1181,14 +1258,27 @@ struct sock *sk_clone(const struct sock *sk, const gfp_t priority)
 
 		if (newsk->sk_prot->sockets_allocated)
 			percpu_counter_inc(newsk->sk_prot->sockets_allocated);
+
+		if (sock_flag(newsk, SOCK_TIMESTAMP) ||
+		    sock_flag(newsk, SOCK_TIMESTAMPING_RX_SOFTWARE))
+			net_enable_timestamp();
 	}
-out:
 	return newsk;
+
+out_err:
+	/* It is still raw copy of parent, so invalidate
+	 * destructor and make plain sk_free() */
+	sock_reset_flag(newsk, SOCK_TIMESTAMP);
+	newsk->sk_destruct = NULL;
+	sk_free(newsk);
+	return NULL;
 }
 EXPORT_SYMBOL_GPL(sk_clone);
 
 void sk_setup_caps(struct sock *sk, struct dst_entry *dst)
 {
+	extern int sysctl_tcp_use_sg;
+
 	__sk_dst_set(sk, dst);
 	sk->sk_route_caps = dst->dev->features;
 	if (sk->sk_route_caps & NETIF_F_GSO)
@@ -1201,6 +1291,8 @@ void sk_setup_caps(struct sock *sk, struct dst_entry *dst)
 			sk->sk_gso_max_size = dst->dev->gso_max_size;
 		}
 	}
+	if (!sysctl_tcp_use_sg)
+		sk->sk_route_caps &= ~NETIF_F_SG;
 }
 EXPORT_SYMBOL_GPL(sk_setup_caps);
 
@@ -1265,9 +1357,9 @@ int sock_i_uid(struct sock *sk)
 {
 	int uid;
 
-	read_lock(&sk->sk_callback_lock);
+	read_lock_bh(&sk->sk_callback_lock);
 	uid = sk->sk_socket ? SOCK_INODE(sk->sk_socket)->i_uid : 0;
-	read_unlock(&sk->sk_callback_lock);
+	read_unlock_bh(&sk->sk_callback_lock);
 	return uid;
 }
 EXPORT_SYMBOL(sock_i_uid);
@@ -1276,9 +1368,9 @@ unsigned long sock_i_ino(struct sock *sk)
 {
 	unsigned long ino;
 
-	read_lock(&sk->sk_callback_lock);
+	read_lock_bh(&sk->sk_callback_lock);
 	ino = sk->sk_socket ? SOCK_INODE(sk->sk_socket)->i_ino : 0;
-	read_unlock(&sk->sk_callback_lock);
+	read_unlock_bh(&sk->sk_callback_lock);
 	return ino;
 }
 EXPORT_SYMBOL(sock_i_ino);
@@ -1378,9 +1470,8 @@ static long sock_wait_for_wmem(struct sock *sk, long timeo)
 /*
  *	Generic send/receive buffer handlers
  */
-
-struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
-				     unsigned long data_len, int noblock,
+struct sk_buff *sock_alloc_send_skb2(struct sock *sk, unsigned long size,
+				     unsigned long size2, int noblock,
 				     int *errcode)
 {
 	struct sk_buff *skb;
@@ -1402,46 +1493,35 @@ struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
 		if (sk->sk_shutdown & SEND_SHUTDOWN)
 			goto failure;
 
+		if (ub_sock_getwres_other(sk, skb_charge_size(size))) {
+			if (size2 < size) {
+				size = size2;
+				continue;
+			}
+			set_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
+			err = -EAGAIN;
+			if (!timeo)
+				goto failure;
+			if (signal_pending(current))
+				goto interrupted;
+			timeo = ub_sock_wait_for_space(sk, timeo,
+					skb_charge_size(size));
+			continue;
+		}
+
 		if (atomic_read(&sk->sk_wmem_alloc) < sk->sk_sndbuf) {
-			skb = alloc_skb(header_len, gfp_mask);
-			if (skb) {
-				int npages;
-				int i;
-
-				/* No pages, we're done... */
-				if (!data_len)
-					break;
-
-				npages = (data_len + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
-				skb->truesize += data_len;
-				skb_shinfo(skb)->nr_frags = npages;
-				for (i = 0; i < npages; i++) {
-					struct page *page;
-					skb_frag_t *frag;
-
-					page = alloc_pages(sk->sk_allocation, 0);
-					if (!page) {
-						err = -ENOBUFS;
-						skb_shinfo(skb)->nr_frags = i;
-						kfree_skb(skb);
-						goto failure;
-					}
-
-					frag = &skb_shinfo(skb)->frags[i];
-					frag->page = page;
-					frag->page_offset = 0;
-					frag->size = (data_len >= PAGE_SIZE ?
-						      PAGE_SIZE :
-						      data_len);
-					data_len -= PAGE_SIZE;
-				}
-
+			skb = alloc_skb(size, gfp_mask);
+			if (skb)
 				/* Full success... */
 				break;
-			}
+			ub_sock_retwres_other(sk, skb_charge_size(size),
+					SOCK_MIN_UBCSPACE_CH);
 			err = -ENOBUFS;
 			goto failure;
 		}
+		ub_sock_retwres_other(sk,
+				skb_charge_size(size),
+				SOCK_MIN_UBCSPACE_CH);
 		set_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
 		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
 		err = -EAGAIN;
@@ -1452,6 +1532,7 @@ struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
 		timeo = sock_wait_for_wmem(sk, timeo);
 	}
 
+	ub_skb_set_charge(skb, sk, skb_charge_size(size), UB_OTHERSOCKBUF);
 	skb_set_owner_w(skb, sk);
 	return skb;
 
@@ -1461,12 +1542,12 @@ failure:
 	*errcode = err;
 	return NULL;
 }
-EXPORT_SYMBOL(sock_alloc_send_pskb);
+EXPORT_SYMBOL(sock_alloc_send_skb2);
 
 struct sk_buff *sock_alloc_send_skb(struct sock *sk, unsigned long size,
 				    int noblock, int *errcode)
 {
-	return sock_alloc_send_pskb(sk, size, 0, noblock, errcode);
+	return sock_alloc_send_skb2(sk, size, size, noblock, errcode);
 }
 EXPORT_SYMBOL(sock_alloc_send_skb);
 
@@ -1513,6 +1594,12 @@ static void __release_sock(struct sock *sk)
 
 		bh_lock_sock(sk);
 	} while ((skb = sk->sk_backlog.head) != NULL);
+
+	/*
+	 * Doing the zeroing here guarantee we can not loop forever
+	 * while a wild producer attempts to flood us.
+	 */
+	sk_extended(sk)->sk_backlog.len = 0;
 }
 
 /**
@@ -1611,6 +1698,8 @@ suppress_allocation:
 		if (sk->sk_wmem_queued + size >= sk->sk_sndbuf)
 			return 1;
 	}
+
+	trace_sock_exceed_buf_limit(sk, prot, allocated);
 
 	/* Alas. Undo changes. */
 	sk->sk_forward_alloc -= amt * SK_MEM_QUANTUM;
@@ -1775,7 +1864,7 @@ static void sock_def_readable(struct sock *sk, int len)
 {
 	read_lock(&sk->sk_callback_lock);
 	if (sk_has_sleeper(sk))
-		wake_up_interruptible_sync_poll(sk->sk_sleep, POLLIN |
+		wake_up_interruptible_sync_poll(sk->sk_sleep, POLLIN | POLLPRI |
 						POLLRDNORM | POLLRDBAND);
 	sk_wake_async(sk, SOCK_WAKE_WAITD, POLL_IN);
 	read_unlock(&sk->sk_callback_lock);
@@ -1900,21 +1989,24 @@ void lock_sock_nested(struct sock *sk, int subclass)
 		__lock_sock(sk);
 	sk->sk_lock.owned = 1;
 	spin_unlock(&sk->sk_lock.slock);
+#if !defined(CONFIG_VZ_CHECKPOINT) && !defined(CONFIG_VZ_CHECKPOINT_MODULE)
 	/*
 	 * The sk_lock has mutex_lock() semantics here:
 	 */
 	mutex_acquire(&sk->sk_lock.dep_map, subclass, 0, _RET_IP_);
+#endif
 	local_bh_enable();
 }
 EXPORT_SYMBOL(lock_sock_nested);
 
 void release_sock(struct sock *sk)
 {
+#if !defined(CONFIG_VZ_CHECKPOINT) && !defined(CONFIG_VZ_CHECKPOINT_MODULE)
 	/*
 	 * The sk_lock has mutex_unlock() semantics:
 	 */
 	mutex_release(&sk->sk_lock.dep_map, 1, _RET_IP_);
-
+#endif
 	spin_lock_bh(&sk->sk_lock.slock);
 	if (sk->sk_backlog.tail)
 		__release_sock(sk);
@@ -2189,8 +2281,9 @@ static inline void release_proto_idx(struct proto *prot)
 int proto_register(struct proto *prot, int alloc_slab)
 {
 	if (alloc_slab) {
-		prot->slab = kmem_cache_create(prot->name, prot->obj_size, 0,
-					SLAB_HWCACHE_ALIGN | prot->slab_flags,
+		prot->slab = kmem_cache_create(prot->name,
+					sk_alloc_size(prot->obj_size), 0,
+					SLAB_HWCACHE_ALIGN | SLAB_UBC | prot->slab_flags,
 					NULL);
 
 		if (prot->slab == NULL) {
@@ -2208,8 +2301,8 @@ int proto_register(struct proto *prot, int alloc_slab)
 
 			sprintf(prot->rsk_prot->slab_name, mask, prot->name);
 			prot->rsk_prot->slab = kmem_cache_create(prot->rsk_prot->slab_name,
-								 prot->rsk_prot->obj_size, 0,
-								 SLAB_HWCACHE_ALIGN, NULL);
+								 sk_alloc_size(prot->rsk_prot->obj_size), 0,
+								 SLAB_HWCACHE_ALIGN|SLAB_UBC, NULL);
 
 			if (prot->rsk_prot->slab == NULL) {
 				printk(KERN_CRIT "%s: Can't create request sock SLAB cache!\n",
@@ -2229,9 +2322,9 @@ int proto_register(struct proto *prot, int alloc_slab)
 			sprintf(prot->twsk_prot->twsk_slab_name, mask, prot->name);
 			prot->twsk_prot->twsk_slab =
 				kmem_cache_create(prot->twsk_prot->twsk_slab_name,
-						  prot->twsk_prot->twsk_obj_size,
+						  sk_alloc_size(prot->twsk_prot->twsk_obj_size),
 						  0,
-						  SLAB_HWCACHE_ALIGN |
+						  SLAB_HWCACHE_ALIGN | SLAB_UBC |
 							prot->slab_flags,
 						  NULL);
 			if (prot->twsk_prot->twsk_slab == NULL)

@@ -20,6 +20,8 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/pm.h>
+#include <linux/sched.h>
+#include <linux/ve.h>
 #include <linux/device.h>
 #include <linux/mutex.h>
 #include <linux/interrupt.h>
@@ -54,7 +56,7 @@ sysdev_store(struct kobject *kobj, struct attribute *attr,
 	return -EIO;
 }
 
-static struct sysfs_ops sysfs_ops = {
+static const struct sysfs_ops sysfs_ops = {
 	.show	= sysdev_show,
 	.store	= sysdev_store,
 };
@@ -104,7 +106,7 @@ static ssize_t sysdev_class_store(struct kobject *kobj, struct attribute *attr,
 	return -EIO;
 }
 
-static struct sysfs_ops sysfs_class_ops = {
+static const struct sysfs_ops sysfs_class_ops = {
 	.show	= sysdev_class_show,
 	.store	= sysdev_class_store,
 };
@@ -494,7 +496,7 @@ EXPORT_SYMBOL_GPL(sysdev_resume);
 
 int __init system_bus_init(void)
 {
-	system_kset = kset_create_and_add("system", NULL, &devices_kset->kobj);
+	system_kset = kset_create_and_add("system", NULL, &ve_devices_kset->kobj);
 	if (!system_kset)
 		return -ENOMEM;
 	return 0;

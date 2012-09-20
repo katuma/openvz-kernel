@@ -12,6 +12,12 @@
 #include <linux/proc_fs.h>
 
 extern struct proc_dir_entry proc_root;
+#ifdef CONFIG_VE
+extern struct proc_dir_entry glob_proc_root;
+#else
+#define glob_proc_root	proc_root
+#endif
+
 #ifdef CONFIG_PROC_SYSCTL
 extern int proc_sys_init(void);
 #else
@@ -63,6 +69,14 @@ extern const struct inode_operations proc_net_inode_operations;
 
 void free_proc_entry(struct proc_dir_entry *de);
 
+struct proc_maps_private {
+	struct pid *pid;
+	struct task_struct *task;
+#ifdef CONFIG_MMU
+	struct vm_area_struct *tail_vma;
+#endif
+};
+
 void proc_init_inodecache(void);
 
 static inline struct pid *proc_pid(struct inode *inode)
@@ -80,10 +94,11 @@ static inline int proc_fd(struct inode *inode)
 	return PROC_I(inode)->fd;
 }
 
-struct dentry *proc_lookup_de(struct proc_dir_entry *de, struct inode *ino,
+struct dentry *proc_lookup_de(struct proc_dir_entry *de,
+		struct proc_dir_entry *lpde, struct inode *ino,
 		struct dentry *dentry);
-int proc_readdir_de(struct proc_dir_entry *de, struct file *filp, void *dirent,
-		filldir_t filldir);
+int proc_readdir_de(struct proc_dir_entry *de, struct proc_dir_entry *lpde,
+		struct file *filp, void *dirent, filldir_t filldir);
 
 struct pde_opener {
 	struct inode *inode;
@@ -106,7 +121,9 @@ void de_put(struct proc_dir_entry *de);
 
 extern struct vfsmount *proc_mnt;
 int proc_fill_super(struct super_block *);
-struct inode *proc_get_inode(struct super_block *, unsigned int, struct proc_dir_entry *);
+struct inode *proc_get_inode(struct super_block *, unsigned int,
+		struct proc_dir_entry *, struct proc_dir_entry *);
+int proc_remount(struct super_block *sb, int *flags, char *data);
 
 /*
  * These are generic /proc routines that use the internal
@@ -117,3 +134,7 @@ struct inode *proc_get_inode(struct super_block *, unsigned int, struct proc_dir
  */
 int proc_readdir(struct file *, void *, filldir_t);
 struct dentry *proc_lookup(struct inode *, struct dentry *, struct nameidata *);
+
+extern const struct inode_operations proc_hard_inode_operations;
+
+#define PROC_IS_HARDLINK(d) (d->proc_iops == &proc_hard_inode_operations)

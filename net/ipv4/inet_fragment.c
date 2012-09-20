@@ -19,6 +19,7 @@
 #include <linux/random.h>
 #include <linux/skbuff.h>
 #include <linux/rtnetlink.h>
+#include <linux/sched.h>
 
 #include <net/inet_frag.h>
 
@@ -249,6 +250,9 @@ static struct inet_frag_queue *inet_frag_alloc(struct netns_frags *nf,
 	spin_lock_init(&q->lock);
 	atomic_set(&q->refcnt, 1);
 	q->net = nf;
+#ifdef CONFIG_VE
+	q->owner_ve = get_exec_env();
+#endif
 
 	return q;
 }

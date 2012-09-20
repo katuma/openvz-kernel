@@ -383,7 +383,7 @@ static struct audit_entry *audit_rule_to_entry(struct audit_rule *rule)
 				goto exit_free;
 			break;
 		case AUDIT_FILETYPE:
-			if ((f->val & ~S_IFMT) > S_IFMT)
+			if (f->val & ~S_IFMT)
 				goto exit_free;
 			break;
 		case AUDIT_INODE:
@@ -457,6 +457,8 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 		case AUDIT_ARG1:
 		case AUDIT_ARG2:
 		case AUDIT_ARG3:
+		case AUDIT_OBJ_UID:
+		case AUDIT_OBJ_GID:
 			break;
 		case AUDIT_ARCH:
 			entry->rule.arch_f = f;
@@ -520,7 +522,6 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 				goto exit_free;
 			break;
 		case AUDIT_FILTERKEY:
-			err = -EINVAL;
 			if (entry->rule.filterkey || f->val > AUDIT_MAX_KEY_LEN)
 				goto exit_free;
 			str = audit_unpack_string(&bufp, &remain, f->val);
@@ -534,7 +535,11 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 				goto exit_free;
 			break;
 		case AUDIT_FILETYPE:
-			if ((f->val & ~S_IFMT) > S_IFMT)
+			if (f->val & ~S_IFMT)
+				goto exit_free;
+			break;
+		case AUDIT_FIELD_COMPARE:
+			if (f->val > AUDIT_MAX_FIELD_COMPARE)
 				goto exit_free;
 			break;
 		default:
@@ -1258,6 +1263,18 @@ static int audit_filter_user_rules(struct netlink_skb_parms *cb,
 			break;
 		case AUDIT_LOGINUID:
 			result = audit_comparator(cb->loginuid, f->op, f->val);
+			break;
+		case AUDIT_SUBJ_USER:
+		case AUDIT_SUBJ_ROLE:
+		case AUDIT_SUBJ_TYPE:
+		case AUDIT_SUBJ_SEN:
+		case AUDIT_SUBJ_CLR:
+			if (f->lsm_rule)
+				result = security_audit_rule_match(cb->sid,
+								   f->type,
+								   f->op,
+								   f->lsm_rule,
+								   NULL);
 			break;
 		}
 

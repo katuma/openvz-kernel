@@ -30,7 +30,7 @@ static unsigned long		next_gc;
 static int			nrhosts;
 static DEFINE_MUTEX(nlm_host_mutex);
 
-static void			nlm_gc_hosts(void);
+static int			nlm_gc_hosts(struct ve_struct *ve);
 
 struct nlm_lookup_host_info {
 	const int		server;		/* search for server|client */
@@ -96,11 +96,13 @@ static struct nlm_host *nlm_lookup_host(struct nlm_lookup_host_info *ni)
 	struct hlist_node *pos;
 	struct nlm_host	*host;
 	struct nsm_handle *nsm = NULL;
+	struct ve_struct *ve;
 
+	ve = get_exec_env();
 	mutex_lock(&nlm_host_mutex);
 
 	if (time_after_eq(jiffies, next_gc))
-		nlm_gc_hosts();
+		nlm_gc_hosts(ve);
 
 	/* We may keep several nlm_host objects for a peer, because each
 	 * nlm_host is identified by
@@ -109,9 +111,12 @@ static struct nlm_host *nlm_lookup_host(struct nlm_lookup_host_info *ni)
 	 * different NLM rpc_clients into one single nlm_host object.
 	 * This would allow us to have one nlm_host per address.
 	 */
+
 	chain = &nlm_hosts[nlm_hash_address(ni->sap)];
 	hlist_for_each_entry(host, pos, chain, h_hash) {
 		if (!rpc_cmp_addr(nlm_addr(host), ni->sap))
+			continue;
+		if (!ve_accessible_strict(host->owner_env, ve))
 			continue;
 
 		/* See if we have an NSM handle for this client */
@@ -124,7 +129,7 @@ static struct nlm_host *nlm_lookup_host(struct nlm_lookup_host_info *ni)
 			continue;
 		if (host->h_server != ni->server)
 			continue;
-		if (ni->server &&
+		if (ni->server && ni->src_len != 0 &&
 		    !rpc_cmp_addr(nlm_srcaddr(host), ni->src_sap))
 			continue;
 
@@ -167,6 +172,7 @@ static struct nlm_host *nlm_lookup_host(struct nlm_lookup_host_info *ni)
 	host->h_addrlen = ni->salen;
 	rpc_set_port(nlm_addr(host), 0);
 	memcpy(nlm_srcaddr(host), ni->src_sap, ni->src_len);
+	host->h_srcaddrlen = ni->src_len;
 	host->h_version    = ni->version;
 	host->h_proto      = ni->protocol;
 	host->h_rpcclnt    = NULL;
@@ -186,6 +192,7 @@ static struct nlm_host *nlm_lookup_host(struct nlm_lookup_host_info *ni)
 	spin_lock_init(&host->h_lock);
 	INIT_LIST_HEAD(&host->h_granted);
 	INIT_LIST_HEAD(&host->h_reclaim);
+	host->owner_env    = ve;
 
 	nrhosts++;
 
@@ -238,9 +245,6 @@ struct nlm_host *nlmclnt_lookup_host(const struct sockaddr *sap,
 				     const char *hostname,
 				     int noresvport)
 {
-	const struct sockaddr source = {
-		.sa_family	= AF_UNSPEC,
-	};
 	struct nlm_lookup_host_info ni = {
 		.server		= 0,
 		.sap		= sap,
@@ -249,8 +253,6 @@ struct nlm_host *nlmclnt_lookup_host(const struct sockaddr *sap,
 		.version	= version,
 		.hostname	= hostname,
 		.hostname_len	= strlen(hostname),
-		.src_sap	= &source,
-		.src_len	= sizeof(source),
 		.noresvport	= noresvport,
 	};
 
@@ -353,10 +355,10 @@ nlm_bind_host(struct nlm_host *host)
 			.to_retries	= 5U,
 		};
 		struct rpc_create_args args = {
+			.net		= &init_net,
 			.protocol	= host->h_proto,
 			.address	= nlm_addr(host),
 			.addrsize	= host->h_addrlen,
-			.saddress	= nlm_srcaddr(host),
 			.timeout	= &timeparms,
 			.servername	= host->h_name,
 			.program	= &nlm_program,
@@ -375,6 +377,8 @@ nlm_bind_host(struct nlm_host *host)
 			args.flags |= RPC_CLNT_CREATE_HARDRTRY;
 		if (host->h_noresvport)
 			args.flags |= RPC_CLNT_CREATE_NONPRIVPORT;
+		if (host->h_srcaddrlen)
+			args.saddress = nlm_srcaddr(host);
 
 		clnt = rpc_create(&args);
 		if (!IS_ERR(clnt))
@@ -493,6 +497,11 @@ nlm_shutdown_hosts(void)
 	struct hlist_head *chain;
 	struct hlist_node *pos;
 	struct nlm_host	*host;
+	int nr_hosts_local;
+	struct ve_struct *ve;
+
+	ve = get_exec_env();
+	nr_hosts_local = 0;
 
 	dprintk("lockd: shutting down host module\n");
 	mutex_lock(&nlm_host_mutex);
@@ -501,24 +510,29 @@ nlm_shutdown_hosts(void)
 	dprintk("lockd: nuking all hosts...\n");
 	for (chain = nlm_hosts; chain < nlm_hosts + NLM_HOST_NRHASH; ++chain) {
 		hlist_for_each_entry(host, pos, chain, h_hash) {
+			if (!ve_accessible_strict(host->owner_env, ve))
+				continue;
 			host->h_expires = jiffies - 1;
 			if (host->h_rpcclnt) {
 				rpc_shutdown_client(host->h_rpcclnt);
 				host->h_rpcclnt = NULL;
 			}
+			nr_hosts_local++;
 		}
 	}
 
 	/* Then, perform a garbage collection pass */
-	nlm_gc_hosts();
+	nr_hosts_local -= nlm_gc_hosts(ve);
 	mutex_unlock(&nlm_host_mutex);
 
 	/* complain if any hosts are left */
-	if (nrhosts) {
+	if (nr_hosts_local) {
 		printk(KERN_WARNING "lockd: couldn't shutdown host module!\n");
-		dprintk("lockd: %d hosts left:\n", nrhosts);
+		dprintk("lockd: %d hosts left:\n", nr_hosts_local);
 		for (chain = nlm_hosts; chain < nlm_hosts + NLM_HOST_NRHASH; ++chain) {
 			hlist_for_each_entry(host, pos, chain, h_hash) {
+				if (!ve_accessible_strict(host->owner_env, ve))
+					continue;
 				dprintk("       %s (cnt %d use %d exp %ld)\n",
 					host->h_name, atomic_read(&host->h_count),
 					host->h_inuse, host->h_expires);
@@ -532,17 +546,23 @@ nlm_shutdown_hosts(void)
  * This GC combines reference counting for async operations with
  * mark & sweep for resources held by remote clients.
  */
-static void
-nlm_gc_hosts(void)
+static int
+nlm_gc_hosts(struct ve_struct *ve)
 {
 	struct hlist_head *chain;
 	struct hlist_node *pos, *next;
 	struct nlm_host	*host;
+	int freed;
+
+	freed = 0;
 
 	dprintk("lockd: host garbage collection\n");
 	for (chain = nlm_hosts; chain < nlm_hosts + NLM_HOST_NRHASH; ++chain) {
-		hlist_for_each_entry(host, pos, chain, h_hash)
+		hlist_for_each_entry(host, pos, chain, h_hash) {
+			if (!ve_accessible_strict(host->owner_env, ve))
+				continue;
 			host->h_inuse = 0;
+		}
 	}
 
 	/* Mark all hosts that hold locks, blocks or shares */
@@ -551,7 +571,8 @@ nlm_gc_hosts(void)
 	for (chain = nlm_hosts; chain < nlm_hosts + NLM_HOST_NRHASH; ++chain) {
 		hlist_for_each_entry_safe(host, pos, next, chain, h_hash) {
 			if (atomic_read(&host->h_count) || host->h_inuse
-			 || time_before(jiffies, host->h_expires)) {
+			 || time_before(jiffies, host->h_expires)
+			 || !ve_accessible_strict(host->owner_env, ve)) {
 				dprintk("nlm_gc_hosts skipping %s (cnt %d use %d exp %ld)\n",
 					host->h_name, atomic_read(&host->h_count),
 					host->h_inuse, host->h_expires);
@@ -562,8 +583,10 @@ nlm_gc_hosts(void)
 
 			nlm_destroy_host(host);
 			nrhosts--;
+			freed++;
 		}
 	}
 
 	next_gc = jiffies + NLM_HOST_COLLECT;
+	return freed;
 }

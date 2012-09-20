@@ -137,8 +137,11 @@ typedef int (*ext_prepare_callback)(struct inode *, struct ext4_ext_path *,
 #define EXT_BREAK      1
 #define EXT_REPEAT     2
 
-/* Maximum logical block in a file; ext4_extent's ee_block is __le32 */
-#define EXT_MAX_BLOCK	0xffffffff
+/*
+ * Maximum number of logical blocks in a file; ext4_extent's ee_block is
+ * __le32.
+ */
+#define EXT_MAX_BLOCKS	0xffffffff
 
 /*
  * EXT_INIT_MAX_LEN is the maximum number of blocks we can have in an
@@ -225,7 +228,8 @@ static inline void ext4_ext_mark_initialized(struct ext4_extent *ext)
 	ext->ee_len = cpu_to_le16(ext4_ext_get_actual_len(ext));
 }
 
-extern int ext4_ext_calc_metadata_amount(struct inode *inode, int blocks);
+extern int ext4_ext_calc_metadata_amount(struct inode *inode,
+					 sector_t lblocks);
 extern ext4_fsblk_t ext_pblock(struct ext4_extent *ex);
 extern ext4_fsblk_t idx_pblock(struct ext4_extent_idx *);
 extern void ext4_ext_store_pblock(struct ext4_extent *, ext4_fsblk_t);
@@ -251,5 +255,11 @@ extern int ext4_ext_search_right(struct inode *, struct ext4_ext_path *,
 						ext4_lblk_t *, ext4_fsblk_t *);
 extern void ext4_ext_drop_refs(struct ext4_ext_path *);
 extern int ext4_ext_check_inode(struct inode *inode);
+extern int __ext4_ext_check(const char *function, struct inode *inode,
+			    struct ext4_extent_header *eh,
+			    int depth);
+#define ext4_ext_check(inode, eh, depth)	\
+	__ext4_ext_check(__func__, inode, eh, depth)
+
 #endif /* _EXT4_EXTENTS */
 

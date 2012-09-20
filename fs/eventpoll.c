@@ -31,6 +31,7 @@
 #include <linux/eventpoll.h>
 #include <linux/mount.h>
 #include <linux/bitops.h>
+#include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/anon_inodes.h>
 #include <asm/uaccess.h>
@@ -63,6 +64,13 @@
  * cleanup path and it is also acquired by eventpoll_release_file()
  * if a file has been pushed inside an epoll set and it is then
  * close()d without a previous call toepoll_ctl(EPOLL_CTL_DEL).
+ * It is also acquired when inserting an epoll fd onto another epoll
+ * fd. We do this so that we walk the epoll tree and ensure that this
+ * insertion does not create a cycle of epoll file descriptors, which
+ * could lead to deadlock. We need a global mutex to prevent two
+ * simultaneous inserts (A into B and B into A) from racing and
+ * constructing a cycle without either insert observing that it is
+ * going to.
  * It is possible to drop the "ep->mtx" and to use the global
  * mutex "epmutex" (together with "ep->lock") to have it working,
  * but having "ep->mtx" will make the interface more scalable.
@@ -77,19 +85,11 @@
 /* Maximum number of nesting allowed inside epoll sets */
 #define EP_MAX_NESTS 4
 
-/* Maximum msec timeout value storeable in a long int */
-#define EP_MAX_MSTIMEO min(1000ULL * MAX_SCHEDULE_TIMEOUT / HZ, (LONG_MAX - 999ULL) / HZ)
-
 #define EP_MAX_EVENTS (INT_MAX / sizeof(struct epoll_event))
 
 #define EP_UNACTIVE_PTR ((void *) -1L)
 
 #define EP_ITEM_COST (sizeof(struct epitem) + sizeof(struct eppoll_entry))
-
-struct epoll_filefd {
-	struct file *file;
-	int fd;
-};
 
 /*
  * Structure used to track possible nested calls, for too deep recursions
@@ -108,82 +108,6 @@ struct nested_call_node {
 struct nested_calls {
 	struct list_head tasks_call_list;
 	spinlock_t lock;
-};
-
-/*
- * Each file descriptor added to the eventpoll interface will
- * have an entry of this type linked to the "rbr" RB tree.
- */
-struct epitem {
-	/* RB tree node used to link this structure to the eventpoll RB tree */
-	struct rb_node rbn;
-
-	/* List header used to link this structure to the eventpoll ready list */
-	struct list_head rdllink;
-
-	/*
-	 * Works together "struct eventpoll"->ovflist in keeping the
-	 * single linked chain of items.
-	 */
-	struct epitem *next;
-
-	/* The file descriptor information this item refers to */
-	struct epoll_filefd ffd;
-
-	/* Number of active wait queue attached to poll operations */
-	int nwait;
-
-	/* List containing poll wait queues */
-	struct list_head pwqlist;
-
-	/* The "container" of this item */
-	struct eventpoll *ep;
-
-	/* List header used to link this item to the "struct file" items list */
-	struct list_head fllink;
-
-	/* The structure that describe the interested events and the source fd */
-	struct epoll_event event;
-};
-
-/*
- * This structure is stored inside the "private_data" member of the file
- * structure and rapresent the main data sructure for the eventpoll
- * interface.
- */
-struct eventpoll {
-	/* Protect the this structure access */
-	spinlock_t lock;
-
-	/*
-	 * This mutex is used to ensure that files are not removed
-	 * while epoll is using them. This is held during the event
-	 * collection loop, the file cleanup path, the epoll file exit
-	 * code and the ctl operations.
-	 */
-	struct mutex mtx;
-
-	/* Wait queue used by sys_epoll_wait() */
-	wait_queue_head_t wq;
-
-	/* Wait queue used by file->poll() */
-	wait_queue_head_t poll_wait;
-
-	/* List of ready file descriptors */
-	struct list_head rdllist;
-
-	/* RB tree root used to store monitored fd structs */
-	struct rb_root rbr;
-
-	/*
-	 * This is a single linked list that chains all the "struct epitem" that
-	 * happened while transfering ready events to userspace w/out
-	 * holding ->lock.
-	 */
-	struct epitem *ovflist;
-
-	/* The user that created the eventpoll descriptor */
-	struct user_struct *user;
 };
 
 /* Wait structure used by the poll hooks */
@@ -225,7 +149,11 @@ static int max_user_watches __read_mostly;
 /*
  * This mutex is used to serialize ep_free() and eventpoll_release_file().
  */
-static DEFINE_MUTEX(epmutex);
+DEFINE_MUTEX(epmutex);
+EXPORT_SYMBOL(epmutex);
+
+/* Used to check for epoll file descriptor inclusion loops */
+static struct nested_calls poll_loop_ncalls;
 
 /* Used for safe wake up implementation */
 static struct nested_calls poll_safewake_ncalls;
@@ -238,6 +166,76 @@ static struct kmem_cache *epi_cache __read_mostly;
 
 /* Slab cache used to allocate "struct eppoll_entry" */
 static struct kmem_cache *pwq_cache __read_mostly;
+
+/* Visited nodes during ep_loop_check(), so we can unset them when we finish */
+static LIST_HEAD(visited_list);
+
+#define NUM_FILES 30
+
+/* KABI workarounds */
+struct tfile_check {
+	int count;
+	struct epoll_filefd *tfile_arr[NUM_FILES];
+	struct tfile_check *next;
+};
+
+struct tfile_check base_tfile_check = {
+       .count = 0,
+       .next = NULL,
+};
+
+static struct tfile_check *current_tfile_check = &base_tfile_check;
+
+static int add_to_tfile_check(struct epoll_filefd *ffd)
+{
+	struct tfile_check *new;
+
+	if (current_tfile_check->count < NUM_FILES) {
+		current_tfile_check->tfile_arr[current_tfile_check->count++] = ffd;
+		ffd->added = 1;
+		return 0;
+	}
+	new = kmalloc(sizeof(struct tfile_check), GFP_KERNEL);
+	if (!new)
+		return -ENOMEM;
+	new->count = 0;
+	new->next = NULL;
+	new->tfile_arr[new->count++] = ffd;
+	ffd->added = 1;
+	current_tfile_check->next = new;
+	current_tfile_check = new;
+
+	return 0;
+}
+
+static void clear_added_flag(struct tfile_check *tfile_check_iter)
+{
+	int i;
+
+	for (i = 0; i < tfile_check_iter->count; i++)
+		tfile_check_iter->tfile_arr[i]->added = 0;
+}
+
+void clear_tfile_check_list(void)
+{
+	struct tfile_check *tfile_check_iter, *tmp;
+
+	tfile_check_iter = base_tfile_check.next;
+	base_tfile_check.next = NULL;
+	clear_added_flag(&base_tfile_check);
+	base_tfile_check.count = 0;
+
+	while (tfile_check_iter) {
+		clear_added_flag(tfile_check_iter);
+		tmp = tfile_check_iter;
+		tfile_check_iter = tfile_check_iter->next;
+		kfree(tmp);
+	}
+	current_tfile_check = &base_tfile_check;
+}
+EXPORT_SYMBOL_GPL(clear_tfile_check_list);
+
+
 
 #ifdef CONFIG_SYSCTL
 
@@ -258,6 +256,7 @@ ctl_table epoll_table[] = {
 };
 #endif /* CONFIG_SYSCTL */
 
+const struct file_operations eventpoll_fops;
 
 /* Setup the structure that is used as key for the RB tree */
 static inline void ep_set_ffd(struct epoll_filefd *ffd,
@@ -265,6 +264,7 @@ static inline void ep_set_ffd(struct epoll_filefd *ffd,
 {
 	ffd->file = file;
 	ffd->fd = fd;
+	ffd->added = 0;
 }
 
 /* Compare RB tree keys */
@@ -304,6 +304,19 @@ static void ep_nested_calls_init(struct nested_calls *ncalls)
 {
 	INIT_LIST_HEAD(&ncalls->tasks_call_list);
 	spin_lock_init(&ncalls->lock);
+}
+
+/**
+ * ep_events_available - Checks if ready events might be available.
+ *
+ * @ep: Pointer to the eventpoll context.
+ *
+ * Returns: Returns a value different than zero if ready events are available,
+ *          or zero otherwise.
+ */
+static inline int ep_events_available(struct eventpoll *ep)
+{
+	return !list_empty(&ep->rdllist) || ep->ovflist != EP_UNACTIVE_PTR;
 }
 
 /**
@@ -672,10 +685,11 @@ static unsigned int ep_eventpoll_poll(struct file *file, poll_table *wait)
 }
 
 /* File callbacks that implement the eventpoll file behaviour */
-static const struct file_operations eventpoll_fops = {
+const struct file_operations eventpoll_fops = {
 	.release	= ep_eventpoll_release,
 	.poll		= ep_eventpoll_poll
 };
+EXPORT_SYMBOL(eventpoll_fops);
 
 /* Fast test to see if the file is an evenpoll file */
 static inline int is_file_epoll(struct file *f)
@@ -757,7 +771,7 @@ free_uid:
  * are protected by the "mtx" mutex, and ep_find() must be called with
  * "mtx" held.
  */
-static struct epitem *ep_find(struct eventpoll *ep, struct file *file, int fd)
+struct epitem *ep_find(struct eventpoll *ep, struct file *file, int fd)
 {
 	int kcmp;
 	struct rb_node *rbp;
@@ -780,6 +794,7 @@ static struct epitem *ep_find(struct eventpoll *ep, struct file *file, int fd)
 
 	return epir;
 }
+EXPORT_SYMBOL(ep_find);
 
 /*
  * This is the callback that is passed to the wait queue wakeup
@@ -892,10 +907,110 @@ static void ep_rbtree_insert(struct eventpoll *ep, struct epitem *epi)
 	rb_insert_color(&epi->rbn, &ep->rbr);
 }
 
+
+
+#define PATH_ARR_SIZE 5
+/*
+ * These are the number paths of length 1 to 5, that we are allowing to emanate
+ * from a single file of interest. For example, we allow 1000 paths of length
+ * 1, to emanate from each file of interest. This essentially represents the
+ * potential wakeup paths, which need to be limited in order to avoid massive
+ * uncontrolled wakeup storms. The common use case should be a single ep which
+ * is connected to n file sources. In this case each file source has 1 path
+ * of length 1. Thus, the numbers below should be more than sufficient. These
+ * path limits are enforced during an EPOLL_CTL_ADD operation, since a modify
+ * and delete can't add additional paths. Protected by the epmutex.
+ */
+static const int path_limits[PATH_ARR_SIZE] = { 1000, 500, 100, 50, 10 };
+static int path_count[PATH_ARR_SIZE];
+
+static int path_count_inc(int nests)
+{
+	if (nests == 0)
+		return 0;
+
+	if (++path_count[nests] > path_limits[nests])
+		return -1;
+	return 0;
+}
+
+static void path_count_init(void)
+{
+	int i;
+
+	for (i = 0; i < PATH_ARR_SIZE; i++)
+		path_count[i] = 0;
+}
+
+static int reverse_path_check_proc(void *priv, void *cookie, int call_nests)
+{
+	int error = 0;
+	struct file *file = priv;
+	struct file *child_file;
+	struct epitem *epi;
+
+	list_for_each_entry(epi, &file->f_ep_links, fllink) {
+		child_file = epi->ep->file;
+		if (is_file_epoll(child_file)) {
+			if (list_empty(&child_file->f_ep_links)) {
+				if (path_count_inc(call_nests)) {
+					error = -1;
+					break;
+				}
+			} else {
+				error = ep_call_nested(&poll_loop_ncalls,
+							EP_MAX_NESTS,
+							reverse_path_check_proc,
+							child_file, child_file,
+							current);
+			}
+			if (error != 0)
+				break;
+		} else {
+			printk(KERN_ERR "reverse_path_check_proc: "
+				"file is not an ep!\n");
+		}
+	}
+	return error;
+}
+
+/**
+ * reverse_path_check - The tfile_check_list is list of file *, which have
+ *                      links that are proposed to be newly added. We need to
+ *                      make sure that those added links don't add too many
+ *                      paths such that we will spend all our time waking up
+ *                      eventpoll objects.
+ *
+ * Returns: Returns zero if the proposed links don't create too many paths,
+ *	    -1 otherwise.
+ */
+static int reverse_path_check(void)
+{
+	int length = 0;
+	int error = 0;
+	int i;
+	struct tfile_check *tfile_check_iter = &base_tfile_check;
+
+	/* let's call this for all tfiles */
+	while (tfile_check_iter) {
+		for (i = 0; i < tfile_check_iter->count; i++) {
+			length++;
+			path_count_init();
+			error = ep_call_nested(&poll_loop_ncalls, EP_MAX_NESTS,
+					reverse_path_check_proc, tfile_check_iter->tfile_arr[i]->file,
+					tfile_check_iter->tfile_arr[i]->file, current);
+			if (error)
+				return error;
+		}
+		tfile_check_iter = tfile_check_iter->next;
+	}
+	return error;
+}
+
 /*
  * Must be called with "mtx" held.
  */
-static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
+int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 		     struct file *tfile, int fd)
 {
 	int error, revents, pwake = 0;
@@ -941,6 +1056,12 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 	if (epi->nwait < 0)
 		goto error_unregister;
 
+	if (!is_file_epoll(tfile)) {
+		error = add_to_tfile_check(&epi->ffd);
+		if (error)
+			goto error_unregister;
+	}
+
 	/* Add the current item to the list of active epoll hook for this file */
 	spin_lock(&tfile->f_lock);
 	list_add_tail(&epi->fllink, &tfile->f_ep_links);
@@ -951,6 +1072,11 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 	 * protected by "mtx", and ep_insert() is called with "mtx" held.
 	 */
 	ep_rbtree_insert(ep, epi);
+
+	/* now check if we've created too many backpaths */
+	error = -EINVAL;
+	if (reverse_path_check())
+		goto error_remove_epi;
 
 	/* We have to drop the new item inside our item list to keep track of it */
 	spin_lock_irqsave(&ep->lock, flags);
@@ -976,6 +1102,14 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 
 	return 0;
 
+error_remove_epi:
+	spin_lock(&tfile->f_lock);
+	if (ep_is_linked(&epi->fllink))
+		list_del_init(&epi->fllink);
+	spin_unlock(&tfile->f_lock);
+
+	rb_erase(&epi->rbn, &ep->rbr);
+
 error_unregister:
 	ep_unregister_pollwait(ep, epi);
 
@@ -994,6 +1128,7 @@ error_unregister:
 
 	return error;
 }
+EXPORT_SYMBOL(ep_insert);
 
 /*
  * Modify the interest event mask by dropping an event if the new mask
@@ -1113,27 +1248,63 @@ static int ep_send_events(struct eventpoll *ep,
 	return ep_scan_ready_list(ep, ep_send_events_proc, &esed);
 }
 
+static inline struct timespec ep_set_mstimeout(long ms)
+{
+	struct timespec now, ts = {
+		.tv_sec = ms / MSEC_PER_SEC,
+		.tv_nsec = NSEC_PER_MSEC * (ms % MSEC_PER_SEC),
+	};
+
+	ktime_get_ts(&now);
+	return timespec_add_safe(now, ts);
+}
+
+/**
+ * ep_poll - Retrieves ready events, and delivers them to the caller supplied
+ *           event buffer.
+ *
+ * @ep: Pointer to the eventpoll context.
+ * @events: Pointer to the userspace buffer where the ready events should be
+ *          stored.
+ * @maxevents: Size (in terms of number of events) of the caller event buffer.
+ * @timeout: Maximum timeout for the ready events fetch operation, in
+ *           milliseconds. If the @timeout is zero, the function will not block,
+ *           while if the @timeout is less than zero, the function will block
+ *           until at least one event has been retrieved (or an error
+ *           occurred).
+ *
+ * Returns: Returns the number of ready events which have been fetched, or an
+ *          error code, in case of error.
+ */
 static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
 		   int maxevents, long timeout)
 {
-	int res, eavail;
+	int res = 0, eavail, timed_out = 0;
 	unsigned long flags;
-	long jtimeout;
+	long slack = 0;
 	wait_queue_t wait;
+	ktime_t expires, *to = NULL;
 
-	/*
-	 * Calculate the timeout by checking for the "infinite" value (-1)
-	 * and the overflow condition. The passed timeout is in milliseconds,
-	 * that why (t * HZ) / 1000.
-	 */
-	jtimeout = (timeout < 0 || timeout >= EP_MAX_MSTIMEO) ?
-		MAX_SCHEDULE_TIMEOUT : (timeout * HZ + 999) / 1000;
+	if (timeout > 0) {
+		struct timespec end_time = ep_set_mstimeout(timeout);
 
-retry:
+		slack = select_estimate_accuracy(&end_time);
+		to = &expires;
+		*to = timespec_to_ktime(end_time);
+	} else if (timeout == 0) {
+		/*
+		 * Avoid the unnecessary trip to the wait queue loop, if the
+		 * caller specified a non blocking operation.
+		 */
+		timed_out = 1;
+		spin_lock_irqsave(&ep->lock, flags);
+		goto check_events;
+	}
+
+fetch_events:
 	spin_lock_irqsave(&ep->lock, flags);
 
-	res = 0;
-	if (list_empty(&ep->rdllist)) {
+	if (!ep_events_available(ep)) {
 		/*
 		 * We don't have any available event to return to the caller.
 		 * We need to sleep here, and we will be wake up by
@@ -1150,7 +1321,7 @@ retry:
 			 * to TASK_INTERRUPTIBLE before doing the checks.
 			 */
 			set_current_state(TASK_INTERRUPTIBLE);
-			if (!list_empty(&ep->rdllist) || !jtimeout)
+			if (ep_events_available(ep) || timed_out)
 				break;
 			if (signal_pending(current)) {
 				res = -EINTR;
@@ -1158,15 +1329,18 @@ retry:
 			}
 
 			spin_unlock_irqrestore(&ep->lock, flags);
-			jtimeout = schedule_timeout(jtimeout);
+			if (!schedule_hrtimeout_range(to, slack, HRTIMER_MODE_ABS))
+				timed_out = 1;
+
 			spin_lock_irqsave(&ep->lock, flags);
 		}
 		__remove_wait_queue(&ep->wq, &wait);
 
 		set_current_state(TASK_RUNNING);
 	}
+check_events:
 	/* Is it worth to try to dig for events ? */
-	eavail = !list_empty(&ep->rdllist) || ep->ovflist != EP_UNACTIVE_PTR;
+	eavail = ep_events_available(ep);
 
 	spin_unlock_irqrestore(&ep->lock, flags);
 
@@ -1176,10 +1350,96 @@ retry:
 	 * more luck.
 	 */
 	if (!res && eavail &&
-	    !(res = ep_send_events(ep, events, maxevents)) && jtimeout)
-		goto retry;
+	    !(res = ep_send_events(ep, events, maxevents)) && !timed_out)
+		goto fetch_events;
 
 	return res;
+}
+
+/**
+ * ep_loop_check_proc - Callback function to be passed to the @ep_call_nested()
+ *                      API, to verify that adding an epoll file inside another
+ *                      epoll structure, does not violate the constraints, in
+ *                      terms of closed loops, or too deep chains (which can
+ *                      result in excessive stack usage).
+ *
+ * @priv: Pointer to the epoll file to be currently checked.
+ * @cookie: Original cookie for this call. This is the top-of-the-chain epoll
+ *          data structure pointer.
+ * @call_nests: Current dept of the @ep_call_nested() call stack.
+ *
+ * Returns: Returns zero if adding the epoll @file inside current epoll
+ *          structure @ep does not violate the constraints, or -1 otherwise.
+ */
+static int ep_loop_check_proc(void *priv, void *cookie, int call_nests)
+{
+	int error = 0;
+	struct file *file = priv;
+	struct eventpoll *ep = file->private_data;
+	struct eventpoll *ep_tovisit;
+	struct rb_node *rbp;
+	struct epitem *epi;
+
+	mutex_lock(&ep->mtx);
+	ep->visited = 1;
+	list_add(&ep->visited_list_link, &visited_list);
+	for (rbp = rb_first(&ep->rbr); rbp; rbp = rb_next(rbp)) {
+		epi = rb_entry(rbp, struct epitem, rbn);
+		if (unlikely(is_file_epoll(epi->ffd.file))) {
+			ep_tovisit = epi->ffd.file->private_data;
+			if (ep_tovisit->visited)
+				continue;
+			error = ep_call_nested(&poll_loop_ncalls, EP_MAX_NESTS,
+					       ep_loop_check_proc, epi->ffd.file,
+					       ep_tovisit, current);
+			if (error != 0)
+				break;
+		} else {
+			/*
+			 * If we've reached a file that is not associated with
+			 * an ep, then we need to check if the newly added
+			 * links are going to add too many wakeup paths. We do
+			 * this by adding it to the tfile_check_list, if it's
+			 * not already there, and calling reverse_path_check()
+			 * during ep_insert().
+			 */
+			if (!epi->ffd.added) {
+				error = add_to_tfile_check(&epi->ffd);
+				if (error)
+					break;
+			}
+		}
+	}
+	mutex_unlock(&ep->mtx);
+
+	return error;
+}
+
+/**
+ * ep_loop_check - Performs a check to verify that adding an epoll file (@file)
+ *                 another epoll file (represented by @ep) does not create
+ *                 closed loops or too deep chains.
+ *
+ * @ep: Pointer to the epoll private data structure.
+ * @file: Pointer to the epoll file to be checked.
+ *
+ * Returns: Returns zero if adding the epoll @file inside current epoll
+ *          structure @ep does not violate the constraints, or -1 otherwise.
+ */
+static int ep_loop_check(struct eventpoll *ep, struct file *file)
+{
+	int ret;
+	struct eventpoll *ep_cur, *ep_next;
+
+	ret = ep_call_nested(&poll_loop_ncalls, EP_MAX_NESTS,
+			      ep_loop_check_proc, file, ep, current);
+	/* clear visited list */
+	list_for_each_entry_safe(ep_cur, ep_next, &visited_list,
+							visited_list_link) {
+		ep_cur->visited = 0;
+		list_del(&ep_cur->visited_list_link);
+	}
+	return ret;
 }
 
 /*
@@ -1187,8 +1447,9 @@ retry:
  */
 SYSCALL_DEFINE1(epoll_create1, int, flags)
 {
-	int error;
+	int error, fd;
 	struct eventpoll *ep = NULL;
+	struct file *file;
 
 	/* Check the EPOLL_* constant for consistency.  */
 	BUILD_BUG_ON(EPOLL_CLOEXEC != O_CLOEXEC);
@@ -1205,10 +1466,26 @@ SYSCALL_DEFINE1(epoll_create1, int, flags)
 	 * Creates all the items needed to setup an eventpoll file. That is,
 	 * a file structure and a free file descriptor.
 	 */
-	error = anon_inode_getfd("[eventpoll]", &eventpoll_fops, ep,
-				 flags & O_CLOEXEC);
-	if (error < 0)
-		ep_free(ep);
+	fd = get_unused_fd_flags(O_RDWR | (flags & O_CLOEXEC));
+	if (fd < 0) {
+		error = fd;
+		goto out_free_ep;
+	}
+	file = anon_inode_getfile("[eventpoll]", &eventpoll_fops, ep,
+				  (flags & O_CLOEXEC));
+
+	if (IS_ERR(file)) {
+		error = PTR_ERR(file);
+		goto out_free_fd;
+	}
+	fd_install(fd, file);
+	ep->file = file;
+	return fd;
+
+out_free_fd:
+	put_unused_fd(fd);
+out_free_ep:
+	ep_free(ep);
 
 	return error;
 }
@@ -1220,6 +1497,7 @@ SYSCALL_DEFINE1(epoll_create, int, size)
 
 	return sys_epoll_create1(0);
 }
+EXPORT_SYMBOL(sys_epoll_create);
 
 /*
  * The following function implements the controller interface for
@@ -1230,6 +1508,7 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 		struct epoll_event __user *, event)
 {
 	int error;
+	int did_lock_epmutex = 0;
 	struct file *file, *tfile;
 	struct eventpoll *ep;
 	struct epitem *epi;
@@ -1271,6 +1550,30 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 	 */
 	ep = file->private_data;
 
+	/*
+	 * When we insert an epoll file descriptor, inside another epoll file
+	 * descriptor, there is the change of creating closed loops, which are
+	 * better be handled here, than in more critical paths. While we are
+	 * checking for loops we also determine the list of files reachable
+	 * and hang them on the tfile_check_list, so we can check that we
+	 * haven't created too many possible wakeup paths.
+	 *
+	 * We need to hold the epmutex across both ep_insert and ep_remove
+	 * b/c we want to make sure we are looking at a coherent view of
+	 * epoll network.
+	 */
+	if (op == EPOLL_CTL_ADD || op == EPOLL_CTL_DEL) {
+		mutex_lock(&epmutex);
+		did_lock_epmutex = 1;
+	}
+	if ((op == EPOLL_CTL_ADD) && (is_file_epoll(tfile))) {
+			error = -ELOOP;
+			if (ep_loop_check(ep, tfile) != 0) {
+				clear_tfile_check_list();
+				goto error_tgt_fput;
+			}
+	}
+
 	mutex_lock(&ep->mtx);
 
 	/*
@@ -1288,6 +1591,7 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 			error = ep_insert(ep, &epds, tfile, fd);
 		} else
 			error = -EEXIST;
+		clear_tfile_check_list();
 		break;
 	case EPOLL_CTL_DEL:
 		if (epi)
@@ -1306,6 +1610,9 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 	mutex_unlock(&ep->mtx);
 
 error_tgt_fput:
+	if (did_lock_epmutex)
+		mutex_unlock(&epmutex);
+
 	fput(tfile);
 error_fput:
 	fput(file);
@@ -1421,8 +1728,14 @@ static int __init eventpoll_init(void)
 	/*
 	 * Allows top 4% of lomem to be allocated for epoll watches (per user).
 	 */
-	max_user_watches = (((si.totalram - si.totalhigh) / 25) << PAGE_SHIFT) /
-		EP_ITEM_COST;
+	max_user_watches = min((unsigned long)INT_MAX, (((si.totalram - si.totalhigh) / 25) << PAGE_SHIFT) /
+		EP_ITEM_COST);
+
+	/*
+	 * Initialize the structure used to perform epoll file descriptor
+	 * inclusion loops checks.
+	 */
+	ep_nested_calls_init(&poll_loop_ncalls);
 
 	/* Initialize the structure used to perform safe poll wait head wake ups */
 	ep_nested_calls_init(&poll_safewake_ncalls);

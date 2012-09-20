@@ -1,22 +1,29 @@
 #ifndef _PERF_PERF_H
 #define _PERF_PERF_H
 
+struct winsize;
+
+void get_term_dimensions(struct winsize *ws);
+
 #if defined(__i386__)
 #include "../../arch/x86/include/asm/unistd.h"
 #define rmb()		asm volatile("lock; addl $0,0(%%esp)" ::: "memory")
 #define cpu_relax()	asm volatile("rep; nop" ::: "memory");
+#define CPUINFO_PROC	"model name"
 #endif
 
 #if defined(__x86_64__)
 #include "../../arch/x86/include/asm/unistd.h"
 #define rmb()		asm volatile("lfence" ::: "memory")
 #define cpu_relax()	asm volatile("rep; nop" ::: "memory");
+#define CPUINFO_PROC	"model name"
 #endif
 
 #ifdef __powerpc__
 #include "../../arch/powerpc/include/asm/unistd.h"
 #define rmb()		asm volatile ("sync" ::: "memory")
 #define cpu_relax()	asm volatile ("" ::: "memory");
+#define CPUINFO_PROC	"cpu"
 #endif
 
 #ifdef __s390__
@@ -33,18 +40,59 @@
 # define rmb()		asm volatile("" ::: "memory")
 #endif
 #define cpu_relax()	asm volatile("" ::: "memory")
+#define CPUINFO_PROC	"cpu type"
 #endif
 
 #ifdef __hppa__
 #include "../../arch/parisc/include/asm/unistd.h"
 #define rmb()		asm volatile("" ::: "memory")
 #define cpu_relax()	asm volatile("" ::: "memory");
+#define CPUINFO_PROC	"cpu"
 #endif
 
 #ifdef __sparc__
 #include "../../arch/sparc/include/asm/unistd.h"
 #define rmb()		asm volatile("":::"memory")
 #define cpu_relax()	asm volatile("":::"memory")
+#define CPUINFO_PROC	"cpu"
+#endif
+
+#ifdef __alpha__
+#include "../../arch/alpha/include/asm/unistd.h"
+#define rmb()		asm volatile("mb" ::: "memory")
+#define cpu_relax()	asm volatile("" ::: "memory")
+#define CPUINFO_PROC	"cpu model"
+#endif
+
+#ifdef __ia64__
+#include "../../arch/ia64/include/asm/unistd.h"
+#define rmb()		asm volatile ("mf" ::: "memory")
+#define cpu_relax()	asm volatile ("hint @pause" ::: "memory")
+#define CPUINFO_PROC	"model name"
+#endif
+
+#ifdef __arm__
+#include "../../arch/arm/include/asm/unistd.h"
+/*
+ * Use the __kuser_memory_barrier helper in the CPU helper page. See
+ * arch/arm/kernel/entry-armv.S in the kernel source for details.
+ */
+#define rmb()		((void(*)(void))0xffff0fa0)()
+#define cpu_relax()	asm volatile("":::"memory")
+#define CPUINFO_PROC	"Processor"
+#endif
+
+#ifdef __mips__
+#include "../../arch/mips/include/asm/unistd.h"
+#define rmb()		asm volatile(					\
+				".set	mips2\n\t"			\
+				"sync\n\t"				\
+				".set	mips0"				\
+				: /* no output */			\
+				: /* no input */			\
+				: "memory")
+#define cpu_relax()	asm volatile("" ::: "memory")
+#define CPUINFO_PROC	"cpu model"
 #endif
 
 #include <time.h>
@@ -54,6 +102,33 @@
 
 #include "../../include/linux/perf_event.h"
 #include "util/types.h"
+#include <stdbool.h>
+
+struct perf_mmap {
+	void			*base;
+	int			mask;
+	unsigned int		prev;
+};
+
+static inline unsigned int perf_mmap__read_head(struct perf_mmap *mm)
+{
+	struct perf_event_mmap_page *pc = mm->base;
+	int head = pc->data_head;
+	rmb();
+	return head;
+}
+
+static inline void perf_mmap__write_tail(struct perf_mmap *md,
+					 unsigned long tail)
+{
+	struct perf_event_mmap_page *pc = md->base;
+
+	/*
+	 * ensure all reads are done before we write the tail out.
+	 */
+	/* mb(); */
+	pc->data_tail = tail;
+}
 
 /*
  * prctl(PR_TASK_PERF_EVENTS_DISABLE) will (cheaply) disable all
@@ -80,8 +155,6 @@ static inline unsigned long long rdclock(void)
 #define __user
 #define asmlinkage
 
-#define __used		__attribute__((__unused__))
-
 #define unlikely(x)	__builtin_expect(!!(x), 0)
 #define min(x, y) ({				\
 	typeof(x) _min1 = (x);			\
@@ -105,6 +178,35 @@ sys_perf_event_open(struct perf_event_attr *attr,
 struct ip_callchain {
 	u64 nr;
 	u64 ips[0];
+};
+
+extern bool perf_host, perf_guest;
+extern const char perf_version_string[];
+
+void pthread__unblock_sigwinch(void);
+
+struct perf_record_opts {
+	pid_t	     target_pid;
+	pid_t	     target_tid;
+	bool	     call_graph;
+	bool	     group;
+	bool	     inherit_stat;
+	bool	     no_delay;
+	bool	     no_inherit;
+	bool	     no_samples;
+	bool	     pipe_output;
+	bool	     raw_samples;
+	bool	     sample_address;
+	bool	     sample_time;
+	bool	     sample_id_all_avail;
+	bool	     system_wide;
+	bool	     period;
+	unsigned int freq;
+	unsigned int mmap_pages;
+	unsigned int user_freq;
+	u64	     default_interval;
+	u64	     user_interval;
+	const char   *cpu_list;
 };
 
 #endif

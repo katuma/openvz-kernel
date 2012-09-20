@@ -18,13 +18,12 @@
 #include <linux/buffer_head.h>
 #include <linux/mutex.h>
 #include <linux/idr.h>
+#include <linux/device_cgroup.h>
 
 #include "blk.h"
 
 static DEFINE_MUTEX(block_class_lock);
-#ifndef CONFIG_SYSFS_DEPRECATED
 struct kobject *block_depr;
-#endif
 
 /* for extended dynamic devt allocation, currently only one major is used */
 #define MAX_EXT_DEVT		(1 << MINORBITS)
@@ -35,7 +34,7 @@ struct kobject *block_depr;
 static DEFINE_MUTEX(ext_devt_mutex);
 static DEFINE_IDR(ext_devt_idr);
 
-static struct device_type disk_type;
+struct device_type disk_type;
 
 /**
  * disk_get_part - get partition
@@ -151,7 +150,7 @@ struct hd_struct *disk_part_iter_next(struct disk_part_iter *piter)
 		part = rcu_dereference(ptbl->part[piter->idx]);
 		if (!part)
 			continue;
-		if (!part->nr_sects &&
+		if (!part_nr_sects_read(part) &&
 		    !(piter->flags & DISK_PITER_INCL_EMPTY) &&
 		    !(piter->flags & DISK_PITER_INCL_EMPTY_PART0 &&
 		      piter->idx == 0))
@@ -188,7 +187,7 @@ EXPORT_SYMBOL_GPL(disk_part_iter_exit);
 static inline int sector_in_part(struct hd_struct *part, sector_t sector)
 {
 	return part->start_sect <= sector &&
-		sector < part->start_sect + part->nr_sects;
+		sector < part->start_sect + part_nr_sects_read(part);
 }
 
 /**
@@ -230,6 +229,37 @@ struct hd_struct *disk_map_sector_rcu(struct gendisk *disk, sector_t sector)
 }
 EXPORT_SYMBOL_GPL(disk_map_sector_rcu);
 
+int is_same_part(struct gendisk *disk, sector_t sector1, sector_t sector2,
+		 struct hd_struct **part1, struct hd_struct **part2)
+{
+	struct disk_part_tbl *ptbl;
+	struct hd_struct *part;
+	int i = 1;
+
+	*part1 = *part2 = NULL;
+
+	ptbl = rcu_dereference(disk->part_tbl);
+	part = rcu_dereference(ptbl->last_lookup);
+
+	do {
+		if (part) {
+			if (sector_in_part(part, sector1))
+				*part1 = part;
+			if (sector_in_part(part, sector2))
+				*part2 = part;
+
+			if (*part1 && *part2)
+				/* we found both partitions */
+				return *part1 == *part2;
+		}
+
+		part = rcu_dereference(ptbl->part[i]);
+	} while (i++ < ptbl->len);
+
+	/* we did not found at least one partition */
+	return *part1 == *part2;
+}
+
 /*
  * Can be deleted altogether. Later.
  *
@@ -253,8 +283,12 @@ void blkdev_show(struct seq_file *seqf, off_t offset)
 
 	if (offset < BLKDEV_MAJOR_HASH_SIZE) {
 		mutex_lock(&block_class_lock);
-		for (dp = major_names[offset]; dp; dp = dp->next)
+		for (dp = major_names[offset]; dp; dp = dp->next) {
+			if (!devcgroup_device_visible(S_IFBLK, dp->major,
+						0, INT_MAX))
+				continue;
 			seq_printf(seqf, "%3d %s\n", dp->major, dp->name);
+		}
 		mutex_unlock(&block_class_lock);
 	}
 }
@@ -541,13 +575,21 @@ void add_disk(struct gendisk *disk)
 	disk->major = MAJOR(devt);
 	disk->first_minor = MINOR(devt);
 
+	/* Register BDI before referencing it from bdev */ 
+	bdi = &disk->queue->backing_dev_info;
+	bdi_register_dev(bdi, disk_devt(disk));
+
 	blk_register_region(disk_devt(disk), disk->minors, NULL,
 			    exact_match, exact_lock, disk);
 	register_disk(disk);
 	blk_register_queue(disk);
 
-	bdi = &disk->queue->backing_dev_info;
-	bdi_register_dev(bdi, disk_devt(disk));
+	/*
+	 * Take an extra ref on queue which will be put on disk_release()
+	 * so that it sticks around as long as @disk is there.
+	 */
+	WARN_ON_ONCE(blk_get_queue(disk->queue));
+
 	retval = sysfs_create_link(&disk_to_dev(disk)->kobj, &bdi->dev->kobj,
 				   "bdi");
 	WARN_ON(retval);
@@ -661,7 +703,7 @@ void __init printk_all_partitions(void)
 
 			printk("%s%s %10llu %s", is_part0 ? "" : "  ",
 			       bdevt_str(part_devt(part), devt_buf),
-			       (unsigned long long)part->nr_sects >> 1,
+			       (unsigned long long)part_nr_sects_read(part) >> 1,
 			       disk_name(disk, part->partno, name_buf));
 			if (is_part0) {
 				if (disk->driverfs_dev != NULL &&
@@ -753,7 +795,7 @@ static int show_partition(struct seq_file *seqf, void *v)
 	while ((part = disk_part_iter_next(&piter)))
 		seq_printf(seqf, "%4d  %7d %10llu %s\n",
 			   MAJOR(part_devt(part)), MINOR(part_devt(part)),
-			   (unsigned long long)part->nr_sects >> 1,
+			   (unsigned long long)part_nr_sects_read(part) >> 1,
 			   disk_name(sgp, part->partno, buf));
 	disk_part_iter_exit(&piter);
 
@@ -793,7 +835,7 @@ static int __init genhd_device_init(void)
 {
 	int error;
 
-	block_class.dev_kobj = sysfs_dev_block_kobj;
+	block_class.dev_kobj = ve_sysfs_dev_block_kobj;
 	error = class_register(&block_class);
 	if (unlikely(error))
 		return error;
@@ -802,10 +844,10 @@ static int __init genhd_device_init(void)
 
 	register_blkdev(BLOCK_EXT_MAJOR, "blkext");
 
-#ifndef CONFIG_SYSFS_DEPRECATED
-	/* create top-level block dir */
-	block_depr = kobject_create_and_add("block", NULL);
-#endif
+	if (!sysfs_deprecated)
+		/* create top-level block dir */
+		block_depr = kobject_create_and_add("block", NULL);
+
 	return 0;
 }
 
@@ -861,12 +903,23 @@ static ssize_t disk_alignment_offset_show(struct device *dev,
 	return sprintf(buf, "%d\n", queue_alignment_offset(disk->queue));
 }
 
+static ssize_t disk_discard_alignment_show(struct device *dev,
+					   struct device_attribute *attr,
+					   char *buf)
+{
+	struct gendisk *disk = dev_to_disk(dev);
+
+	return sprintf(buf, "%d\n", queue_discard_alignment(disk->queue));
+}
+
 static DEVICE_ATTR(range, S_IRUGO, disk_range_show, NULL);
 static DEVICE_ATTR(ext_range, S_IRUGO, disk_ext_range_show, NULL);
 static DEVICE_ATTR(removable, S_IRUGO, disk_removable_show, NULL);
 static DEVICE_ATTR(ro, S_IRUGO, disk_ro_show, NULL);
 static DEVICE_ATTR(size, S_IRUGO, part_size_show, NULL);
 static DEVICE_ATTR(alignment_offset, S_IRUGO, disk_alignment_offset_show, NULL);
+static DEVICE_ATTR(discard_alignment, S_IRUGO, disk_discard_alignment_show,
+		   NULL);
 static DEVICE_ATTR(capability, S_IRUGO, disk_capability_show, NULL);
 static DEVICE_ATTR(stat, S_IRUGO, part_stat_show, NULL);
 static DEVICE_ATTR(inflight, S_IRUGO, part_inflight_show, NULL);
@@ -887,6 +940,7 @@ static struct attribute *disk_attrs[] = {
 	&dev_attr_ro.attr,
 	&dev_attr_size.attr,
 	&dev_attr_alignment_offset.attr,
+	&dev_attr_discard_alignment.attr,
 	&dev_attr_capability.attr,
 	&dev_attr_stat.attr,
 	&dev_attr_inflight.attr,
@@ -992,11 +1046,14 @@ static void disk_release(struct device *dev)
 	kfree(disk->random);
 	disk_replace_part_tbl(disk, NULL);
 	free_part_stats(&disk->part0);
+	if (disk->queue)
+		blk_put_queue(disk->queue);
 	kfree(disk);
 }
 struct class block_class = {
 	.name		= "block",
 };
+EXPORT_SYMBOL(block_class);
 
 static char *block_devnode(struct device *dev, mode_t *mode)
 {
@@ -1007,12 +1064,13 @@ static char *block_devnode(struct device *dev, mode_t *mode)
 	return NULL;
 }
 
-static struct device_type disk_type = {
+struct device_type disk_type = {
 	.name		= "disk",
 	.groups		= disk_attr_groups,
 	.release	= disk_release,
 	.devnode	= block_devnode,
 };
+EXPORT_SYMBOL(disk_type);
 
 #ifdef CONFIG_PROC_FS
 /*
@@ -1267,7 +1325,7 @@ int invalidate_partition(struct gendisk *disk, int partno)
 	struct block_device *bdev = bdget_disk(disk, partno);
 	if (bdev) {
 		fsync_bdev(bdev);
-		res = __invalidate_device(bdev);
+		res = __invalidate_device(bdev, true);
 		bdput(bdev);
 	}
 	return res;

@@ -35,6 +35,17 @@ Who:	Luis R. Rodriguez <lrodriguez@atheros.com>
 
 ---------------------------
 
+What:	AR9170USB
+When:	2.6.40
+
+Why:	This driver is deprecated and the firmware is no longer
+	maintained. The replacement driver "carl9170" has been
+	around for a while, so the devices are still supported.
+
+Who:	Christian Lamparter <chunkeey@googlemail.com>
+
+---------------------------
+
 What:	IRQF_SAMPLE_RANDOM
 Check:	IRQF_SAMPLE_RANDOM
 When:	July 2009
@@ -345,15 +356,6 @@ Who:	Johannes Berg <johannes@sipsolutions.net>
 
 ---------------------------
 
-What: CONFIG_NF_CT_ACCT
-When: 2.6.29
-Why:  Accounting can now be enabled/disabled without kernel recompilation.
-      Currently used only to set a default value for a feature that is also
-      controlled by a kernel/module/sysfs/sysctl parameter.
-Who:  Krzysztof Piotr Oledzki <ole@ans.pl>
-
----------------------------
-
 What:	sysfs ui for changing p4-clockmod parameters
 When:	September 2009
 Why:	See commits 129f8ae9b1b5be94517da76009ea956e89104ce8 and
@@ -489,3 +491,14 @@ Why:	With the recent innovations in CPU hardware acceleration technologies
 Who:	Alok N Kataria <akataria@vmware.com>
 
 ----------------------------
+
+What:   access to nfsd auth cache through sys_nfsservctl or '.' files
+        in the 'nfsd' filesystem.
+When:   2.6.40
+Why:    This is a legacy interface which have been replaced by a more
+        dynamic cache.  Continuing to maintain this interface is an
+        unnecessary burden.
+Who:    NeilBrown <neilb@suse.de>
+
+----------------------------
+	

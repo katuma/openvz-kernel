@@ -28,6 +28,8 @@
 #include <linux/path.h> /* struct path */
 #include <linux/slab.h> /* kmem_* */
 #include <linux/types.h>
+#include <linux/sched.h>
+#include <linux/mount.h>
 
 #include "inotify.h"
 
@@ -70,6 +72,9 @@ static int inotify_handle_event(struct fsnotify_group *group, struct fsnotify_ev
 		    (ret == -EOVERFLOW))
 			ret = 0;
 	}
+
+	if (entry->mask & IN_ONESHOT)
+		fsnotify_destroy_mark_by_entry(entry);
 
 	/*
 	 * If we hold the entry until after the event is on the queue
@@ -121,7 +126,7 @@ static int idr_callback(int id, void *p, void *data)
 	if (warned)
 		return 0;
 
-	warned = false;
+	warned = true;
 	entry = p;
 	ientry = container_of(entry, struct inotify_inode_mark_entry, fsn_entry);
 
@@ -146,6 +151,8 @@ static void inotify_free_group_priv(struct fsnotify_group *group)
 	idr_for_each(&group->inotify_data.idr, idr_callback, group);
 	idr_remove_all(&group->inotify_data.idr);
 	idr_destroy(&group->inotify_data.idr);
+	atomic_dec(&group->inotify_data.user->inotify_devs);
+	free_uid(group->inotify_data.user);
 }
 
 void inotify_free_event_priv(struct fsnotify_event_private_data *fsn_event_priv)
@@ -159,10 +166,25 @@ void inotify_free_event_priv(struct fsnotify_event_private_data *fsn_event_priv)
 	kmem_cache_free(event_priv_cachep, event_priv);
 }
 
+static void inotify_detach_mnt(struct fsnotify_mark_entry *fe)
+{
+	struct inotify_inode_mark_entry *e;
+
+	e = container_of(fe, struct inotify_inode_mark_entry, fsn_entry);
+	if (e->path.dentry) {
+		dput(e->path.dentry);
+		e->path.dentry = NULL;
+		mnt_unpin(e->path.mnt);
+		mntput(e->path.mnt);
+		e->path.dentry = NULL;
+	}
+}
+
 const struct fsnotify_ops inotify_fsnotify_ops = {
 	.handle_event = inotify_handle_event,
 	.should_send_event = inotify_should_send_event,
 	.free_group_priv = inotify_free_group_priv,
 	.free_event_priv = inotify_free_event_priv,
 	.freeing_mark = inotify_freeing_mark,
+	.detach_mnt = inotify_detach_mnt,
 };

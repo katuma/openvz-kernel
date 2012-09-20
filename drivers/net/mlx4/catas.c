@@ -47,7 +47,8 @@ static struct work_struct catas_work;
 static int internal_err_reset = 1;
 module_param(internal_err_reset, int, 0644);
 MODULE_PARM_DESC(internal_err_reset,
-		 "Reset device on internal errors if non-zero (default 1)");
+		 "Reset device on internal errors if non-zero"
+		 " (default 1, in SRIOV mode default is 0)");
 
 static void dump_err_buf(struct mlx4_dev *dev)
 {
@@ -113,7 +114,11 @@ static void catas_reset(struct work_struct *work)
 void mlx4_start_catas_poll(struct mlx4_dev *dev)
 {
 	struct mlx4_priv *priv = mlx4_priv(dev);
-	unsigned long addr;
+	phys_addr_t addr;
+
+	/*If we are in SRIOV the default of the module param must be 0*/
+	if (mlx4_is_mfunc(dev))
+		internal_err_reset = 0;
 
 	INIT_LIST_HEAD(&priv->catas_err.list);
 	init_timer(&priv->catas_err.timer);
@@ -124,8 +129,8 @@ void mlx4_start_catas_poll(struct mlx4_dev *dev)
 
 	priv->catas_err.map = ioremap(addr, priv->fw.catas_size * 4);
 	if (!priv->catas_err.map) {
-		mlx4_warn(dev, "Failed to map internal error buffer at 0x%lx\n",
-			  addr);
+		mlx4_warn(dev, "Failed to map internal error buffer at 0x%llx\n",
+			  (unsigned long long) addr);
 		return;
 	}
 

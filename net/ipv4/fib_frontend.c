@@ -241,16 +241,19 @@ int fib_validate_source(__be32 src, __be32 dst, u8 tos, int oif,
 			    .iif = oif };
 
 	struct fib_result res;
-	int no_addr, rpf;
+	int no_addr, rpf, accept_local;
 	int ret;
 	struct net *net;
 
-	no_addr = rpf = 0;
+	no_addr = rpf = accept_local = 0;
 	rcu_read_lock();
 	in_dev = __in_dev_get_rcu(dev);
 	if (in_dev) {
 		no_addr = in_dev->ifa_list == NULL;
 		rpf = IN_DEV_RPFILTER(in_dev);
+		accept_local = IN_DEV_ACCEPT_LOCAL(in_dev);
+		if (mark && !IN_DEV_SRC_VMARK(in_dev))
+			fl.mark = 0;
 	}
 	rcu_read_unlock();
 
@@ -260,8 +263,11 @@ int fib_validate_source(__be32 src, __be32 dst, u8 tos, int oif,
 	net = dev_net(dev);
 	if (fib_lookup(net, &fl, &res))
 		goto last_resort;
-	if (res.type != RTN_UNICAST)
-		goto e_inval_res;
+	if (res.type != RTN_UNICAST) {
+		if (!(dev->features & NETIF_F_VENET) ||
+		    res.type != RTN_LOCAL || !accept_local)
+			goto e_inval_res;
+	}
 	*spec_dst = FIB_RES_PREFSRC(res);
 	fib_combine_itag(itag, &res);
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
@@ -462,7 +468,7 @@ int ip_rt_ioctl(struct net *net, unsigned int cmd, void __user *arg)
 	switch (cmd) {
 	case SIOCADDRT:		/* Add a route */
 	case SIOCDELRT:		/* Delete a route */
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_VE_NET_ADMIN))
 			return -EPERM;
 
 		if (copy_from_user(&rt, arg, sizeof(rt)))
@@ -895,11 +901,11 @@ static void nl_fib_lookup_exit(struct net *net)
 	net->ipv4.fibnl = NULL;
 }
 
-static void fib_disable_ip(struct net_device *dev, int force)
+static void fib_disable_ip(struct net_device *dev, int force, int delay)
 {
 	if (fib_sync_down_dev(dev, force))
 		fib_flush(dev_net(dev));
-	rt_cache_flush(dev_net(dev), 0);
+	rt_cache_flush(dev_net(dev), delay);
 	arp_ifdown(dev);
 }
 
@@ -922,7 +928,7 @@ static int fib_inetaddr_event(struct notifier_block *this, unsigned long event, 
 			/* Last address was deleted from this interface.
 			   Disable IP.
 			 */
-			fib_disable_ip(dev, 1);
+			fib_disable_ip(dev, 1, 0);
 		} else {
 			rt_cache_flush(dev_net(dev), -1);
 		}
@@ -937,7 +943,12 @@ static int fib_netdev_event(struct notifier_block *this, unsigned long event, vo
 	struct in_device *in_dev = __in_dev_get_rtnl(dev);
 
 	if (event == NETDEV_UNREGISTER) {
-		fib_disable_ip(dev, 2);
+		fib_disable_ip(dev, 2, -1);
+		return NOTIFY_DONE;
+	}
+
+	if (event == NETDEV_UNREGISTER_BATCH) {
+		rt_cache_flush_batch();
 		return NOTIFY_DONE;
 	}
 
@@ -955,7 +966,7 @@ static int fib_netdev_event(struct notifier_block *this, unsigned long event, vo
 		rt_cache_flush(dev_net(dev), -1);
 		break;
 	case NETDEV_DOWN:
-		fib_disable_ip(dev, 0);
+		fib_disable_ip(dev, 0, 0);
 		break;
 	case NETDEV_CHANGEMTU:
 	case NETDEV_CHANGE:

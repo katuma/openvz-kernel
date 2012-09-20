@@ -34,6 +34,8 @@ extern void __chk_io_ptr(const volatile void __iomem *);
 # define __cond_lock(x,c) (c)
 #endif
 
+#define __percpu
+
 #ifdef __KERNEL__
 
 #ifdef __GNUC__
@@ -211,6 +213,10 @@ void ftrace_likely_update(struct ftrace_branch_data *f, int val, int expect);
 
 #ifndef __maybe_unused
 # define __maybe_unused		/* unimplemented */
+#endif
+
+#ifndef __always_unused
+# define __always_unused	/* unimplemented */
 #endif
 
 #ifndef noinline
