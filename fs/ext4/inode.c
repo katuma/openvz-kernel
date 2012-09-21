@@ -5235,6 +5235,8 @@ void ext4_set_inode_flags(struct inode *inode)
 	unsigned int flags = EXT4_I(inode)->i_flags;
 
 	inode->i_flags &= ~(S_SYNC|S_APPEND|S_IMMUTABLE|S_NOATIME|S_DIRSYNC);
+	if (flags & EXT4_COWLINK_FL)
+		inode->i_flags |= S_COWLINK;
 	if (flags & EXT4_SYNC_FL)
 		inode->i_flags |= S_SYNC;
 	if (flags & EXT4_APPEND_FL)
@@ -5594,7 +5596,7 @@ static int ext4_do_update_inode(handle_t *handle,
 		goto out_brelse;
 	raw_inode->i_dtime = cpu_to_le32(ei->i_dtime);
 	raw_inode->i_dqcookie = cpu_to_le32(ei->i_dq_cookie);
-	raw_inode->i_flags = cpu_to_le32(ei->i_flags);
+	raw_inode->i_flags = cpu_to_le32((ei->i_flags & ~S_COWLINK) | (inode->i_flags & S_COWLINK));
 	if (EXT4_SB(inode->i_sb)->s_es->s_creator_os !=
 	    cpu_to_le32(EXT4_OS_HURD))
 		raw_inode->i_file_acl_high =

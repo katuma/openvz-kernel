@@ -6,6 +6,9 @@
 #define F_SETLEASE	(F_LINUX_SPECIFIC_BASE + 0)
 #define F_GETLEASE	(F_LINUX_SPECIFIC_BASE + 1)
 
+#define F_SETCOW    (F_LINUX_SPECIFIC_BASE+3)
+#define F_GETCOW    (F_LINUX_SPECIFIC_BASE+4)
+
 /*
  * Cancel a blocking posix lock; internal use only until we expose an
  * asynchronous lock api to userspace:

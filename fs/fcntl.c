@@ -372,6 +372,17 @@ static int f_getown_ex(struct file *filp, unsigned long arg)
 	return ret;
 }
 
+static long fcntl_setcow(struct file *filp, unsigned long arg)
+{
+	struct inode *inode = filp->f_path.dentry->d_inode;
+	if (arg)
+		inode->i_flags |= S_COWLINK;
+	else
+		inode->i_flags &= ~S_COWLINK;
+    mark_inode_dirty(inode);
+    return 0;
+}
+
 static long do_fcntl(int fd, unsigned int cmd, unsigned long arg,
 		struct file *filp)
 {
@@ -448,6 +459,11 @@ static long do_fcntl(int fd, unsigned int cmd, unsigned long arg,
 	case F_NOTIFY:
 		err = fcntl_dirnotify(fd, filp, arg);
 		break;
+	case F_SETCOW:
+		err = fcntl_setcow(filp, arg);
+		break;
+	case F_GETCOW:
+		err = (filp->f_path.dentry->d_inode->i_flags & S_COWLINK) / S_COWLINK;
 	default:
 		break;
 	}

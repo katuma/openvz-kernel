@@ -31,6 +31,7 @@
 #include <linux/falloc.h>
 #include <linux/fs_struct.h>
 #include <linux/ima.h>
+#include <linux/cowlink.h>
 
 #include "internal.h"
 
@@ -487,6 +488,9 @@ static int do_fchmodat(int dfd, const char __user *filename, mode_t mode, int fl
 	error = user_path_at(dfd, filename, follow, &path);
 	if (error)
 		goto out;
+	error = cow_check_and_break(&path);
+	if (error)
+		goto dput_and_out;
 	inode = path.dentry->d_inode;
 
 	error = mnt_want_write(path.mnt);
@@ -558,6 +562,8 @@ SYSCALL_DEFINE3(chown, const char __user *, filename, uid_t, user, gid_t, group)
 	error = mnt_want_write(path.mnt);
 	if (error)
 		goto out_release;
+	error = cow_check_and_break(&path);
+	if (!error)
 	error = chown_common(path.dentry, user, group);
 	mnt_drop_write(path.mnt);
 out_release:
@@ -584,6 +590,8 @@ SYSCALL_DEFINE5(fchownat, int, dfd, const char __user *, filename, uid_t, user,
 	error = mnt_want_write(path.mnt);
 	if (error)
 		goto out_release;
+	error = cow_check_and_break(&path);
+	if (!error)
 	error = chown_common(path.dentry, user, group);
 	mnt_drop_write(path.mnt);
 out_release:
@@ -603,6 +611,8 @@ SYSCALL_DEFINE3(lchown, const char __user *, filename, uid_t, user, gid_t, group
 	error = mnt_want_write(path.mnt);
 	if (error)
 		goto out_release;
+	error = cow_check_and_break(&path);
+	if (!error)
 	error = chown_common(path.dentry, user, group);
 	mnt_drop_write(path.mnt);
 out_release:

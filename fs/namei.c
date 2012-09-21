@@ -33,6 +33,7 @@
 #include <linux/fcntl.h>
 #include <linux/device_cgroup.h>
 #include <linux/fs_struct.h>
+#include <linux/cowlink.h>
 #include <asm/uaccess.h>
 
 #include "internal.h"
@@ -1751,6 +1752,12 @@ int may_open(struct path *path, int acc_mode, int flag)
 		flag &= ~O_TRUNC;
 		break;
 	}
+	if (IS_COW(inode) && ((flag & FMODE_WRITE) || (acc_mode & (MAY_APPEND|MAY_WRITE)))) {
+		if (IS_COW_LINK(inode))
+			return -EMLINK;
+		inode->i_flags &= ~S_COWLINK;
+		mark_inode_dirty(inode);
+	}
 
 	error = inode_permission(inode, acc_mode);
 	if (error)
@@ -1877,6 +1884,9 @@ struct file *do_filp_open(int dfd, const char *pathname,
 	int count = 0;
 	int will_truncate;
 	int flag = open_to_namei_flags(open_flag);
+	int rflag = flag;
+	int rmode = mode;
+restart:;
 
 	if (!acc_mode)
 		acc_mode = MAY_OPEN | ACC_MODE(flag);
@@ -2043,6 +2053,24 @@ ok:
 			goto exit;
 	}
 	error = may_open(&nd.path, acc_mode, open_flag);
+	if (error == -EMLINK) {
+		struct dentry *dentry;
+		dentry = cow_break_link(pathname);
+		if (IS_ERR(dentry)) {
+			error = PTR_ERR(dentry);
+			goto exit_cow;
+		}
+		dput(dentry);
+		if (will_truncate)
+			mnt_drop_write(nd.path.mnt);
+		release_open_intent(&nd);
+		path_put(&nd.path);
+		flag = rflag;
+		mode = rmode;
+		goto restart;
+	}
+exit_cow:
+
 	if (error) {
 		if (will_truncate)
 			mnt_drop_write(nd.path.mnt);
@@ -3074,6 +3102,175 @@ int generic_readlink(struct dentry *dentry, char __user *buffer, int buflen)
 int vfs_follow_link(struct nameidata *nd, const char *link)
 {
 	return __vfs_follow_link(nd, link);
+}
+
+#include <linux/file.h>
+
+static inline
+long do_cow_splice(struct file *in, struct file *out, size_t len)
+{
+	loff_t ppos = 0;
+
+	return do_splice_direct(in, &ppos, out, len, 0);
+}
+
+struct dentry *cow_break_link(const char *pathname)
+{
+	int ret, mode, pathlen, redo = 0;
+	struct nameidata old_nd, dir_nd;
+	struct path old_path, new_path;
+	struct dentry *dir, *res = NULL;
+	struct file *old_file;
+	struct file *new_file;
+	char *to, *path, pad='\251';
+	loff_t size;
+
+	path = kmalloc(PATH_MAX, GFP_KERNEL);
+	ret = -ENOMEM;
+	if (!path)
+		goto out;
+
+	/* old_nd will have refs to dentry and mnt */
+	ret = path_lookup(pathname, LOOKUP_FOLLOW, &old_nd);
+	if (ret < 0)
+		goto out_free_path;
+
+	old_path = old_nd.path;
+	mode = old_path.dentry->d_inode->i_mode;
+
+	to = d_path(&old_path, path, PATH_MAX-2);
+	pathlen = strlen(to);
+	to[pathlen + 1] = 0;
+retry:
+	to[pathlen] = pad--;
+	ret = -EMLINK;
+	if (pad <= '\240')
+		goto out_rel_old;
+
+	/* dir_nd will have refs to dentry and mnt */
+	ret = path_lookup(to,
+		LOOKUP_PARENT | LOOKUP_OPEN | LOOKUP_CREATE, &dir_nd);
+	if (ret < 0)
+		goto retry;
+
+	/* this puppy downs the inode mutex */
+	new_path.dentry = lookup_create(&dir_nd, 0);
+	if (!new_path.dentry || IS_ERR(new_path.dentry)) {
+		mutex_unlock(&dir_nd.path.dentry->d_inode->i_mutex);
+		path_put(&dir_nd.path);
+		goto retry;
+	}
+	dir = dir_nd.path.dentry;
+
+	ret = vfs_create(dir_nd.path.dentry->d_inode, new_path.dentry, mode, &dir_nd);
+	if (ret == -EEXIST) {
+		mutex_unlock(&dir->d_inode->i_mutex);
+		dput(new_path.dentry);
+		path_put(&dir_nd.path);
+		goto retry;
+	}
+	else if (ret < 0)
+		goto out_unlock_new;
+
+	/* drop out early, ret passes ENOENT */
+	ret = -ENOENT;
+	if ((redo = d_unhashed(old_path.dentry)))
+		goto out_unlock_new;
+
+	new_path.mnt = dir_nd.path.mnt;
+	dget(old_path.dentry);
+	mntget(old_path.mnt);
+	/* this one cleans up the dentry/mnt in case of failure */
+	old_file = dentry_open(old_path.dentry, old_path.mnt,
+		O_RDONLY, current_cred());
+	if (!old_file || IS_ERR(old_file)) {
+		res = IS_ERR(old_file) ? (void *) old_file : res;
+		goto out_unlock_new;
+	}
+
+	dget(new_path.dentry);
+	mntget(new_path.mnt);
+	/* this one cleans up the dentry/mnt in case of failure */
+	new_file = dentry_open(new_path.dentry, new_path.mnt,
+		O_WRONLY, current_cred());
+
+	ret = IS_ERR(new_file) ? PTR_ERR(new_file) : -ENOENT;
+	if (!new_file || IS_ERR(new_file))
+		goto out_fput_old;
+
+	size = i_size_read(old_file->f_dentry->d_inode);
+	ret = do_cow_splice(old_file, new_file, size);
+	if (ret < 0) {
+		goto out_fput_both;
+	} else if (ret < size) {
+		ret = -ENOSPC;
+		goto out_fput_both;
+	} else {
+		struct inode *old_inode = old_path.dentry->d_inode;
+		struct inode *new_inode = new_path.dentry->d_inode;
+		struct iattr attr = {
+			.ia_uid = old_inode->i_uid,
+			.ia_gid = old_inode->i_gid,
+			.ia_valid = ATTR_UID | ATTR_GID
+			};
+
+		ret = inode_setattr(new_inode, &attr);
+		if (ret)
+			goto out_fput_both;
+	}
+
+	mutex_lock(&old_path.dentry->d_inode->i_sb->s_vfs_rename_mutex);
+
+	/* drop out late */
+	ret = -ENOENT;
+	if ((redo = d_unhashed(old_path.dentry)))
+		goto out_unlock;
+
+	ret = vfs_rename(dir_nd.path.dentry->d_inode, new_path.dentry,
+		old_nd.path.dentry->d_parent->d_inode, old_path.dentry);
+	res = new_path.dentry;
+
+out_unlock:
+	mutex_unlock(&old_path.dentry->d_inode->i_sb->s_vfs_rename_mutex);
+
+out_fput_both:
+	fput(new_file);
+
+out_fput_old:
+	fput(old_file);
+
+out_unlock_new:
+	mutex_unlock(&dir->d_inode->i_mutex);
+	if (!ret)
+		goto out_redo;
+
+	/* error path cleanup */
+	vfs_unlink(dir->d_inode, new_path.dentry);
+	dput(new_path.dentry);
+
+out_redo:
+	if (!redo)
+		goto out_rel_both;
+	/* lookup dentry once again */
+	path_put(&old_nd.path);
+	ret = path_lookup(pathname, LOOKUP_FOLLOW, &old_nd);
+	if (ret)
+		goto out_rel_both;
+
+	new_path.dentry = old_nd.path.dentry;
+	dget(new_path.dentry);
+	res = new_path.dentry;
+
+out_rel_both:
+	path_put(&dir_nd.path);
+out_rel_old:
+	path_put(&old_nd.path);
+out_free_path:
+	kfree(path);
+out:
+	if (ret)
+		res = ERR_PTR(ret);
+	return res;
 }
 
 /* get the link contents into pagecache */

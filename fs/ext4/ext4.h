@@ -305,7 +305,7 @@ struct flex_groups {
 #define EXT4_EA_INODE_FL		0x00200000 /* Inode used for large EA */
 #define EXT4_EOFBLOCKS_FL		0x00400000 /* Blocks allocated beyond EOF */
 #define EXT4_RESERVED_FL		0x80000000 /* reserved for ext4 lib */
-
+#define EXT4_COWLINK_FL             0x20000000 /* Copy on Write marker */
 #define EXT4_FL_USER_VISIBLE		0x004BDFFF /* User visible flags */
 #define EXT4_FL_USER_MODIFIABLE		0x004B80FF /* User modifiable flags */
 

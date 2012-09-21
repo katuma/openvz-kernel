@@ -271,6 +271,7 @@ struct inodes_stat_t {
 #define S_NOCMTIME	128	/* Do not update file c/mtime */
 #define S_SWAPFILE	256	/* Do not truncate: swapon got its bmaps */
 #define S_PRIVATE	512	/* Inode is fs-internal */
+#define S_COWLINK   1024 /* Hard-link with COW semantics */
 #define S_AUTOMOUNT	2048	/* Automount/referral quasi-directory */
 #define S_AOP_EXT	16384 /* fs supports extended aops */
 
@@ -312,6 +313,8 @@ struct inodes_stat_t {
 #define IS_PRIVATE(inode)	((inode)->i_flags & S_PRIVATE)
 #define IS_AUTOMOUNT(inode)	((inode)->i_flags & S_AUTOMOUNT)
 #define IS_AOP_EXT(inode)	((inode)->i_flags & S_AOP_EXT)
+#define IS_COW(inode)		((inode)->i_flags & S_COWLINK)
+#define IS_COW_LINK(inode)	(S_ISREG((inode)->i_mode) && ((inode)->i_nlink > 1))
 
 /* the read-only stuff doesn't really belong here, but any other place is
    probably as bad and I don't want to create yet another include file. */
